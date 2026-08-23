@@ -46,24 +46,28 @@ static double now_s(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
 }
+static uint64_t now_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 #define MAX_WRITE_BYTES (64LL << 20)  // 出力ファイルは先頭64MBまで(2Gbpsで肥大化防止)
 
 #define VID 0x0fd9              // Elgato USB vendor ID
-#define PID 0x0074              // HD60 S product ID
+#define PID 0x005e              // Original HD60 S detected on this PC
 #define EP_STREAM 0x83          // iso IN endpoint (映像+SEP embedded audio)
 // マジックナンバーの意味:
 //   wValue = 0x5066  → I2C ブリッジ経路 (bank+reg 指定で IT6802E/IT66121 を叩く)
 //   wValue = 0x509c  → MCU コマンド経路 (Cypress FX3 内の MCU 相当への 2B コマンド)
 //   bRequest = 0xC0/0xC6 → ベンダ固有 (詳細は notes/protocol.md 参照予定)
 //   bank 0x9a=IT66121 write, 0x9b=IT66121 read setup, 0x9c=IT6802E write, 0x9d=IT6802E read setup
-// SuperSpeed iso: 1 iso packet = 1 service interval = wBytesPerInterval まで。
-// alt2 は bMaxBurst15/Mult1 → wBytesPerInterval=32768。1024で読むと大半empty(バグ)。
+    // SuperSpeed iso: 1 iso packet = 1 service interval = wBytesPerInterval まで。
+    // Alt2 は 1024B × 16 × 1 = 16384B、alt3 は 1024B × 13 × 2
+    // = 26624B per service interval.  The latter is the capture setting.
 // Windows実測: 32 iso pkt/URB × 16 in-flight = 16MB/64ms でempty 0.07%。
 // Linuxではさらにキュー深度を増やして URB 完了→再サブミット遅延の吸収余裕を確保。
 // libuvcのLinuxデフォルト=100本。8-64本試行で empty% と CPU 負荷のバランスを取る。
-#define ISO_PACKETS 64        // 1転送あたりiso packet(=interval)数（32→64、Windows 1MB match）
-#define ISO_PKTSIZE 32768     // alt2 wBytesPerInterval
-#define NUM_TRANSFERS 128     // 同時投入数（64→128、URB starvation 回避 2026-07-11）
+#define NUM_TRANSFERS 506     // empirically stable xHCI ceiling for 005e (~16 MiB in flight)
 
 static FILE* outf;
 static FILE* g_rdlog = NULL;      // 差分観測: IN読み応答ログ
@@ -84,11 +88,13 @@ static int inflight = 0;
 #define FRAME_H 1080
 #define LINE_BYTES (FRAME_W * 2)                   // 3840
 #define FRAME_BYTES (LINE_BYTES * FRAME_H)         // 4,147,200
+#define EXPECTED_FRAME_BLK 45                      // measured 005e vertical-blanking markers/frame
 
 // マーカー (little-endian 32bit で読む)
 #define MK_EOL_ACT 0x800000ffu   // bytes: ff 00 00 80
 #define MK_EOL_BLK 0xab0000ffu   // bytes: ff 00 00 ab
 #define MK_SEP     0x02ff00ffu   // bytes: ff 00 ff 02, その後12バイトスキップ
+#define MK_SEP_BULK 0x04ff00ffu  // bulk/USB3 stream uses the same SEP payload with type 04
 
 typedef enum { HUNT = 0, LOCKED = 1 } pstate_t;
 static pstate_t g_state = HUNT;
@@ -103,6 +109,68 @@ static uint8_t g_pend[16];
 static int g_pend_n = 0;
 
 static int g_v4l_fd = -1;
+static int g_pace_output = 0;
+static uint8_t g_pace_frame[FRAME_BYTES];
+static int g_pace_have_frame = 0;
+static uint64_t g_pace_next_ns = 0;
+static unsigned long long g_v4l_write_seq = 0;
+
+// Temporary cadence diagnostics.  These counters do not alter capture logic.
+static int g_diag = 0;
+static uint64_t g_diag_window_ns = 0, g_diag_frame_start_ns = 0;
+static uint64_t g_diag_last_write_ns = 0;
+static unsigned long long g_diag_blk = 0, g_diag_complete = 0;
+static unsigned long long g_diag_partial = 0, g_diag_resets = 0;
+static unsigned long long g_diag_writes = 0, g_diag_write_fail = 0;
+static unsigned long long g_diag_interval_n = 0, g_diag_latency_n = 0, g_diag_write_dur_n = 0;
+static unsigned long long g_diag_markers = 0, g_diag_q_bad = 0;
+static unsigned long long g_diag_act = 0;
+static unsigned long long g_diag_input_bytes = 0;
+static size_t g_diag_q_min = SIZE_MAX, g_diag_q_max = 0;
+static uint64_t g_diag_interval_min = UINT64_MAX, g_diag_interval_max = 0;
+static uint64_t g_diag_latency_min = UINT64_MAX, g_diag_latency_max = 0;
+static uint64_t g_diag_write_dur_min = UINT64_MAX, g_diag_write_dur_max = 0;
+static long double g_diag_interval_sum = 0, g_diag_latency_sum = 0, g_diag_write_dur_sum = 0;
+
+static void diag_report_if_due(void) {
+    if (!g_diag) return;
+    uint64_t now = now_mono_ns();
+    if (!g_diag_window_ns) { g_diag_window_ns = now; return; }
+    if (now - g_diag_window_ns < 1000000000ull) return;
+    double sec = (double)(now - g_diag_window_ns) / 1e9;
+    fprintf(stderr,
+            "[cadence] %.3fs BLK=%llu complete=%llu partial=%llu resets=%llu "
+            "v4l_write=%llu fail=%llu fps_complete=%.3f fps_write=%.3f "
+            "write_dt_us[min/avg/max]=%llu/%.1f/%llu latency_us[min/avg/max]=%llu/%.1f/%llu "
+            "write_call_us[min/avg/max]=%llu/%.1f/%llu markers[A/B]=%llu/%llu "
+            "marker_q[min/max/bad]=%zu/%zu/%llu input_MBps=%.2f\n",
+            sec, g_diag_blk, g_diag_complete, g_diag_partial, g_diag_resets,
+            g_diag_writes, g_diag_write_fail,
+            g_diag_complete / sec, g_diag_writes / sec,
+            g_diag_interval_n ? (unsigned long long)(g_diag_interval_min / 1000) : 0,
+            g_diag_interval_n ? (double)(g_diag_interval_sum / g_diag_interval_n / 1000.0) : 0.0,
+            g_diag_interval_n ? (unsigned long long)(g_diag_interval_max / 1000) : 0,
+            g_diag_latency_n ? (unsigned long long)(g_diag_latency_min / 1000) : 0,
+            g_diag_latency_n ? (double)(g_diag_latency_sum / g_diag_latency_n / 1000.0) : 0.0,
+            g_diag_latency_n ? (unsigned long long)(g_diag_latency_max / 1000) : 0,
+            g_diag_write_dur_n ? (unsigned long long)(g_diag_write_dur_min / 1000) : 0,
+            g_diag_write_dur_n ? (double)(g_diag_write_dur_sum / g_diag_write_dur_n / 1000.0) : 0.0,
+            g_diag_write_dur_n ? (unsigned long long)(g_diag_write_dur_max / 1000) : 0,
+            g_diag_act, g_diag_blk, g_diag_markers ? g_diag_q_min : 0,
+            g_diag_markers ? g_diag_q_max : 0, g_diag_q_bad,
+            (double)g_diag_input_bytes / sec / 1000000.0);
+    g_diag_window_ns = now;
+    g_diag_blk = g_diag_complete = g_diag_partial = g_diag_resets = 0;
+    g_diag_writes = g_diag_write_fail = 0;
+    g_diag_interval_n = g_diag_latency_n = g_diag_write_dur_n = 0;
+    g_diag_markers = g_diag_q_bad = 0;
+    g_diag_act = 0;
+    g_diag_input_bytes = 0;
+    g_diag_q_min = SIZE_MAX; g_diag_q_max = 0;
+    g_diag_interval_min = g_diag_latency_min = UINT64_MAX;
+    g_diag_interval_max = g_diag_latency_max = 0;
+    g_diag_interval_sum = g_diag_latency_sum = g_diag_write_dur_sum = 0;
+}
 
 // ======================================================================
 // SECTION 2: ALSA 音声出力 (snd-aloop 経由)
@@ -407,6 +475,13 @@ static void audio_pw_open(void) {
         PW_KEY_NODE_LATENCY, "128/48000",   // 128 samples @ 48kHz = 2.6ms
         PW_KEY_NODE_ALWAYS_PROCESS, "true",
         NULL);
+    // Route audio to a dedicated sink when requested. Its monitor becomes
+    // a normal Audio/Source that OBS can select.
+    const char *audio_target = getenv("HD60S_AUDIO_TARGET");
+    if (audio_target && audio_target[0]) {
+        pw_properties_set(props, PW_KEY_TARGET_OBJECT, audio_target);
+        fprintf(stderr, "[audio-pw] target: %s (OBS source is its monitor)\n", audio_target);
+    }
 
     g_pw_stream = pw_stream_new_simple(
         pw_thread_loop_get_loop(g_pw_loop),
@@ -638,25 +713,81 @@ static unsigned long long g_resyncs = 0;
 static unsigned long long g_resync_empty = 0;   // iso empty 起因
 static unsigned long long g_resync_marker = 0;  // 未知マーカー起因
 static unsigned long long g_resync_overflow = 0;// work overflow 起因
+static int g_parser_synced = 0;
+static uint8_t g_sync_buf[524288];
+static size_t g_sync_n = 0;
+static uint8_t g_dyn_buf[131072];
+static size_t g_dyn_n = 0;
+static uint8_t g_prev_line[LINE_BYTES];
+static int g_have_prev_line = 0;
 
 static void parser_reset(const char* why) {
     // 分類は state 問わずカウント（HUNT中の resync も見たい）
     if (strstr(why, "empty")) g_resync_empty++;
     else if (strstr(why, "marker")) g_resync_marker++;
     else if (strstr(why, "overflow")) g_resync_overflow++;
+    if (g_diag) {
+        g_diag_resets++;
+        fprintf(stderr, "[cadence-reset] reason=%s ACT=%d BLK=%d\n", why, g_fline, g_blk_run);
+    }
     g_state = HUNT; g_lpos = 0; g_fline = 0; g_blk_run = 0; g_pend_n = 0;
     g_resyncs++;
 }
 
 static void emit_frame(void) {
-    if (g_v4l_fd >= 0) {
+    uint64_t emit_start_ns = now_mono_ns();
+    if (g_diag && g_diag_frame_start_ns) {
+        uint64_t latency = emit_start_ns - g_diag_frame_start_ns;
+        g_diag_latency_n++;
+        g_diag_latency_sum += latency;
+        if (latency < g_diag_latency_min) g_diag_latency_min = latency;
+        if (latency > g_diag_latency_max) g_diag_latency_max = latency;
+    }
+    if (g_frames_out < 3) {
+        unsigned long long sum = 0;
+        for (size_t i = 0; i < FRAME_BYTES; i += 4096) sum += g_framebuf[i];
+        fprintf(stderr, "[frame-debug] #%llu first=%02x last=%02x sample_mean=%.1f\n",
+                g_frames_out + 1, g_framebuf[0], g_framebuf[FRAME_BYTES - 1],
+                (double)sum / (FRAME_BYTES / 4096));
+    }
+    if (g_v4l_fd >= 0 && g_pace_output) {
+        // Presentation is paced by the main loop at 60 Hz.  Keep the newest
+        // complete frame here; this does not change assembly or USB timing.
+        memcpy(g_pace_frame, g_framebuf, FRAME_BYTES);
+        g_pace_have_frame = 1;
+    } else if (g_v4l_fd >= 0) {
+        uint64_t write_start_ns = now_mono_ns();
         ssize_t w = write(g_v4l_fd, g_framebuf, FRAME_BYTES);
-        if (w != FRAME_BYTES) fprintf(stderr, "[v4l2] short write %zd\n", w);
+        uint64_t write_done_ns = now_mono_ns();
+        fprintf(stderr, "[v4l-write] seq=%llu mode=direct bytes=%zd expected=%zu %s\n",
+                ++g_v4l_write_seq, w, (size_t)FRAME_BYTES,
+                w == FRAME_BYTES ? "OK" : "ANOMALY");
+        if (g_diag) {
+            uint64_t dur = write_done_ns - write_start_ns;
+            g_diag_write_dur_n++;
+            g_diag_write_dur_sum += dur;
+            if (dur < g_diag_write_dur_min) g_diag_write_dur_min = dur;
+            if (dur > g_diag_write_dur_max) g_diag_write_dur_max = dur;
+        }
+        if (w == FRAME_BYTES) {
+            g_diag_writes++;
+            if (g_diag_last_write_ns) {
+                uint64_t dt = write_done_ns - g_diag_last_write_ns;
+                g_diag_interval_n++;
+                g_diag_interval_sum += dt;
+                if (dt < g_diag_interval_min) g_diag_interval_min = dt;
+                if (dt > g_diag_interval_max) g_diag_interval_max = dt;
+            }
+            g_diag_last_write_ns = write_done_ns;
+        } else {
+            g_diag_write_fail++;
+            fprintf(stderr, "[v4l2] short write %zd\n", w);
+        }
     }
     g_frames_out++;
     // 2026-07-18 debug dump は HD60S_DEBUG_DUMP=1 の時のみ (常時 4MB × 3 個の write は無駄)
     if (getenv("HD60S_DEBUG_DUMP") &&
-        (g_frames_out == 60 || g_frames_out == 300 || g_frames_out == 600)) {
+        (g_frames_out == 1 || g_frames_out == 60 || g_frames_out == 300 || g_frames_out == 600)) {
         char path[256];
         snprintf(path, sizeof(path), "captures/proof/live_frame_%llu.yuv", g_frames_out);
         FILE* fp = fopen(path, "wb");
@@ -670,11 +801,290 @@ static void emit_frame(void) {
     if (!verbose_checked) { verbose = getenv("HD60S_VERBOSE") ? 1 : 0; verbose_checked = 1; }
     unsigned long long interval = verbose ? 60 : 300;
     if ((g_frames_out % interval) == 0) fprintf(stderr, "[emit] %llu frames\n", g_frames_out);
+    diag_report_if_due();
+}
+
+static void pace_output_if_due(void) {
+    if (!g_pace_output || g_v4l_fd < 0 || !g_pace_have_frame) return;
+    const uint64_t period = 16666667ull; // 60 Hz
+    uint64_t now = now_mono_ns();
+    if (!g_pace_next_ns) g_pace_next_ns = now;
+    if (now < g_pace_next_ns) return;
+    uint64_t write_start_ns = now;
+    ssize_t w = write(g_v4l_fd, g_pace_frame, FRAME_BYTES);
+    uint64_t write_done_ns = now_mono_ns();
+    fprintf(stderr, "[v4l-write] seq=%llu mode=paced bytes=%zd expected=%zu %s\n",
+            ++g_v4l_write_seq, w, (size_t)FRAME_BYTES,
+            w == FRAME_BYTES ? "OK" : "ANOMALY");
+    if (g_diag) {
+        uint64_t dur = write_done_ns - write_start_ns;
+        g_diag_write_dur_n++;
+        g_diag_write_dur_sum += dur;
+        if (dur < g_diag_write_dur_min) g_diag_write_dur_min = dur;
+        if (dur > g_diag_write_dur_max) g_diag_write_dur_max = dur;
+    }
+    if (w == FRAME_BYTES) {
+        g_diag_writes++;
+        if (g_diag_last_write_ns) {
+            uint64_t dt = write_done_ns - g_diag_last_write_ns;
+            g_diag_interval_n++; g_diag_interval_sum += dt;
+            if (dt < g_diag_interval_min) g_diag_interval_min = dt;
+            if (dt > g_diag_interval_max) g_diag_interval_max = dt;
+        }
+        g_diag_last_write_ns = write_done_ns;
+    } else {
+        g_diag_write_fail++;
+    }
+    do { g_pace_next_ns += period; } while (g_pace_next_ns <= write_done_ns);
+    diag_report_if_due();
+}
+
+// HD60 S 0fd9:005e line assembler.  Unlike the older 0074 stream, this
+// revision can lose a USB block and can insert SEP records at a line edge.
+// Assemble by locating the next protocol marker, padding a short line and
+// discarding surplus bytes, rather than assuming a fixed marker offset.
+static void dynamic_video_feed(const uint8_t *data, size_t len) {
+    if (len > sizeof(g_dyn_buf) - g_dyn_n) {
+        size_t drop = len - (sizeof(g_dyn_buf) - g_dyn_n);
+        if (drop > g_dyn_n) drop = g_dyn_n;
+        memmove(g_dyn_buf, g_dyn_buf + drop, g_dyn_n - drop);
+        g_dyn_n -= drop;
+        g_resyncs++;
+    }
+    size_t room = sizeof(g_dyn_buf) - g_dyn_n;
+    if (len > room) len = room;
+    memcpy(g_dyn_buf + g_dyn_n, data, len);
+    g_dyn_n += len;
+
+    for (;;) {
+        size_t q = 0;
+        uint32_t tag = 0;
+        // A video line is exactly 3840 bytes followed by its marker.  Do not
+        // search the whole accumulated buffer: YUYV pixels can accidentally
+        // contain the marker bytes and that causes horizontal stair-stepping.
+        // The marker follows one complete 1920-wide YUYV line.  Searching
+        // inside the last 240 bytes of the pixel payload is unsafe: the
+        // marker byte pattern can occur naturally in image data and would
+        // shorten a line, permanently shifting every following line.
+        // Allow only the small protocol padding window around LINE_BYTES.
+        size_t scan_start = LINE_BYTES - 240;
+        size_t scan_end = g_dyn_n > LINE_BYTES + 360 ? LINE_BYTES + 360 : g_dyn_n;
+        size_t best_q = SIZE_MAX;
+        uint32_t best_tag = 0;
+        int best_score = INT_MAX;
+        for (size_t p = scan_start; p + 4 <= scan_end; ++p) {
+            uint32_t candidate;
+            memcpy(&candidate, g_dyn_buf + p, 4);
+            if (candidate == MK_EOL_ACT || candidate == MK_EOL_BLK ||
+                candidate == MK_SEP || candidate == MK_SEP_BULK) {
+                // A marker-looking sequence in the pixel payload is not
+                // sufficient.  Confirm the next protocol marker at the
+                // normal line distance before accepting this candidate.
+                if (g_dyn_n < p + 3004) break;
+                int next_ok = 0;
+                size_t next_pos = 0;
+                for (size_t s = p + 3000; s <= p + 4100 && s + 4 <= g_dyn_n; ++s) {
+                    uint32_t next;
+                    memcpy(&next, g_dyn_buf + s, 4);
+                    if (next == MK_EOL_ACT || next == MK_EOL_BLK ||
+                        next == MK_SEP || next == MK_SEP_BULK) {
+                        next_ok = 1;
+                        next_pos = s;
+                        break;
+                    }
+                }
+                if (next_ok) {
+                    int score = abs((int)p - (LINE_BYTES + 6)) +
+                                abs((int)(next_pos - p) - (LINE_BYTES + 8));
+                    if (score < best_score) {
+                        best_score = score;
+                        best_q = p;
+                        best_tag = candidate;
+                    }
+                }
+            }
+        }
+        if (best_q != SIZE_MAX) { q = best_q; tag = best_tag; }
+        if (!q) {
+            // A vertical blanking interval can be much larger than the
+            // normal 4/16-byte line padding.  Once enough data is buffered,
+            // recover at the next short run of genuine ACT line markers
+            // instead of allowing g_dyn_buf to overflow and dropping an
+            // arbitrary portion of the image.
+            if (g_dyn_n > 65536) {
+                size_t sync_p = SIZE_MAX;
+                for (size_t p = 0; p + 8 * 3840 + 4 <= g_dyn_n; ++p) {
+                    uint32_t first;
+                    memcpy(&first, g_dyn_buf + p, 4);
+                    if (first != MK_EOL_ACT) continue;
+                    size_t cursor = p;
+                    int run = 1;
+                    for (int k = 1; k < 8; ++k) {
+                        int found = 0;
+                        size_t lo = cursor + 3000;
+                        size_t hi = cursor + 4100;
+                        if (hi + 4 > g_dyn_n) break;
+                        for (size_t s = lo; s <= hi; ++s) {
+                            uint32_t next;
+                            memcpy(&next, g_dyn_buf + s, 4);
+                            if (next == MK_EOL_ACT) {
+                                cursor = s;
+                                found = 1;
+                                run++;
+                                break;
+                            }
+                        }
+                        if (!found) break;
+                    }
+                    if (run == 8) { sync_p = p; break; }
+                }
+                if (sync_p != SIZE_MAX) {
+                    size_t consume = sync_p + 4;
+                    memmove(g_dyn_buf, g_dyn_buf + consume, g_dyn_n - consume);
+                    g_dyn_n -= consume;
+                    // Keep the current frame counter across a transport
+                    // re-lock.  A false marker or a long gap must not make
+                    // the assembler restart line 0 indefinitely; the
+                    // 1080-ACT boundary below is the only frame reset.
+                    g_resyncs++;
+                    continue;
+                }
+                // Keep only enough tail to detect a marker crossing the
+                // next USB callback; discard the stale prefix explicitly.
+                size_t keep = 4096;
+                memmove(g_dyn_buf, g_dyn_buf + g_dyn_n - keep, keep);
+                g_dyn_n = keep;
+                g_resyncs++;
+            }
+            break;
+        }
+
+        if (g_diag) {
+            g_diag_markers++;
+            if (q < g_diag_q_min) g_diag_q_min = q;
+            if (q > g_diag_q_max) g_diag_q_max = q;
+            if (q < 3800 || q > 3900) g_diag_q_bad++;
+        }
+
+        memset(g_linebuf, 0, LINE_BYTES);
+        size_t copy = q < LINE_BYTES ? q : LINE_BYTES;
+        memcpy(g_linebuf, g_dyn_buf, copy);
+        if (copy < LINE_BYTES && g_have_prev_line)
+            memcpy(g_linebuf + copy, g_prev_line + copy, LINE_BYTES - copy);
+        if (tag == MK_EOL_ACT || tag == MK_SEP || tag == MK_SEP_BULK) {
+            if (g_diag) g_diag_act++;
+            if (g_diag && g_fline == 0 && !g_diag_frame_start_ns)
+                g_diag_frame_start_ns = now_mono_ns();
+            memcpy(g_prev_line, g_linebuf, LINE_BYTES);
+            g_have_prev_line = 1;
+            if (g_fline < FRAME_H)
+                memcpy(g_framebuf + (size_t)g_fline * LINE_BYTES, g_linebuf, LINE_BYTES);
+            g_fline++;
+            if (g_fline >= FRAME_H) {
+                int frame_lines = g_fline;
+                int frame_blks = g_blk_run;
+                fprintf(stderr, "[frame] emit #%llu lines=%d BLK=%d %s\n",
+                        g_frames_out + 1, frame_lines, frame_blks,
+                        frame_blks == EXPECTED_FRAME_BLK ? "OK" : "ANOMALY");
+                if (g_diag) g_diag_complete++;
+                emit_frame();
+                g_fline = 0;
+                g_blk_run = 0;
+                g_diag_frame_start_ns = 0;
+            }
+        } else if (tag == MK_EOL_BLK) {
+            // BLK is retained as a structural diagnostic.  It is not the
+            // frame delimiter: the 005e stream normally has about 29 BLK
+            // markers around each group of 1080 video-line events.
+            g_blk_run++;
+            if (g_diag) g_diag_blk++;
+        }
+
+        size_t consume = q + 4;
+        if (tag == MK_SEP || tag == MK_SEP_BULK) {
+            if (g_dyn_n < q + 16) break;
+            audio_feed_sep(g_dyn_buf + q + 4);
+            consume = q + 16; // SEP + 8-byte audio payload + following EOL
+        }
+        if (consume > g_dyn_n) break;
+        memmove(g_dyn_buf, g_dyn_buf + consume, g_dyn_n - consume);
+        g_dyn_n -= consume;
+        diag_report_if_due();
+    }
 }
 
 // data/len を消費してパーサに突っ込む。iso packet 最大32768B、pending 最大16Bなので
 // work は余裕を持って十分大きく取る。
 static void parser_feed(const uint8_t* data, size_t len) {
+    if (!g_parser_synced) {
+        size_t take = len;
+        size_t room = sizeof(g_sync_buf) - g_sync_n;
+        if (take > room) {
+            // The device can send a long pre-video/control interval before
+            // the first stable ACT run.  Keep this as a sliding window;
+            // otherwise the original 512 KiB would fill once and prevent
+            // the real video start from ever being examined.
+            if (take >= sizeof(g_sync_buf)) {
+                data += len - sizeof(g_sync_buf);
+                take = sizeof(g_sync_buf);
+                g_sync_n = 0;
+            } else {
+                size_t drop = take - room;
+                memmove(g_sync_buf, g_sync_buf + drop, g_sync_n - drop);
+                g_sync_n -= drop;
+            }
+        }
+        memcpy(g_sync_buf + g_sync_n, data, take);
+        g_sync_n += take;
+        // Do not lock on three accidental byte patterns.  Before video is
+        // enabled the stream contains control/blanking data in which the
+        // four-byte ACT marker can occur by chance.  A real line run has ACT
+        // markers 3844 or 3856 bytes apart (3840-byte YUYV payload plus the
+        // protocol marker/padding).  Require a long chain before accepting
+        // the starting offset.
+        const int LOCK_LINES = 8;
+        for (size_t p = 0; p + 3004 * LOCK_LINES <= g_sync_n; ++p) {
+            uint32_t first;
+            memcpy(&first, g_sync_buf + p, 4);
+            if (first != MK_EOL_ACT) continue;
+            size_t cursor = p;
+            int matched = 1;
+            for (int k = 1; k < LOCK_LINES; ++k) {
+                size_t lo = cursor + 3000;
+                size_t hi = cursor + 4100;
+                if (hi + 4 > g_sync_n) { matched = 0; break; }
+                int found = 0;
+                for (size_t q = lo; q <= hi; ++q) {
+                    uint32_t next;
+                    memcpy(&next, g_sync_buf + q, 4);
+                    if (next == MK_EOL_ACT) {
+                        cursor = q;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) { matched = 0; break; }
+            }
+            if (matched) {
+                g_parser_synced = 1;
+                size_t off = p + 4;
+                size_t remain = g_sync_n - off;
+                while (remain) {
+                    size_t chunk = remain > 60000 ? 60000 : remain;
+                    dynamic_video_feed(g_sync_buf + off, chunk);
+                    off += chunk;
+                    remain -= chunk;
+                }
+                g_sync_n = 0;
+                data = NULL;
+                len = 0;
+                break;
+            }
+        }
+        if (!g_parser_synced) return;
+    }
+    dynamic_video_feed(data, len);
+    return;
     static uint8_t work[65536 + 64];
     if (g_pend_n + len > sizeof(work)) {
         // 想定外の巨大パケット。切り捨てて resync
@@ -708,12 +1118,28 @@ static void parser_feed(const uint8_t* data, size_t len) {
             return;
         }
         uint32_t tag; memcpy(&tag, work + i, 4);
+        // This HD60 S revision occasionally inserts four or twelve bytes
+        // around a line boundary.  Locate the next protocol marker instead
+        // of assuming it is exactly at byte 3840.
+        size_t marker_i = i;
+        size_t marker_end = total < i + 64 ? total : i + 64;
+        for (size_t q = i; q + 4 <= marker_end; ++q) {
+            uint32_t candidate;
+            memcpy(&candidate, work + q, 4);
+            if (candidate == MK_EOL_ACT || candidate == MK_EOL_BLK ||
+                candidate == MK_SEP || candidate == MK_SEP_BULK) {
+                marker_i = q;
+                tag = candidate;
+                break;
+            }
+        }
+        i = marker_i;
 
         // SEP: 4B magic + 8B payload + 4B マーカー (EOL_ACT等) = 全16B。
         // 実測: SEP+12 位置に必ず EOL_ACT (ff 00 00 80) が続く（201/201=100%）。
         // → 実装は「SEP magic を見たら +12 進んで直後のマーカー4Bを読み直す」。
         //   SEP payload の 8B は音声データの可能性 (parser では読み飛ばす、音声パーサで別処理)。
-        if (tag == MK_SEP) {
+        if (tag == MK_SEP || tag == MK_SEP_BULK) {
             if (total - i < 16) {
                 size_t r = total - i;
                 memcpy(g_pend, work + i, r); g_pend_n = r;
@@ -772,7 +1198,9 @@ static void parser_notify_loss(size_t bytes_lost) {
 // (S_FMT を driver から叩くと apt 版0.15.3の挙動でCapture側フォーマットが壊れることがある)
 // fps ヒントだけ VIDIOC_S_PARM で 60fps に固定 (OBSがフレームレート一覧に60を出すために必要)
 static int v4l2_open(const char* devpath) {
-    int fd = open(devpath, O_WRONLY);
+    // Nonblocking prevents the userspace capture loop from deadlocking when
+    // OBS has not opened the consumer side yet.
+    int fd = open(devpath, O_WRONLY | O_NONBLOCK);
     if (fd < 0) { perror("open v4l2loopback"); return -1; }
     // 🔥 2026-07-11 Opus 4.8 診断: write() only では v4l2loopback の timestamp state
     // machine が初期化されず、consumer側でフレーム表示が止まる (VLC "Timestamp conversion
@@ -795,11 +1223,11 @@ static int v4l2_open(const char* devpath) {
     sp.parm.output.timeperframe.denominator = 60;
     if (ioctl(fd, VIDIOC_S_PARM, &sp) < 0) fprintf(stderr, "[v4l2] S_PARM fps60 失敗(続行)\n");
 
-    // STREAMON: OUTPUT ストリーム開始を宣言 (write() モードでも必須)
-    enum v4l2_buf_type btype = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    if (ioctl(fd, VIDIOC_STREAMON, &btype) < 0) fprintf(stderr, "[v4l2] STREAMON 失敗(続行): %s\n", strerror(errno));
-
-    fprintf(stderr, "[v4l2] %s opened (YUYV 1920x1080 @60fps, S_FMT+STREAMON 済)\n", devpath);
+    // v4l2loopback's write() interface owns the OUTPUT queue.  Calling
+    // VIDIOC_STREAMON here can block waiting for a queue state that is
+    // established by the consumer (OBS), so leave the queue in write mode.
+    // A complete frame is submitted by each write(FRAME_BYTES) below.
+    fprintf(stderr, "[v4l2] %s opened (YUYV 1920x1080 @60fps, S_FMT/write mode)\n", devpath);
     return fd;
 }
 
@@ -818,6 +1246,7 @@ static int hex2bin(const char* hex, unsigned char* out, int maxlen) {
 // SECTION 3: USB 送受信 (呪文再生 / iso コールバック / burst 発火)
 // ======================================================================
 static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
+    static unsigned long callback_count = 0;
     // HEX DUMP HOOK: HD60S_HEXDUMP=1 で iso packet の先頭 32B を最初 500 個 dump
     // 音声パケットと映像パケットを見分けるため (workflow suggestion 2026-07-11)
     static const char* env_hexdump = NULL;
@@ -846,6 +1275,7 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
                 // 検証用: 先頭512MBだけ生ストリームを保存 (音声解析用に増量)
                 if (total_bytes < (512LL << 20) && outf) fwrite(buf, 1, d->actual_length, outf);
                 total_bytes += d->actual_length;
+                if (g_diag) g_diag_input_bytes += d->actual_length;
                 pkt_ok++;
             } else {
                 // iso 0-length pkt はブランキングによる正常な休止と考え、
@@ -860,6 +1290,9 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     } else {
         inflight--;
     }
+    if ((++callback_count % 100) == 0)
+        fprintf(stderr, "[iso-debug] callbacks=%lu ok=%ld empty=%ld err=%ld bytes=%lld frames=%llu\\n",
+                callback_count, pkt_ok, pkt_empty, pkt_err, total_bytes, g_frames_out);
 }
 
 // 呪文再生(TSV) ; 戻り値: (ok<<0) 実際はグローバルでカウント
@@ -995,6 +1428,12 @@ static void load_burst(const char* path) {
 // TODO: パススルー (HDMI ループスルー) の恒久有効化と、それを維持したまま
 // キャプチャする経路の両立が未解決。現状は pt-only モードで一時的に維持のみ。
 int main(int argc, char** argv) {
+    g_diag = getenv("HD60S_CADENCE_DIAG") ? 1 : 0;
+    const char *pace_env = getenv("HD60S_PACE_OUTPUT");
+    g_pace_output = pace_env && pace_env[0] && pace_env[0] != '0' &&
+                    pace_env[0] != 'n' && pace_env[0] != 'N';
+    if (g_diag) fprintf(stderr, "[cadence] diagnostics enabled (no capture parameters changed)\n");
+    if (g_pace_output) fprintf(stderr, "[cadence] V4L2 output pacing enabled at 60 Hz\n");
     // stderr を無バッファに (SCHED_FIFO でリアルタイム優先度にすると
     // ブロックバッファになってログが即表示されない問題の対策)
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -1003,7 +1442,29 @@ int main(int argc, char** argv) {
     // 秒数 0 or 負数を「実用上無限 (~68 年)」に扱う
     // 注: 100 年 = 3,153,600,000 は int overflow なので INT_MAX-3600 で安全
     if (read_sec <= 0) read_sec = 2147480047;  // INT_MAX - 3600, ~68 years
+    // Alternate 3 is the high-bandwidth SuperSpeed video setting:
+    // 13 burst units × 2 transactions × 1024 bytes = 26624 bytes/interval.
+    // Alt2 is only 16384 bytes/interval and cannot sustain the requested
+    // 1080p60 YUYV stream.
     int alt = argc > 2 ? atoi(argv[2]) : 2;
+    // SuperSpeed companion descriptor: wBytesPerInterval for this device.
+    // The 005e revision exposes different payload capacities per alternate.
+    // For SuperSpeed isochronous transfers, usbfs/libusb represents the
+    // complete service-interval payload in each iso descriptor.  Alt2 has
+    // wMaxPacketSize=1024 and bMaxBurst=15, so its accepted interval payload
+    // is 16 KiB (16 wire transactions), not a 32 KiB individual packet.
+    int iso_pkt_size = (alt == 2) ? 32768 : 1024;
+    const char *pkt_env = getenv("HD60S_ISO_PKT");
+    if (pkt_env && *pkt_env) iso_pkt_size = atoi(pkt_env);
+    if (iso_pkt_size < 1024) iso_pkt_size = 1024;
+    // Keep each URB split across two accepted service-interval descriptors.
+    // Passing 32768 as one descriptor exceeds the endpoint's declared
+    // per-interval capacity.
+    int iso_packets = (alt == 2) ? 1 : 32;
+    const char *packets_env = getenv("HD60S_ISO_PKTS");
+    if (packets_env && *packets_env) iso_packets = atoi(packets_env);
+    if (iso_packets < 1) iso_packets = 1;
+    fprintf(stderr, "[iso] per-transfer packet length=%d\n", iso_pkt_size);
     // 5番目の引数が "pt" ならパススルー専用モード（iso張らず、9a burstだけ撃って維持）
     int passthrough_only = (argc > 5 && strcmp(argv[5], "pt") == 0);
     // ラベルは 5番目 (pt モードでは 6番目)
@@ -1017,7 +1478,7 @@ int main(int argc, char** argv) {
 
     if (libusb_init(NULL) < 0) { fprintf(stderr, "libusb_init失敗\n"); return 1; }
     libusb_device_handle* h = libusb_open_device_with_vid_pid(NULL, VID, PID);
-    if (!h) { fprintf(stderr, "デバイスopen失敗 (0fd9:0074)\n"); return 1; }
+    if (!h) { fprintf(stderr, "デバイスopen失敗 (0fd9:005e)\n"); return 1; }
     libusb_set_auto_detach_kernel_driver(h, 1);
     // 2026-07-10 デバイス強制リセット: 前回異常終了後や物理抜き差し後にI2Cバスがロックしたり
     // 内部状態が乱れる問題への対策 (実測: reset無しだと 9d:0x12 が0x9d返しで100%空パケット)
@@ -1214,6 +1675,55 @@ int main(int argc, char** argv) {
 
     if (libusb_set_interface_alt_setting(h, 0, alt) < 0) fprintf(stderr, "set_alt(%d)失敗\n", alt);
     else fprintf(stderr, "[main] alt=%d 選択OK\n", alt);
+
+    // Diagnostic path for the USB 3 bulk alternate (alt=4).  The public
+    // driver only exercised isochronous alternates; this bounded probe lets
+    // us determine whether 0fd9:005e exposes media through bulk transport.
+    if (alt == 4) {
+        unsigned char bulk_buf[1024 * 32];
+        int nonempty = 0;
+        FILE *bulk_dump = fopen("/tmp/hd60s-bulk-stream.bin", "wb");
+        g_v4l_fd = v4l2_open("/dev/video42");
+        int bulk_count = 200;
+        const char *bulk_env = getenv("HD60S_BULK_COUNT");
+        if (bulk_env && *bulk_env) bulk_count = atoi(bulk_env);
+        if (bulk_count < 1) bulk_count = 1;
+        for (int n = 0; n < bulk_count; ++n) {
+            int actual = 0;
+            int rc = libusb_bulk_transfer(h, EP_STREAM, bulk_buf,
+                                          (int)sizeof(bulk_buf), &actual, 250);
+            if (rc == 0 && actual > 0) {
+                if (bulk_dump) fwrite(bulk_buf, 1, (size_t)actual, bulk_dump);
+                parser_feed(bulk_buf, actual);
+                total_bytes += actual;
+                if (g_diag) g_diag_input_bytes += actual;
+                pkt_ok++;
+                if (nonempty++ < 8) {
+                    fprintf(stderr, "[bulk] n=%d len=%d head=", n, actual);
+                    for (int b = 0; b < actual && b < 16; ++b)
+                        fprintf(stderr, "%02x", bulk_buf[b]);
+                    fprintf(stderr, "\n");
+                }
+            } else if (rc != LIBUSB_ERROR_TIMEOUT && n < 8) {
+                fprintf(stderr, "[bulk] n=%d rc=%d (%s) actual=%d\n",
+                        n, rc, libusb_error_name(rc), actual);
+            }
+        }
+        if (bulk_dump) fclose(bulk_dump);
+        fprintf(stderr, "[bulk] nonempty_transfers=%d\n", nonempty);
+        if (g_v4l_fd >= 0) {
+            enum v4l2_buf_type bulk_type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            ioctl(g_v4l_fd, VIDIOC_STREAMOFF, &bulk_type);
+            close(g_v4l_fd);
+            g_v4l_fd = -1;
+        }
+        fprintf(stderr, "[bulk] bytes=%lld frames=%llu resyncs=%llu\n",
+                total_bytes, g_frames_out, g_resyncs);
+        libusb_release_interface(h, 0);
+        libusb_close(h);
+        libusb_exit(NULL);
+        return nonempty ? 0 : 4;
+    }
     // パススルー対策(H1): SET_INTERFACE → 初burstまで pcap実測 103ms 空ける (FX3 GPIF 再初期化とI2C競合回避)
     { struct timeval td={0, 120000}; libusb_handle_events_timeout(NULL, &td); }
     fprintf(stderr, "[main] iso開始 %d秒\n", read_sec);
@@ -1381,15 +1891,16 @@ int main(int argc, char** argv) {
     for (int i = 0; i < NUM_TRANSFERS; i++) {
         // Zerocopy DMA バッファ (usbfs mmap経由) → CPU 使用率↓、tail latency↓。
         // 失敗時は malloc にフォールバック (小型ホストで KMS が確保できない場合)。
-        bufs[i] = libusb_dev_mem_alloc(h, ISO_PACKETS * ISO_PKTSIZE);
-        if (!bufs[i]) bufs[i] = malloc(ISO_PACKETS * ISO_PKTSIZE);
-        xfrs[i] = libusb_alloc_transfer(ISO_PACKETS);
+        bufs[i] = libusb_dev_mem_alloc(h, iso_packets * iso_pkt_size);
+        if (!bufs[i]) bufs[i] = malloc(iso_packets * iso_pkt_size);
+        xfrs[i] = libusb_alloc_transfer(iso_packets);
         // timeout=0 = 無限。連続isoで有限timeoutはURBキャンセルで in-flight packet 全て empty化する罠
         libusb_fill_iso_transfer(xfrs[i], h, EP_STREAM, bufs[i],
-            ISO_PACKETS * ISO_PKTSIZE, ISO_PACKETS, iso_cb, NULL, 0);
-        libusb_set_iso_packet_lengths(xfrs[i], ISO_PKTSIZE);
-        if (libusb_submit_transfer(xfrs[i]) == 0) inflight++;
-        else fprintf(stderr, "submit%d失敗\n", i);
+            iso_packets * iso_pkt_size, iso_packets, iso_cb, NULL, 0);
+        libusb_set_iso_packet_lengths(xfrs[i], iso_pkt_size);
+        int submit_rc = libusb_submit_transfer(xfrs[i]);
+        if (submit_rc == 0) inflight++;
+        else fprintf(stderr, "submit%d failed rc=%d (%s)\\n", i, submit_rc, libusb_error_name(submit_rc));
     }
     fprintf(stderr, "[main] iso転送 %d 本投入\n", inflight);
 
@@ -1536,7 +2047,7 @@ int main(int argc, char** argv) {
     double burst_t0 = g_nburst ? g_burst[0].t : 0;
     double start = now_s();
     int bi = 0, bok = 0, bfail = 0;
-    struct timeval tv = {0, 10000}; // 10ms 刻み
+    struct timeval tv = {0, g_pace_output ? 1000 : 10000}; // paced: 1ms wakeup
     const char* env_pt = getenv("HD60S_PT_LOOP");
     int pt_loop = (env_pt && env_pt[0] && env_pt[0] != '0' && env_pt[0] != 'n' && env_pt[0] != 'N');
     double last_pt_fire = 0.0;
@@ -1848,11 +2359,25 @@ int main(int argc, char** argv) {
             libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, rb, 1, 100);
             last_pt_fire = el;
             pt_fires++;
-        }
-        libusb_handle_events_timeout(NULL, &tv);
+    }
+    libusb_handle_events_timeout(NULL, &tv);
+    pace_output_if_due();
     }
     if (pt_loop) fprintf(stderr, "[pt-loop] 継続発火 %d 回\n", pt_fires);
     fprintf(stderr, "[burst] 発行 %d/%d (ok=%d fail=%d)\n", bi, g_nburst, bok, bfail);
+
+    // The pre-burst endpoint carries control/blanking data that can contain
+    // line-marker byte patterns.  Any parser lock obtained there is invalid
+    // for the video phase.  Start a fresh sliding-window search immediately
+    // after the stream-enable burst has completed.
+    g_parser_synced = 0;
+    g_sync_n = 0;
+    g_dyn_n = 0;
+    g_fline = 0;
+    g_blk_run = 0;
+    g_lpos = 0;
+    g_have_prev_line = 0;
+    fprintf(stderr, "[parser] video-phase synchronization reset after burst\n");
 
     // (pt-loop は main iso loop 内でinline 実行、ここでの再ループは削除)
 

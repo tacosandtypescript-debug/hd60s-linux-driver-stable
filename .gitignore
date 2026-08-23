@@ -10,6 +10,7 @@ audio_extract
 offline_parser
 ep81_probe
 spi_dump
+probe_iso
 
 # Runtime output
 captures/
