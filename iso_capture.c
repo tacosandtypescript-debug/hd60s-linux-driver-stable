@@ -1453,14 +1453,17 @@ int main(int argc, char** argv) {
     // complete service-interval payload in each iso descriptor.  Alt2 has
     // wMaxPacketSize=1024 and bMaxBurst=15, so its accepted interval payload
     // is 16 KiB (16 wire transactions), not a 32 KiB individual packet.
-    int iso_pkt_size = (alt == 2) ? 32768 : 1024;
+    // libusb's iso packet length is the individual USB packet size.  The
+    // endpoint descriptor advertises 1024 bytes per transaction; 32 KiB is
+    // the desired aggregate URB payload, not a legal packet length.
+    int iso_pkt_size = 1024;
     const char *pkt_env = getenv("HD60S_ISO_PKT");
     if (pkt_env && *pkt_env) iso_pkt_size = atoi(pkt_env);
     if (iso_pkt_size < 1024) iso_pkt_size = 1024;
     // Keep each URB split across two accepted service-interval descriptors.
     // Passing 32768 as one descriptor exceeds the endpoint's declared
     // per-interval capacity.
-    int iso_packets = (alt == 2) ? 1 : 32;
+    int iso_packets = (alt == 2) ? 32 : 32;
     const char *packets_env = getenv("HD60S_ISO_PKTS");
     if (packets_env && *packets_env) iso_packets = atoi(packets_env);
     if (iso_packets < 1) iso_packets = 1;
