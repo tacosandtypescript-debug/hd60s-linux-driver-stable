@@ -109,7 +109,7 @@ make iso_capture
 1. 上記 `./hd60s live` で iso_capture を起動しておく (mpv は不要なら閉じてよい)
 2. OBS ソース追加:
    - **映像キャプチャデバイス (V4L2)** → デバイス: `/dev/video42`
-   - **音声入力キャプチャ (PulseAudio/PipeWire)** → デバイス: `Monitor of HD60 S Capture Audio`
+   - **音声入力キャプチャ (PulseAudio/PipeWire)** → fuente: `hd60s_capture`
 3. Windows OBS と同じ感覚で録画/配信できる
 
 「音声モニタリング: モニターのみ (出力はミュート)」設定にすれば、プレイ音は PC スピーカーで即時モニタ、録画音は同期して録画される (Windows OBS と同じ挙動)。

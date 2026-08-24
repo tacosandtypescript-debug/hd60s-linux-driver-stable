@@ -61,13 +61,15 @@ static uint64_t now_mono_ns(void) {
 //   wValue = 0x509c  → MCU コマンド経路 (Cypress FX3 内の MCU 相当への 2B コマンド)
 //   bRequest = 0xC0/0xC6 → ベンダ固有 (詳細は notes/protocol.md 参照予定)
 //   bank 0x9a=IT66121 write, 0x9b=IT66121 read setup, 0x9c=IT6802E write, 0x9d=IT6802E read setup
-    // SuperSpeed iso: 1 iso packet = 1 service interval = wBytesPerInterval まで。
-    // Alt2 は 1024B × 16 × 1 = 16384B、alt3 は 1024B × 13 × 2
-    // = 26624B per service interval.  The latter is the capture setting.
+    // SuperSpeed iso: each libusb iso descriptor represents one service
+    // interval payload for this device.  The SS companion descriptors report:
+    // Alt2: wMaxPacketSize=1024, bMaxBurst=15, Mult=1 -> 32768 B/interval.
+    // Alt3: wMaxPacketSize=1024, bMaxBurst=12, Mult=2 -> 39936 B/interval.
+    // The multiplier is zero-based in the descriptor.
 // Windows実測: 32 iso pkt/URB × 16 in-flight = 16MB/64ms でempty 0.07%。
 // Linuxではさらにキュー深度を増やして URB 完了→再サブミット遅延の吸収余裕を確保。
 // libuvcのLinuxデフォルト=100本。8-64本試行で empty% と CPU 負荷のバランスを取る。
-#define NUM_TRANSFERS 506     // empirically stable xHCI ceiling for 005e (~16 MiB in flight)
+#define NUM_TRANSFERS 506     // tested xHCI ceiling: 512 attempted, 506 accepted
 
 static FILE* outf;
 static FILE* g_rdlog = NULL;      // 差分観測: IN読み応答ログ
@@ -75,6 +77,8 @@ static long long total_bytes = 0;
 static long pkt_ok = 0, pkt_empty = 0, pkt_err = 0;
 static int keep_running = 1;
 static int inflight = 0;
+static int max_inflight = 0;
+static unsigned long submit_ok = 0, submit_fail = 0, resubmit_fail = 0;
 
 // ======================================================================
 // SECTION 1: フレーム同期パーサ (映像 + 埋込音声 SEP)
@@ -468,24 +472,19 @@ static void audio_pw_open(void) {
 
     struct pw_properties* props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
-        PW_KEY_MEDIA_CATEGORY, "Playback",
+        PW_KEY_MEDIA_CLASS, "Audio/Source",
+        PW_KEY_MEDIA_CATEGORY, "Capture",
         PW_KEY_MEDIA_ROLE, "Game",
-        PW_KEY_NODE_NAME, "hd60s-monitor",
-        PW_KEY_NODE_DESCRIPTION, "HD60 S Monitor",
+        PW_KEY_MEDIA_NAME, "hd60s_capture",
+        PW_KEY_NODE_NAME, "hd60s_capture",
+        PW_KEY_NODE_DESCRIPTION, "Elgato HD60 S Audio Capture",
         PW_KEY_NODE_LATENCY, "128/48000",   // 128 samples @ 48kHz = 2.6ms
         PW_KEY_NODE_ALWAYS_PROCESS, "true",
         NULL);
-    // Route audio to a dedicated sink when requested. Its monitor becomes
-    // a normal Audio/Source that OBS can select.
-    const char *audio_target = getenv("HD60S_AUDIO_TARGET");
-    if (audio_target && audio_target[0]) {
-        pw_properties_set(props, PW_KEY_TARGET_OBJECT, audio_target);
-        fprintf(stderr, "[audio-pw] target: %s (OBS source is its monitor)\n", audio_target);
-    }
 
     g_pw_stream = pw_stream_new_simple(
         pw_thread_loop_get_loop(g_pw_loop),
-        "hd60s-monitor",
+        "hd60s_capture",
         props,
         &g_pw_events,
         NULL);
@@ -527,7 +526,7 @@ static void audio_pw_open(void) {
 
     pw_thread_loop_unlock(g_pw_loop);
     pw_thread_loop_start(g_pw_loop);
-    fprintf(stderr, "[audio-pw] PipeWire ネイティブ stream 起動 (48kHz S16_LE mono, PW graph 一致で downsample 段消去)\n");
+    fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE mono)\n");
 
     // 2026-07-19 libsamplerate 初期化 (SINC MEDIUM QUALITY): linear interp より
     // 位相・振幅の色付けが激減。SEP レート測定完了後に src_ratio を set する。
@@ -1036,20 +1035,44 @@ static void parser_feed(const uint8_t* data, size_t len) {
         }
         memcpy(g_sync_buf + g_sync_n, data, take);
         g_sync_n += take;
-        // Do not lock on three accidental byte patterns.  Before video is
-        // enabled the stream contains control/blanking data in which the
-        // four-byte ACT marker can occur by chance.  A real line run has ACT
-        // markers 3844 or 3856 bytes apart (3840-byte YUYV payload plus the
-        // protocol marker/padding).  Require a long chain before accepting
-        // the starting offset.
-        const int LOCK_LINES = 8;
-        for (size_t p = 0; p + 3004 * LOCK_LINES <= g_sync_n; ++p) {
+        // Do not lock on an arbitrary ACT run.  The video phase begins with
+        // a vertical blanking run (normally 45 BLK markers) followed by the
+        // first ACT line.  The stream can contain a long ACT preamble before
+        // that BLK run; locking on eight ACT markers there starts the frame at
+        // an arbitrary vertical line and creates a continuous roll.  Require
+        // a real BLK->ACT transition and start immediately after the final
+        // BLK marker, so the next 1080 ACT events are one complete frame.
+        const int LOCK_BLK = 30;
+        const int LOCK_ACT = 8;
+        for (size_t p = 0; p + 3004 * (LOCK_BLK + LOCK_ACT) <= g_sync_n; ++p) {
             uint32_t first;
             memcpy(&first, g_sync_buf + p, 4);
-            if (first != MK_EOL_ACT) continue;
-            size_t cursor = p;
+            if (first != MK_EOL_BLK) continue;
+
+            size_t last_blk = p;
+            int blk_count = 1;
+            while (blk_count < 60) {
+                size_t lo = last_blk + 3000;
+                size_t hi = last_blk + 4100;
+                if (hi + 4 > g_sync_n) break;
+                size_t next_pos = SIZE_MAX;
+                uint32_t next = 0;
+                for (size_t q = lo; q <= hi; ++q) {
+                    memcpy(&next, g_sync_buf + q, 4);
+                    if (next == MK_EOL_BLK || next == MK_EOL_ACT) {
+                        next_pos = q;
+                        break;
+                    }
+                }
+                if (next_pos == SIZE_MAX || next != MK_EOL_BLK) break;
+                last_blk = next_pos;
+                blk_count++;
+            }
+            if (blk_count < LOCK_BLK) continue;
+
+            size_t cursor = last_blk;
             int matched = 1;
-            for (int k = 1; k < LOCK_LINES; ++k) {
+            for (int k = 0; k < LOCK_ACT; ++k) {
                 size_t lo = cursor + 3000;
                 size_t hi = cursor + 4100;
                 if (hi + 4 > g_sync_n) { matched = 0; break; }
@@ -1067,7 +1090,7 @@ static void parser_feed(const uint8_t* data, size_t len) {
             }
             if (matched) {
                 g_parser_synced = 1;
-                size_t off = p + 4;
+                size_t off = last_blk + 4;
                 size_t remain = g_sync_n - off;
                 while (remain) {
                     size_t chunk = remain > 60000 ? 60000 : remain;
@@ -1286,7 +1309,10 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
         } else pkt_err++;
     }
     if (keep_running) {
-        if (libusb_submit_transfer(xfr) < 0) { inflight--; }
+        if (libusb_submit_transfer(xfr) < 0) {
+            inflight--;
+            resubmit_fail++;
+        }
     } else {
         inflight--;
     }
@@ -1442,28 +1468,19 @@ int main(int argc, char** argv) {
     // 秒数 0 or 負数を「実用上無限 (~68 年)」に扱う
     // 注: 100 年 = 3,153,600,000 は int overflow なので INT_MAX-3600 で安全
     if (read_sec <= 0) read_sec = 2147480047;  // INT_MAX - 3600, ~68 years
-    // Alternate 3 is the high-bandwidth SuperSpeed video setting:
-    // 13 burst units × 2 transactions × 1024 bytes = 26624 bytes/interval.
-    // Alt2 is only 16384 bytes/interval and cannot sustain the requested
-    // 1080p60 YUYV stream.
+    // The default is Alt2, confirmed from the device descriptor as
+    // bMaxBurst=15, Mult=1, with 32768 bytes per service interval.
     int alt = argc > 2 ? atoi(argv[2]) : 2;
-    // SuperSpeed companion descriptor: wBytesPerInterval for this device.
-    // The 005e revision exposes different payload capacities per alternate.
-    // For SuperSpeed isochronous transfers, usbfs/libusb represents the
-    // complete service-interval payload in each iso descriptor.  Alt2 has
-    // wMaxPacketSize=1024 and bMaxBurst=15, so its accepted interval payload
-    // is 16 KiB (16 wire transactions), not a 32 KiB individual packet.
-    // libusb's iso packet length is the individual USB packet size.  The
-    // endpoint descriptor advertises 1024 bytes per transaction; 32 KiB is
-    // the desired aggregate URB payload, not a legal packet length.
-    int iso_pkt_size = 1024;
+    // On this device/libusb stack, one iso descriptor accepts the complete
+    // Alt2 service-interval payload.  32768 x 1 was verified on hardware
+    // without EMSGSIZE and restored the expected USB throughput.
+    int iso_pkt_size = (alt == 2) ? 32768 : 1024;
     const char *pkt_env = getenv("HD60S_ISO_PKT");
     if (pkt_env && *pkt_env) iso_pkt_size = atoi(pkt_env);
     if (iso_pkt_size < 1024) iso_pkt_size = 1024;
-    // Keep each URB split across two accepted service-interval descriptors.
-    // Passing 32768 as one descriptor exceeds the endpoint's declared
-    // per-interval capacity.
-    int iso_packets = (alt == 2) ? 32 : 32;
+    // One descriptor corresponds to one complete service interval.  Queue
+    // depth is provided by NUM_TRANSFERS, not by subdividing the burst.
+    int iso_packets = (alt == 2) ? 1 : 32;
     const char *packets_env = getenv("HD60S_ISO_PKTS");
     if (packets_env && *packets_env) iso_packets = atoi(packets_env);
     if (iso_packets < 1) iso_packets = 1;
@@ -1902,10 +1919,19 @@ int main(int argc, char** argv) {
             iso_packets * iso_pkt_size, iso_packets, iso_cb, NULL, 0);
         libusb_set_iso_packet_lengths(xfrs[i], iso_pkt_size);
         int submit_rc = libusb_submit_transfer(xfrs[i]);
-        if (submit_rc == 0) inflight++;
-        else fprintf(stderr, "submit%d failed rc=%d (%s)\\n", i, submit_rc, libusb_error_name(submit_rc));
+        if (submit_rc == 0) {
+            inflight++;
+            submit_ok++;
+            if (inflight > max_inflight) max_inflight = inflight;
+        } else {
+            submit_fail++;
+            fprintf(stderr, "submit%d failed rc=%d (%s)\\n", i, submit_rc, libusb_error_name(submit_rc));
+        }
     }
     fprintf(stderr, "[main] iso転送 %d 本投入\n", inflight);
+
+    fprintf(stderr, "[iso] submit summary ok=%lu fail=%lu max_inflight=%d current=%d\\n",
+            submit_ok, submit_fail, max_inflight, inflight);
 
     // 🔍 IT66121 状態 dump (パススルー sequence 前後の切り分け用)
     // マクロは file 後半で定義されてるので inline で書く
