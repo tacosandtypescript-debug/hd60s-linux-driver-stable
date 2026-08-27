@@ -20,8 +20,8 @@
 `./hd60s live` 一発で:
 
 - ✅ **1080p60 YUYV 映像キャプチャ** → `/dev/video42` (v4l2loopback) → OBS Studio / mpv / ffmpeg などから利用
-- ✅ **48kHz mono 音声出力** → PipeWire source `hd60s_capture` → OBS / スピーカー
-- ✅ **ALSA fallback** → `snd-aloop` playback `hw:10,0` / capture `hw:10,1`
+- ✅ **96kHz mono 音声出力** → `snd-aloop` playback `hw:10,0` / capture `hw:10,1` → PipeWire source `hd60s_capture` → OBS
+- ✅ **音声ソース自動公開** → supervisor が `module-alsa-source` を重複なくロードし、OBS から選択可能
 - ✅ **HDMI パススルー** (HD60 S HDMI OUT → TV) を並行して 低遅延で維持 (ゲームプレイに使える)
 - ✅ **iso capture と パススルー 同時動作** (Windows Elgato Game Capture ソフトと同じ運用パターンが可能)
 
@@ -163,11 +163,11 @@ systemctl --user enable --now hd60s.service
    │  iso_capture (libusb)│
    │  - Init + MCU/CPLD   │
    │  - Frame parser      │
-   │  - PipeWire stream   │
+   │  - ALSA audio feed   │
    └───┬──────────────┬───┘
        │              │
-       ▼              ▼
-  /dev/video42    PipeWire source
+      ▼              ▼
+  /dev/video42    snd-aloop → PipeWire source
   (v4l2loopback)   "hd60s_capture"
        │              │
        ▼              ▼
@@ -288,7 +288,8 @@ Windows Elgato Game Capture ソフトの USB pcap を提供いただけると、
 One-shot launch (`./hd60s live`) delivers:
 
 - ✅ 1080p60 YUYV video via `/dev/video42` (v4l2loopback) — OBS Studio / mpv / ffmpeg compatible
-- ✅ 48kHz mono audio via PipeWire source `hd60s_capture` — for OBS / speaker monitoring
+- ✅ 96kHz mono audio via the stable PipeWire/Pulse source `hd60s_capture` — for OBS / speaker monitoring
+- ✅ Automatic ALSA loopback publication (`hw:10,0` playback → `hw:10,1` capture) without manual `pactl` commands
 - ✅ HDMI passthrough (HD60 S HDMI OUT → TV) simultaneously with low latency for gameplay
 - ✅ Simultaneous iso capture and passthrough (matches Windows Elgato app usage pattern)
 

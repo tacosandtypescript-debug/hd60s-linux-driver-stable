@@ -104,16 +104,16 @@ case "$CMD" in
     tmux new-session -d -s hd60s -x 220 -y 55 \
         -e "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" -e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
     # ペイン1 (上): iso_capture — Ctrl+C まで無限実行 (argv[1]=0 で 100年扱い)
-    # 音声は libpipewire で直接 PipeWire ノード "hd60s-monitor" に流れる
-    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=1 ./run-hd60s-obs.sh" Enter
+    # 音声は snd-aloop の hw:10,0 → hw:10,1 経由で hd60s_capture に公開される
+    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 ./run-hd60s-obs.sh" Enter
     # ペイン2 (下): mpv 映像プレビュー - 13秒後起動 (HD60S_NO_MPV=1 で抑制)
     # OBS 使うなら mpv は不要 → プレビューが要らないなら NO_MPV=1 で起動しない
     if [ -z "${HD60S_NO_MPV:-}" ]; then
         tmux split-window -v -t hd60s
         tmux send-keys -t hd60s "sleep 13 && mpv --vo=wlshm --untimed --profile=low-latency --no-audio --demuxer-lavf-o=input_format=yuyv422,video_size=1920x1080 av://v4l2:$VDEV" Enter
-        say "tmux 'hd60s' 起動: 上=iso_capture(無限, 音声PipeWire直結) / 下=mpvプレビュー"
+        say "tmux 'hd60s' 起動: 上=iso_capture(無限, 音声ALSA→PipeWire) / 下=mpvプレビュー"
     else
-        say "tmux 'hd60s' 起動: iso_capture のみ (無限、音声PipeWire直結) — HD60S_NO_MPV=1"
+        say "tmux 'hd60s' 起動: iso_capture のみ (無限、音声ALSA→PipeWire) — HD60S_NO_MPV=1"
     fi
     say "  切替: Ctrl+B → 矢印 / 抜ける: Ctrl+B → d / 全終了: Ctrl+B → q"
     sleep 3

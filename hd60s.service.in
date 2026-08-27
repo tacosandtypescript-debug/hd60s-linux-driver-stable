@@ -11,6 +11,7 @@ RestartSec=2s
 KillMode=mixed
 TimeoutStopSec=10s
 Environment=HD60S_CADENCE_DIAG=1
+Environment=HD60S_AUDIO_PW=0
 
 [Install]
 WantedBy=default.target
