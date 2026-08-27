@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Kernel](https://img.shields.io/badge/Kernel-7.0+-orange.svg)]()
 [![PipeWire](https://img.shields.io/badge/PipeWire-1.6+-yellow.svg)]()
-[![Status](https://img.shields.io/badge/Status-Working-brightgreen.svg)]()
+[![Status](https://img.shields.io/badge/Status-Experimental-orange.svg)]()
 
 **Elgato HD60 S (HDMI キャプチャカード) を Linux で動作させる**、USB プロトコル・レジスタマップ・MCU シーケンスを逆解析して作った ユーザーランドドライバ。純正ドライバは Windows / macOS のみ、それ以前の Linux 実装も存在しなかった (Doug Brown が 2024/09 に "no Linux drivers exist" と明言) ため、実質的に **公開されている唯一の HD60 S Linux 実装** です (2026-07 時点、私達の把握範囲で)。
 
@@ -20,11 +20,13 @@
 `./hd60s live` 一発で:
 
 - ✅ **1080p60 YUYV 映像キャプチャ** → `/dev/video42` (v4l2loopback) → OBS Studio / mpv / ffmpeg などから利用
-- ✅ **48kHz mono 音声出力** → PipeWire 専用 sink → OBS の `Monitor of HD60 S Capture Audio` / スピーカー
+- ✅ **48kHz mono 音声出力** → PipeWire source `hd60s_capture` → OBS / スピーカー
+- ✅ **ALSA fallback** → `snd-aloop` playback `hw:10,0` / capture `hw:10,1`
 - ✅ **HDMI パススルー** (HD60 S HDMI OUT → TV) を並行して 低遅延で維持 (ゲームプレイに使える)
 - ✅ **iso capture と パススルー 同時動作** (Windows Elgato Game Capture ソフトと同じ運用パターンが可能)
 
-Nintendo Switch を接続して 動作確認済み。長時間プレイでも安定 (iso packet loss ~5-7%)。
+Nintendo Switch を接続した過去の実機 run では動作を確認済み (iso packet loss ~5-7%)。
+この checkout では parser/build/install の offline 検証を済ませているが、HD60 S が未接続のため、現在のホストでの OBS と再接続の実機検証は未完了。
 
 ## Windows Elgato Game Capture ソフトとの比較
 
@@ -127,7 +129,7 @@ systemctl --user enable --now hd60s.service
 1. 上記 `./hd60s live` で iso_capture を起動しておく (mpv は不要なら閉じてよい)
 2. OBS ソース追加:
    - **映像キャプチャデバイス (V4L2)** → デバイス: `/dev/video42`
-   - **音声入力キャプチャ (PulseAudio/PipeWire)** → fuente: `hd60s_capture`
+   - **音声入力キャプチャ (PulseAudio/PipeWire)** → source: `hd60s_capture`
 3. Windows OBS と同じ感覚で録画/配信できる
 
 「音声モニタリング: モニターのみ (出力はミュート)」設定にすれば、プレイ音は PC スピーカーで即時モニタ、録画音は同期して録画される (Windows OBS と同じ挙動)。
@@ -165,8 +167,8 @@ systemctl --user enable --now hd60s.service
    └───┬──────────────┬───┘
        │              │
        ▼              ▼
-  /dev/video42    PipeWire node
-  (v4l2loopback)   "hd60s-monitor"
+  /dev/video42    PipeWire source
+  (v4l2loopback)   "hd60s_capture"
        │              │
        ▼              ▼
     OBS / mpv     OBS / speakers
@@ -268,7 +270,8 @@ PR / Issue 歓迎します。特に:
 
 - [ ] 720p60 / 1080p30 モード対応
 - [ ] HD60 S+ / HD60 X 対応 (別チップだが構造が近い可能性、要 pcap)
-- [ ] ホットプラグ対応 (udev + libusb hotplug)
+- [x] ユーザー空間 supervisor による USB 切断・再列挙の自動再試行
+- [ ] libusb hotplug API によるイベント駆動のホットプラグ
 - [ ] 純正 V4L2 カーネルモジュール化 (userspace で安定したら)
 - [ ] EDID 制御 (現状は Switch から出た EDID をそのまま TV に流している)
 
@@ -285,7 +288,7 @@ Windows Elgato Game Capture ソフトの USB pcap を提供いただけると、
 One-shot launch (`./hd60s live`) delivers:
 
 - ✅ 1080p60 YUYV video via `/dev/video42` (v4l2loopback) — OBS Studio / mpv / ffmpeg compatible
-- ✅ 96kHz mono audio via PipeWire node `hd60s-monitor` — for OBS / speaker monitoring
+- ✅ 48kHz mono audio via PipeWire source `hd60s_capture` — for OBS / speaker monitoring
 - ✅ HDMI passthrough (HD60 S HDMI OUT → TV) simultaneously with low latency for gameplay
 - ✅ Simultaneous iso capture and passthrough (matches Windows Elgato app usage pattern)
 
