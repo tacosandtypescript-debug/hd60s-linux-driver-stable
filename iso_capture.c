@@ -196,6 +196,8 @@ static uint8_t g_pace_frame[FRAME_BYTES];
 static int g_pace_have_frame = 0;
 static uint64_t g_pace_next_ns = 0;
 static unsigned long long g_v4l_write_seq = 0;
+static unsigned long long g_pace_frame_seq = 0;
+static unsigned long long g_pace_last_written_seq = 0;
 
 // Temporary cadence diagnostics.  These counters do not alter capture logic.
 static int g_diag = 0;
@@ -204,6 +206,8 @@ static uint64_t g_diag_last_write_ns = 0;
 static unsigned long long g_diag_blk = 0, g_diag_complete = 0;
 static unsigned long long g_diag_partial = 0, g_diag_resets = 0;
 static unsigned long long g_diag_writes = 0, g_diag_write_fail = 0;
+static unsigned long long g_diag_discarded = 0;
+static unsigned long long g_diag_paced_new = 0, g_diag_paced_repeat = 0;
 static unsigned long long g_diag_interval_n = 0, g_diag_latency_n = 0, g_diag_write_dur_n = 0;
 static unsigned long long g_diag_markers = 0, g_diag_q_bad = 0;
 static unsigned long long g_diag_act = 0;
@@ -221,14 +225,17 @@ static void diag_report_if_due(void) {
     if (now - g_diag_window_ns < 1000000000ull) return;
     double sec = (double)(now - g_diag_window_ns) / 1e9;
     fprintf(stderr,
-            "[cadence] %.3fs BLK=%llu complete=%llu partial=%llu resets=%llu "
+            "[cadence] %.3fs BLK=%llu complete=%llu partial=%llu resets=%llu discarded=%llu "
             "v4l_write=%llu fail=%llu fps_complete=%.3f fps_write=%.3f "
+            "paced_new=%llu paced_repeat=%llu "
             "write_dt_us[min/avg/max]=%llu/%.1f/%llu latency_us[min/avg/max]=%llu/%.1f/%llu "
             "write_call_us[min/avg/max]=%llu/%.1f/%llu markers[A/B]=%llu/%llu "
             "marker_q[min/max/bad]=%zu/%zu/%llu input_MBps=%.2f\n",
             sec, g_diag_blk, g_diag_complete, g_diag_partial, g_diag_resets,
+            g_diag_discarded,
             g_diag_writes, g_diag_write_fail,
             g_diag_complete / sec, g_diag_writes / sec,
+            g_diag_paced_new, g_diag_paced_repeat,
             g_diag_interval_n ? (unsigned long long)(g_diag_interval_min / 1000) : 0,
             g_diag_interval_n ? (double)(g_diag_interval_sum / g_diag_interval_n / 1000.0) : 0.0,
             g_diag_interval_n ? (unsigned long long)(g_diag_interval_max / 1000) : 0,
@@ -244,6 +251,8 @@ static void diag_report_if_due(void) {
     g_diag_window_ns = now;
     g_diag_blk = g_diag_complete = g_diag_partial = g_diag_resets = 0;
     g_diag_writes = g_diag_write_fail = 0;
+    g_diag_discarded = 0;
+    g_diag_paced_new = g_diag_paced_repeat = 0;
     g_diag_interval_n = g_diag_latency_n = g_diag_write_dur_n = 0;
     g_diag_markers = g_diag_q_bad = 0;
     g_diag_act = 0;
@@ -982,6 +991,10 @@ static uint8_t g_dyn_buf[131072];
 static size_t g_dyn_n = 0;
 static uint8_t g_prev_line[LINE_BYTES];
 static int g_have_prev_line = 0;
+// After a transport/parser loss, do not publish the first structurally
+// ambiguous 1080-line group.  Wait for a complete vertical blanking run
+// before resuming output.
+static int g_recovery_pending = 0;
 
 static void parser_notify_loss(size_t bytes_lost);
 
@@ -1019,6 +1032,7 @@ static void emit_frame(void) {
         // complete frame here; this does not change assembly or USB timing.
         memcpy(g_pace_frame, g_framebuf, FRAME_BYTES);
         g_pace_have_frame = 1;
+        g_pace_frame_seq = g_frames_out + 1;
     } else if (g_v4l_fd >= 0) {
         uint64_t write_start_ns = now_mono_ns();
         ssize_t w = write(g_v4l_fd, g_framebuf, FRAME_BYTES);
@@ -1088,6 +1102,13 @@ static void pace_output_if_due(void) {
         if (dur > g_diag_write_dur_max) g_diag_write_dur_max = dur;
     }
     if (w == FRAME_BYTES) {
+        if (g_diag) {
+            if (g_pace_frame_seq == g_pace_last_written_seq)
+                g_diag_paced_repeat++;
+            else
+                g_diag_paced_new++;
+        }
+        g_pace_last_written_seq = g_pace_frame_seq;
         g_diag_writes++;
         if (g_diag_last_write_ns) {
             uint64_t dt = write_done_ns - g_diag_last_write_ns;
@@ -1219,11 +1240,21 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
             if (g_fline >= FRAME_H) {
                 int frame_lines = g_fline;
                 int frame_blks = g_blk_run;
-                fprintf(stderr, "[frame] emit #%llu lines=%d BLK=%d %s\n",
-                        g_frames_out + 1, frame_lines, frame_blks,
-                        frame_blks == EXPECTED_FRAME_BLK ? "OK" : "ANOMALY");
-                if (g_diag) g_diag_complete++;
-                emit_frame();
+                int valid_after_recovery = !g_recovery_pending ||
+                                           frame_blks == EXPECTED_FRAME_BLK;
+                if (valid_after_recovery) {
+                    fprintf(stderr, "[frame] emit #%llu lines=%d BLK=%d %s\n",
+                            g_frames_out + 1, frame_lines, frame_blks,
+                            frame_blks == EXPECTED_FRAME_BLK ? "OK" : "ANOMALY");
+                    if (g_diag) g_diag_complete++;
+                    emit_frame();
+                    g_recovery_pending = 0;
+                } else {
+                    fprintf(stderr,
+                            "[frame-drop] complete lines=%d BLK=%d expected=%d reason=post-resync\n",
+                            frame_lines, frame_blks, EXPECTED_FRAME_BLK);
+                    if (g_diag) g_diag_discarded++;
+                }
                 g_fline = 0;
                 g_blk_run = 0;
                 g_diag_frame_start_ns = 0;
@@ -1466,6 +1497,7 @@ static void parser_notify_loss(size_t bytes_lost) {
     g_parser_synced = 0;
     g_fline = 0;
     g_blk_run = 0;
+    g_recovery_pending = 1;
     g_have_prev_line = 0;
     g_diag_frame_start_ns = 0;
     g_resyncs++;
