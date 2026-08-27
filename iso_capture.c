@@ -1272,9 +1272,8 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
             if (g_fline >= FRAME_H) {
                 int frame_lines = g_fline;
                 int frame_blks = g_blk_run;
-                int valid_after_recovery = !g_recovery_pending ||
-                                           frame_blks == EXPECTED_FRAME_BLK;
-                if (valid_after_recovery) {
+                int structurally_valid = frame_blks == EXPECTED_FRAME_BLK;
+                if (structurally_valid) {
                     fprintf(stderr, "[frame] emit #%llu lines=%d BLK=%d %s\n",
                             g_frames_out + 1, frame_lines, frame_blks,
                             frame_blks == EXPECTED_FRAME_BLK ? "OK" : "ANOMALY");
@@ -1283,9 +1282,13 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
                     g_recovery_pending = 0;
                 } else {
                     fprintf(stderr,
-                            "[frame-drop] complete lines=%d BLK=%d expected=%d reason=post-resync\n",
+                            "[frame-drop] complete lines=%d BLK=%d expected=%d reason=structural\n",
                             frame_lines, frame_blks, EXPECTED_FRAME_BLK);
                     if (g_diag) g_diag_discarded++;
+                    // A wrong BLK count means the vertical phase is not
+                    // trustworthy even when no packet error was reported.
+                    // Require the next complete 45-BLK group before output.
+                    g_recovery_pending = 1;
                 }
                 g_fline = 0;
                 g_blk_run = 0;
