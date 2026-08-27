@@ -53,7 +53,7 @@ Nintendo Switch を接続して 動作確認済み。長時間プレイでも安
 - **USB**: **USB 3.0 (SuperSpeed) 必須**。1080p60 は 2Gbps 出るので USB 2.0 だと帯域が足りない
 - **音声**: **PipeWire** (PulseAudio only 環境では動作しない、PulseAudio → PipeWire 移行済み想定)
 - **v4l2loopback**: 0.15.3 以降 推奨 (`exclusive_caps=0` で運用)
-- **対象デバイス**: Elgato Game Capture HD60 S (VID `0fd9` / PID `0074`) — **HD60 S+ は別チップ構成なので動かない**
+- **対象デバイス**: Elgato Game Capture HD60 S (VID `0fd9` / PID `005e`) — **HD60 S+ は別チップ構成なので動かない**
 
 ### 既知の制約 / TODO
 
@@ -61,7 +61,7 @@ Nintendo Switch を接続して 動作確認済み。長時間プレイでも安
 - Wayland + NVIDIA GPU 環境で mpv `--vo=gpu-next` が MESA ZINK エラーで動かない場合あり → `--vo=wlshm` を強制 (wrapper で対応済)
 - 30fps / 720p60 モードは未実装 (1080p60 のみ動作確認)
 - HD60 S+ / HD60 X などの後継モデルは非対応
-- ホットプラグは非対応 (起動時に接続してる前提)
+- ホットプラグは supervisor 経由で自動再試行するが、物理的な USB 再列挙そのものは OS/デバイス側に依存する
 
 ---
 
@@ -74,13 +74,21 @@ sudo apt install \
   libusb-1.0-0-dev \
   libasound2-dev \
   libpipewire-0.3-dev \
+  libsamplerate0-dev \
   v4l2loopback-dkms \
   alsa-utils \
   tmux mpv ffmpeg
 
 # ビルド
-make iso_capture
+make all
+
+# 任意: /usr/local にインストール (udev ルールも配置)
+sudo make install
 ```
+
+`make install` は実行ファイル、必要な解析用 TSV、`hd60s` ランチャー、
+自動再試行用 `run-hd60s-obs.sh` を `/usr/local/libexec/hd60s` に配置し、
+`/usr/local/bin/hd60s` と udev ルールを作成します。削除は `sudo make uninstall` です。
 
 ---
 
@@ -94,7 +102,7 @@ make iso_capture
 
 これで tmux セッションが立ち上がる:
 
-- **上ペイン**: `iso_capture` — USB 制御、映像/音声抽出、PipeWire ノード公開
+- **上ペイン**: 自動再試行 supervisor — USB 制御、映像/音声抽出、PipeWire ノード公開
 - **下ペイン**: `mpv` — 13 秒後に自動で `/dev/video42` を再生
 
 **同時に TV には HDMI パススルー経由でゲーム映像が低遅延で出る** (プレイに使う経路)。
@@ -276,13 +284,14 @@ One-shot launch (`./hd60s live`) delivers:
 - Ubuntu 25.04+ (kernel 7.0+), PipeWire 1.6+
 - USB 3.0 (SuperSpeed) — 1080p60 requires ~2 Gbps, USB 2.0 insufficient
 - v4l2loopback 0.15.3+ with `exclusive_caps=0`
-- Elgato HD60 S (VID `0fd9` / PID `0074`) — **HD60 S+ is a different chipset and not supported**
+- Elgato HD60 S (VID `0fd9` / PID `005e`) — **HD60 S+ is a different chipset and not supported**
 
 ## Build & Run
 
 ```bash
-sudo apt install build-essential libusb-1.0-0-dev libasound2-dev libpipewire-0.3-dev v4l2loopback-dkms alsa-utils tmux mpv ffmpeg
-make iso_capture
+sudo apt install build-essential pkg-config libusb-1.0-0-dev libasound2-dev libpipewire-0.3-dev libsamplerate0-dev v4l2loopback-dkms v4l2loopback-utils alsa-utils tmux mpv ffmpeg
+make all
+sudo make install
 ./hd60s live
 ```
 

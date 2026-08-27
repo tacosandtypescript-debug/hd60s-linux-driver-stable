@@ -1,5 +1,9 @@
 CC ?= gcc
 CFLAGS ?= -O2 -Wall
+PREFIX ?= /usr/local
+LIBEXECDIR ?= $(PREFIX)/libexec/hd60s
+UDEVRULEDIR ?= /etc/udev/rules.d
+UDEVRULE := 70-elgato-hd60s.rules
 LIBUSB_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
 LIBUSB_LIBS := $(shell pkg-config --libs libusb-1.0)
 ALSA_LIBS := -lasound
@@ -25,7 +29,23 @@ clean:
 install-symlink:
 	ln -sf $(CURDIR)/hd60s /usr/local/bin/hd60s
 
-.PHONY: all clean install-symlink
+.PHONY: all clean install install-symlink uninstall
+
+install: all
+	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin"
+	install -m 0755 iso_capture hd60s run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
+	install -m 0644 analysis/*.tsv "$(DESTDIR)$(LIBEXECDIR)/analysis/"
+	install -d "$(DESTDIR)$(UDEVRULEDIR)"
+	install -m 0644 $(UDEVRULE) "$(DESTDIR)$(UDEVRULEDIR)/$(UDEVRULE)"
+	ln -sfn "$(LIBEXECDIR)/hd60s" "$(DESTDIR)$(PREFIX)/bin/hd60s"
+	@if test -z "$(DESTDIR)" && command -v udevadm >/dev/null 2>&1; then \
+		udevadm control --reload-rules; udevadm trigger --subsystem-match=usb; \
+	fi
+
+uninstall:
+	rm -f "$(DESTDIR)$(PREFIX)/bin/hd60s"
+	rm -f "$(DESTDIR)$(UDEVRULEDIR)/$(UDEVRULE)"
+	rm -rf "$(DESTDIR)$(LIBEXECDIR)"
 
 spi_dump: spi_dump.c
 	$(CC) $(CFLAGS) $(LIBUSB_CFLAGS) $< -o $@ $(LIBUSB_LIBS)

@@ -19,7 +19,7 @@
 #include <libusb-1.0/libusb.h>
 
 #define VID 0x0fd9
-#define PID 0x0074
+#define PID 0x005e
 
 static int hd60s_read_spi(libusb_device_handle* h, uint32_t addr, uint8_t out[64]) {
     uint8_t setup[6] = {
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     libusb_init(NULL);
     libusb_device_handle* h = libusb_open_device_with_vid_pid(NULL, VID, PID);
     if (!h) {
-        fprintf(stderr, "HD60S (0fd9:0074) not found\n");
+        fprintf(stderr, "HD60 S (0fd9:005e) not found\n");
         libusb_exit(NULL);
         return 1;
     }

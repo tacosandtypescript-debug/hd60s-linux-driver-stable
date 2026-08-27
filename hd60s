@@ -5,7 +5,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 
 CMD="${1:-help}"; SEC="${2:-}"
 VDEV="/dev/video42"
-ADEV="hw:10,1"
+ADEV="hw:10,0"
 
 # ---------- helpers ----------
 say()  { echo "[hd60s] $*"; }
@@ -60,8 +60,10 @@ set_caps() {
 }
 
 kill_capture() {
+    sudo pkill -TERM -f 'run-hd60s-obs\.sh' 2>/dev/null || true
     sudo pkill -TERM -x iso_capture 2>/dev/null || true
     sleep 1
+    sudo pkill -9 -f 'run-hd60s-obs\.sh' 2>/dev/null || true
     sudo pkill -9 -x iso_capture 2>/dev/null || true
 }
 
@@ -93,7 +95,7 @@ case "$CMD" in
         -e "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" -e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
     # ペイン1 (上): iso_capture — Ctrl+C まで無限実行 (argv[1]=0 で 100年扱い)
     # 音声は libpipewire で直接 PipeWire ノード "hd60s-monitor" に流れる
-    tmux send-keys -t hd60s "cd $HERE && sudo XDG_RUNTIME_DIR=/run/user/\$(id -u) HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_IT6802_RECOVER=1 HD60S_AUDIO_PW=1 ./iso_capture 0 2 5" Enter
+    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=1 ./run-hd60s-obs.sh" Enter
     # ペイン2 (下): mpv 映像プレビュー - 13秒後起動 (HD60S_NO_MPV=1 で抑制)
     # OBS 使うなら mpv は不要 → プレビューが要らないなら NO_MPV=1 で起動しない
     if [ -z "${HD60S_NO_MPV:-}" ]; then
@@ -118,7 +120,7 @@ case "$CMD" in
     kill_capture
     HERE="$PWD"
     tmux new-session -d -s hd60s -x 200 -y 50
-    tmux send-keys -t hd60s "cd $HERE && sudo ./iso_capture 3600 2 5" Enter
+    tmux send-keys -t hd60s "cd $HERE && ./run-hd60s-obs.sh" Enter
     say "iso_capture 起動 (tmux 'hd60s')。映像ロック待ち 12秒..."
     sleep 12
     say "OBS 起動..."
@@ -223,6 +225,7 @@ case "$CMD" in
     # 深緑色化の修正テスト: init-p2-color.tsv (InfoFrame command 復活版) 使用
     SEC="${SEC:-30}"
     prep
+    [ -r analysis/init-p2-color.tsv ] || die "analysis/init-p2-color.tsv がありません。色空間用のローカル参照 TSV を配置してください"
     say "色空間修正テスト ${SEC}秒: init-p2-color.tsv (InfoFrame 復活版)"
     exec sudo -E HD60S_INIT_TSV=analysis/init-p2-color.tsv ./iso_capture "$SEC" 2 5
     ;;
@@ -239,8 +242,8 @@ case "$CMD" in
     # Windows Elgato pcap から抽出した audio init コマンドを merge した init 使う
     SEC="${SEC:-15}"
     prep
-    say "Windows audio init merge テスト ${SEC}秒: init-p2-audio.tsv 使用"
-    exec sudo -E HD60S_INIT_TSV=analysis/init-p2-audio.tsv ./iso_capture "$SEC" 2 5
+    say "Windows audio init テスト ${SEC}秒: init-p2-audio-fast.tsv 使用"
+    exec sudo -E HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv ./iso_capture "$SEC" 2 5
     ;;
 
   busy)
@@ -259,7 +262,7 @@ case "$CMD" in
         fi
     }
     chk "iso_capture ビルド済み"   "[ -x ./iso_capture ]"                     "cd $(pwd) && make"
-    chk "HD60S 接続 (USB 0fd9:0074)" "lsusb | grep -qi 0fd9:0074"              "USB ケーブル/電源を確認"
+    chk "HD60 S 接続 (USB 0fd9:005e)" "lsusb | grep -qi 0fd9:005e"              "USB ケーブル/電源を確認"
     chk "v4l2loopback ロード済み"  "lsmod | grep -q v4l2loopback"              "sudo modprobe v4l2loopback video_nr=42 card_label=HD60S exclusive_caps=0"
     chk "$VDEV 存在"               "[ -e $VDEV ]"                              "v4l2loopback を video_nr=42 でロード"
     chk "snd-aloop ロード済み"     "lsmod | grep -q snd_aloop"                 "sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1"
@@ -277,7 +280,8 @@ case "$CMD" in
   install-deps)
     say "apt package まとめてインストール..."
     need_sudo
-    PKGS=(build-essential pkg-config libusb-1.0-0-dev
+    PKGS=(build-essential pkg-config libusb-1.0-0-dev libasound2-dev
+          libpipewire-0.3-dev libsamplerate0-dev
           v4l2loopback-dkms v4l2loopback-utils linux-headers-$(uname -r)
           ffmpeg vlc mpv guvcview tmux obs-studio)
     sudo apt update
