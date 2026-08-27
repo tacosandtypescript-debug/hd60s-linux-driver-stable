@@ -88,7 +88,17 @@ sudo make install
 
 `make install` は実行ファイル、必要な解析用 TSV、`hd60s` ランチャー、
 自動再試行用 `run-hd60s-obs.sh` を `/usr/local/libexec/hd60s` に配置し、
-`/usr/local/bin/hd60s` と udev ルールを作成します。削除は `sudo make uninstall` です。
+`/usr/local/bin/hd60s`、ユーザー用 systemd unit、udev ルールを作成します。削除は `sudo make uninstall` です。
+
+端末や tmux に依存せず自動再試行を常駐させる場合:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now hd60s.service
+```
+
+この unit は v4l2loopback や snd-aloop のカーネルモジュールをロードしません。
+先に `./hd60s prep` を実行するか、各モジュールをログイン時にロードする設定にしてください。
 
 ---
 

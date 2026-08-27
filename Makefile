@@ -4,13 +4,15 @@ PREFIX ?= /usr/local
 LIBEXECDIR ?= $(PREFIX)/libexec/hd60s
 UDEVRULEDIR ?= /etc/udev/rules.d
 UDEVRULE := 70-elgato-hd60s.rules
+SYSTEMD_USER_UNITDIR ?= $(PREFIX)/share/systemd/user
+SYSTEMD_USER_UNIT_TEMPLATE := hd60s.service.in
 LIBUSB_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
 LIBUSB_LIBS := $(shell pkg-config --libs libusb-1.0)
 ALSA_LIBS := -lasound
 PIPEWIRE_CFLAGS := $(shell pkg-config --cflags libpipewire-0.3)
 PIPEWIRE_LIBS := $(shell pkg-config --libs libpipewire-0.3)
 
-BINS = iso_capture audio_extract offline_parser spi_dump
+BINS = iso_capture audio_extract offline_parser spi_dump probe_iso
 
 all: $(BINS)
 
@@ -32,9 +34,10 @@ install-symlink:
 .PHONY: all clean install install-symlink uninstall
 
 install: all
-	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin"
-	install -m 0755 iso_capture hd60s run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
+	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)"
+	install -m 0755 iso_capture probe_iso hd60s run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
 	install -m 0644 analysis/*.tsv "$(DESTDIR)$(LIBEXECDIR)/analysis/"
+	@sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' "$(SYSTEMD_USER_UNIT_TEMPLATE)" > "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s.service"
 	install -d "$(DESTDIR)$(UDEVRULEDIR)"
 	install -m 0644 $(UDEVRULE) "$(DESTDIR)$(UDEVRULEDIR)/$(UDEVRULE)"
 	ln -sfn "$(LIBEXECDIR)/hd60s" "$(DESTDIR)$(PREFIX)/bin/hd60s"
@@ -45,7 +48,11 @@ install: all
 uninstall:
 	rm -f "$(DESTDIR)$(PREFIX)/bin/hd60s"
 	rm -f "$(DESTDIR)$(UDEVRULEDIR)/$(UDEVRULE)"
+	rm -f "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s.service"
 	rm -rf "$(DESTDIR)$(LIBEXECDIR)"
 
 spi_dump: spi_dump.c
+	$(CC) $(CFLAGS) $(LIBUSB_CFLAGS) $< -o $@ $(LIBUSB_LIBS)
+
+probe_iso: probe_iso.c
 	$(CC) $(CFLAGS) $(LIBUSB_CFLAGS) $< -o $@ $(LIBUSB_LIBS)

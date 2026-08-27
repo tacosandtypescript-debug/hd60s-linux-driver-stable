@@ -41,6 +41,7 @@
 #include <spa/param/audio/format-utils.h>
 #include <spa/pod/builder.h>
 #include <pthread.h>
+#include <limits.h>
 
 static double now_s(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -79,6 +80,66 @@ static int keep_running = 1;
 static int inflight = 0;
 static int max_inflight = 0;
 static unsigned long submit_ok = 0, submit_fail = 0, resubmit_fail = 0;
+static int usb_session_fatal = 0;
+static int usb_session_error = 0;
+
+// Return the payload capacity advertised for EP_STREAM in the selected
+// alternate setting.  On SuperSpeed devices the companion descriptor's
+// wBytesPerInterval is the authoritative service-interval capacity; for
+// high-speed descriptors, derive it from wMaxPacketSize and its transaction
+// multiplier.  Keeping this check next to URB construction prevents a
+// total-interval size from being silently used as an oversized packet.
+static int iso_endpoint_capacity(libusb_device_handle* h, int alt,
+                                 int* capacity, int* superspeed) {
+    struct libusb_config_descriptor* cfg = NULL;
+    libusb_device* dev = libusb_get_device(h);
+    int rc = libusb_get_active_config_descriptor(dev, &cfg);
+    if (rc < 0) rc = libusb_get_config_descriptor(dev, 0, &cfg);
+    if (rc < 0 || !cfg) return rc < 0 ? rc : LIBUSB_ERROR_OTHER;
+
+    int found = LIBUSB_ERROR_NOT_FOUND;
+    *capacity = 0;
+    *superspeed = 0;
+    for (int i = 0; i < cfg->bNumInterfaces; i++) {
+        const struct libusb_interface* iface = &cfg->interface[i];
+        for (int a = 0; a < iface->num_altsetting; a++) {
+            const struct libusb_interface_descriptor* setting = &iface->altsetting[a];
+            if (setting->bInterfaceNumber != 0 || setting->bAlternateSetting != alt)
+                continue;
+            for (int e = 0; e < setting->bNumEndpoints; e++) {
+                const struct libusb_endpoint_descriptor* ep = &setting->endpoint[e];
+                if (ep->bEndpointAddress != EP_STREAM ||
+                    (ep->bmAttributes & 3) != LIBUSB_TRANSFER_TYPE_ISOCHRONOUS)
+                    continue;
+
+                int max_packet = ep->wMaxPacketSize & 0x07ff;
+                int transactions = ((ep->wMaxPacketSize >> 11) & 3) + 1;
+                struct libusb_ss_endpoint_companion_descriptor* ss = NULL;
+                int ss_rc = libusb_get_ss_endpoint_companion_descriptor(NULL, ep, &ss);
+                if (ss_rc == 0 && ss) {
+                    *superspeed = 1;
+                    *capacity = ss->wBytesPerInterval;
+                    fprintf(stderr,
+                            "[usb] alt=%d ep=0x%02x wMax=0x%04x SS burst=%u mult=%u bytes/interval=%u\n",
+                            alt, ep->bEndpointAddress, ep->wMaxPacketSize,
+                            ss->bMaxBurst, ss->bmAttributes & 3,
+                            ss->wBytesPerInterval);
+                    libusb_free_ss_endpoint_companion_descriptor(ss);
+                } else {
+                    *capacity = max_packet * transactions;
+                    fprintf(stderr,
+                            "[usb] alt=%d ep=0x%02x wMax=0x%04x max_packet=%d transactions=%d bytes/interval=%d\n",
+                            alt, ep->bEndpointAddress, ep->wMaxPacketSize,
+                            max_packet, transactions, *capacity);
+                }
+                found = (*capacity > 0) ? 0 : LIBUSB_ERROR_INVALID_PARAM;
+                break;
+            }
+        }
+    }
+    libusb_free_config_descriptor(cfg);
+    return found;
+}
 
 // ======================================================================
 // SECTION 1: フレーム同期パーサ (映像 + 埋込音声 SEP)
@@ -188,8 +249,13 @@ static void diag_report_if_due(void) {
 // 補間比 upsample_ratio を算出 → ALSA は 96kHz 固定のまま、各 SEP からの
 // 4 samples を upsample_ratio 倍に線形補間して feed。結果: 音は本来速度で鳴る。
 static snd_pcm_t* g_pcm = NULL;
-static unsigned long long g_audio_frames = 0;
-static unsigned long long g_audio_underrun = 0;
+static _Atomic unsigned long long g_audio_frames = 0;
+static _Atomic unsigned long long g_audio_underrun = 0;
+static _Atomic unsigned long long g_audio_packets = 0;
+static _Atomic unsigned long long g_audio_bytes = 0;
+static _Atomic unsigned long long g_audio_samples_in = 0;
+static _Atomic unsigned long long g_audio_samples_out = 0;
+static _Atomic unsigned long long g_audio_pw_underflow = 0;
 #define AUDIO_BATCH_FRAMES 960  // 10ms 相当 (96kHz mono)
 static int16_t g_audio_buf[AUDIO_BATCH_FRAMES];  // mono
 static int g_audio_buf_pos = 0;
@@ -212,7 +278,7 @@ static double now_monotonic_s(void) {
 }
 
 // PipeWire 版の前方宣言 (定義は後段)
-static void audio_pw_open(void);
+static int audio_pw_open(void);
 static void audio_pw_close(void);
 static void audio_feed_sep_pw(const uint8_t* payload);
 extern int g_use_pw;
@@ -221,9 +287,12 @@ static void audio_open(const char* pcm_name) {
     // HD60S_AUDIO_PW=1 で PipeWire ネイティブ実装に分岐
     const char* env_pw = getenv("HD60S_AUDIO_PW");
     if (env_pw && env_pw[0] && env_pw[0] != '0' && env_pw[0] != 'n') {
-        g_use_pw = 1;
-        audio_pw_open();
-        return;
+        if (audio_pw_open() == 0) {
+            g_use_pw = 1;
+            return;
+        }
+        fprintf(stderr, "[audio] PipeWire unavailable; falling back to ALSA %s\n", pcm_name);
+        g_use_pw = 0;
     }
     int err = snd_pcm_open(&g_pcm, pcm_name, SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0) {
@@ -257,6 +326,7 @@ static void audio_flush(void) {
         }
     } else {
         g_audio_frames += written;
+        g_audio_samples_out += (unsigned long long)written;
     }
     g_audio_buf_pos = 0;
 }
@@ -264,6 +334,8 @@ static void audio_flush(void) {
 // 補間 & 出力書き込み。samples[n] を effective rate × upsample_ratio 相当で
 // 96kHz に伸ばす (nearest / linear)。
 static void audio_feed_sep(const uint8_t* payload) {
+    g_audio_packets++;
+    g_audio_bytes += 8;
     if (g_use_pw) { audio_feed_sep_pw(payload); return; }
     g_sep_count++;
 
@@ -335,6 +407,8 @@ static void audio_feed_sep(const uint8_t* payload) {
 // ======================================================================
 static struct pw_thread_loop* g_pw_loop = NULL;
 static struct pw_stream* g_pw_stream = NULL;
+static int g_pw_initialized = 0;
+static int g_pw_started = 0;
 // ring buffer (mono int16 samples). Producer: iso_capture (audio_feed_sep 経由).
 // Consumer: pipewire process コールバック (別スレッド)。
 // 🔥 kusq テストで判明: 683ms は大きすぎて古い音蓄積 → 遅延。
@@ -393,10 +467,12 @@ static void pw_on_process(void* userdata) {
     }
 
     uint32_t n = (want < avail) ? want : avail;
+    if (n < want) g_audio_pw_underflow++;
     for (uint32_t i = 0; i < n; i++) {
         dst[i] = g_pw_ring[(tail + i) & (PW_RING_SIZE - 1)];
     }
     if (n > 0) g_pw_last_sample = dst[n-1];
+    g_audio_samples_out += n;
 
     // 🔥 underflow 埋め: 0 でなく last_sample を高速に減衰 (連続性維持でクリック回避)
     int32_t decay = g_pw_last_sample;
@@ -450,6 +526,7 @@ static void pw_ring_push_batch(const int16_t* samples, int n) {
     uint32_t space = PW_RING_SIZE - 1 - fill;   // -1 は full/empty 区別のため
     int to_write = (n < (int)space) ? n : (int)space;
     int dropped = n - to_write;
+    g_audio_samples_in += (unsigned long long)n;
     if (dropped > 0) {
         atomic_fetch_add_explicit(&g_pw_drops_new, (uint64_t)dropped, memory_order_relaxed);
     }
@@ -461,12 +538,15 @@ static void pw_ring_push_batch(const int16_t* samples, int n) {
                           memory_order_release);
 }
 
-static void audio_pw_open(void) {
+static int audio_pw_open(void) {
     pw_init(NULL, NULL);
+    g_pw_initialized = 1;
     g_pw_loop = pw_thread_loop_new("hd60s-audio", NULL);
     if (!g_pw_loop) {
         fprintf(stderr, "[audio-pw] pw_thread_loop_new failed\n");
-        return;
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
     }
     pw_thread_loop_lock(g_pw_loop);
 
@@ -494,7 +574,9 @@ static void audio_pw_open(void) {
         pw_thread_loop_unlock(g_pw_loop);
         pw_thread_loop_destroy(g_pw_loop);
         g_pw_loop = NULL;
-        return;
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
     }
 
     // 2026-07-21 P3-1: PW stream rate を 48kHz に統合。graph rate と一致するので
@@ -520,12 +602,30 @@ static void audio_pw_open(void) {
         params, 1);
     if (r < 0) {
         fprintf(stderr, "[audio-pw] pw_stream_connect failed: %d\n", r);
+        pw_stream_destroy(g_pw_stream);
+        g_pw_stream = NULL;
         pw_thread_loop_unlock(g_pw_loop);
-        return;
+        pw_thread_loop_destroy(g_pw_loop);
+        g_pw_loop = NULL;
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
     }
 
     pw_thread_loop_unlock(g_pw_loop);
-    pw_thread_loop_start(g_pw_loop);
+    r = pw_thread_loop_start(g_pw_loop);
+    if (r < 0) {
+        fprintf(stderr, "[audio-pw] pw_thread_loop_start failed: %d\n", r);
+        pw_stream_disconnect(g_pw_stream);
+        pw_stream_destroy(g_pw_stream);
+        g_pw_stream = NULL;
+        pw_thread_loop_destroy(g_pw_loop);
+        g_pw_loop = NULL;
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
+    }
+    g_pw_started = 1;
     fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE mono)\n");
 
     // 2026-07-19 libsamplerate 初期化 (SINC MEDIUM QUALITY): linear interp より
@@ -539,19 +639,28 @@ static void audio_pw_open(void) {
         g_src_ok = 1;
         fprintf(stderr, "[audio-pw] libsamplerate SINC_MEDIUM_QUALITY 有効\n");
     }
+    return 0;
 }
 
 static void audio_pw_close(void) {
-    if (!g_pw_loop) return;
-    pw_thread_loop_stop(g_pw_loop);
+    if (g_pw_started && g_pw_loop) {
+        pw_thread_loop_stop(g_pw_loop);
+        g_pw_started = 0;
+    }
     if (g_pw_stream) {
+        pw_stream_disconnect(g_pw_stream);
         pw_stream_destroy(g_pw_stream);
         g_pw_stream = NULL;
     }
-    pw_thread_loop_destroy(g_pw_loop);
-    g_pw_loop = NULL;
+    if (g_pw_loop) {
+        pw_thread_loop_destroy(g_pw_loop);
+        g_pw_loop = NULL;
+    }
     if (g_src) { src_delete(g_src); g_src = NULL; g_src_ok = 0; }
-    pw_deinit();
+    if (g_pw_initialized) {
+        pw_deinit();
+        g_pw_initialized = 0;
+    }
 }
 
 // audio_feed_sep の PipeWire 版: upsample した samples を ring に push
@@ -720,6 +829,8 @@ static size_t g_dyn_n = 0;
 static uint8_t g_prev_line[LINE_BYTES];
 static int g_have_prev_line = 0;
 
+static void parser_notify_loss(size_t bytes_lost);
+
 static void parser_reset(const char* why) {
     // 分類は state 問わずカウント（HUNT中の resync も見たい）
     if (strstr(why, "empty")) g_resync_empty++;
@@ -844,11 +955,11 @@ static void pace_output_if_due(void) {
 // discarding surplus bytes, rather than assuming a fixed marker offset.
 static void dynamic_video_feed(const uint8_t *data, size_t len) {
     if (len > sizeof(g_dyn_buf) - g_dyn_n) {
-        size_t drop = len - (sizeof(g_dyn_buf) - g_dyn_n);
-        if (drop > g_dyn_n) drop = g_dyn_n;
-        memmove(g_dyn_buf, g_dyn_buf + drop, g_dyn_n - drop);
-        g_dyn_n -= drop;
-        g_resyncs++;
+        // Once the line buffer is full, its byte alignment is no longer
+        // trustworthy.  Retaining a suffix and the old g_fline would allow
+        // lines from two frames to be combined after a USB loss.
+        parser_notify_loss(g_dyn_n);
+        return;
     }
     size_t room = sizeof(g_dyn_buf) - g_dyn_n;
     if (len > room) len = room;
@@ -906,54 +1017,15 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
         if (best_q != SIZE_MAX) { q = best_q; tag = best_tag; }
         if (!q) {
             // A vertical blanking interval can be much larger than the
-            // normal 4/16-byte line padding.  Once enough data is buffered,
-            // recover at the next short run of genuine ACT line markers
-            // instead of allowing g_dyn_buf to overflow and dropping an
-            // arbitrary portion of the image.
+            // normal 4/16-byte line padding.  If the buffer grows without a
+            // confirmed marker, the byte alignment is lost; discard the
+            // partial image and let parser_feed reacquire BLK->ACT.
             if (g_dyn_n > 65536) {
-                size_t sync_p = SIZE_MAX;
-                for (size_t p = 0; p + 8 * 3840 + 4 <= g_dyn_n; ++p) {
-                    uint32_t first;
-                    memcpy(&first, g_dyn_buf + p, 4);
-                    if (first != MK_EOL_ACT) continue;
-                    size_t cursor = p;
-                    int run = 1;
-                    for (int k = 1; k < 8; ++k) {
-                        int found = 0;
-                        size_t lo = cursor + 3000;
-                        size_t hi = cursor + 4100;
-                        if (hi + 4 > g_dyn_n) break;
-                        for (size_t s = lo; s <= hi; ++s) {
-                            uint32_t next;
-                            memcpy(&next, g_dyn_buf + s, 4);
-                            if (next == MK_EOL_ACT) {
-                                cursor = s;
-                                found = 1;
-                                run++;
-                                break;
-                            }
-                        }
-                        if (!found) break;
-                    }
-                    if (run == 8) { sync_p = p; break; }
-                }
-                if (sync_p != SIZE_MAX) {
-                    size_t consume = sync_p + 4;
-                    memmove(g_dyn_buf, g_dyn_buf + consume, g_dyn_n - consume);
-                    g_dyn_n -= consume;
-                    // Keep the current frame counter across a transport
-                    // re-lock.  A false marker or a long gap must not make
-                    // the assembler restart line 0 indefinitely; the
-                    // 1080-ACT boundary below is the only frame reset.
-                    g_resyncs++;
-                    continue;
-                }
-                // Keep only enough tail to detect a marker crossing the
-                // next USB callback; discard the stale prefix explicitly.
-                size_t keep = 4096;
-                memmove(g_dyn_buf, g_dyn_buf + g_dyn_n - keep, keep);
-                g_dyn_n = keep;
-                g_resyncs++;
+                // Do not lock on an ACT run in the middle of a frame.  A
+                // transport gap invalidates the current image; wait for a
+                // fresh BLK->ACT transition in parser_feed instead.
+                parser_notify_loss(g_dyn_n);
+                return;
             }
             break;
         }
@@ -970,6 +1042,17 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
         memcpy(g_linebuf, g_dyn_buf, copy);
         if (copy < LINE_BYTES && g_have_prev_line)
             memcpy(g_linebuf + copy, g_prev_line + copy, LINE_BYTES - copy);
+        // In the live HD60 S stream the SEP record is immediately followed
+        // by the EOL_ACT marker: [SEP 4B][audio payload 8B][EOL_ACT 4B].
+        // The line-marker scorer intentionally prefers EOL_ACT, so recover
+        // the audio payload from the 12 bytes immediately preceding that
+        // marker instead of letting the video parser skip it.
+        if (tag == MK_EOL_ACT && q >= 12) {
+            uint32_t sep_tag;
+            memcpy(&sep_tag, g_dyn_buf + q - 12, 4);
+            if (sep_tag == MK_SEP || sep_tag == MK_SEP_BULK)
+                audio_feed_sep(g_dyn_buf + q - 8);
+        }
         if (tag == MK_EOL_ACT || tag == MK_SEP || tag == MK_SEP_BULK) {
             if (g_diag) g_diag_act++;
             if (g_diag && g_fline == 0 && !g_diag_frame_start_ns)
@@ -1204,16 +1287,34 @@ static void parser_feed(const uint8_t* data, size_t len) {
     }
 }
 
-// URB からデータが完全に飛んだ時 (iso pkt actual_length==0 = empty)。
-// iso 0-length pkt が単なる "no data this interval" ならライン位置は保たれるが、
-// 実際にはデータ欠落を伴うことが多い→ 進行中ラインを破棄して次のマーカーで再同期。
-// ただし LOCKED は維持し frame カウントは崩さない (BLKでラインカウントリセットされる)。
-__attribute__((unused))
+// A packet-level USB error means that bytes in the current line/frame are
+// missing.  Discard the partial frame and require a fresh BLK->ACT lock; if
+// we kept g_fline, subsequent lines could be combined with the old frame and
+// produce a vertically rolling image.  A completed iso packet with
+// actual_length==0 is deliberately not routed here: on this device it can be
+// a normal no-data interval during blanking.
 static void parser_notify_loss(size_t bytes_lost) {
     (void)bytes_lost;
-    // 現ライン破棄。次のマーカーが来た時にラインが1本ズレるがフレーム全体は緩やかに回復する。
+    int partial_lines = g_fline;
+    if (g_diag) {
+        if (partial_lines > 0) g_diag_partial++;
+        g_diag_resets++;
+        fprintf(stderr, "[parser-loss] discarded partial frame ACT=%d BLK=%d\n",
+                g_fline, g_blk_run);
+    }
+    // The dynamic parser owns the active line assembly; resetting only the
+    // legacy g_lpos/g_pend state is insufficient and would leave stale bytes
+    // in g_dyn_buf.
     g_lpos = 0;
     g_pend_n = 0;
+    g_dyn_n = 0;
+    g_sync_n = 0;
+    g_parser_synced = 0;
+    g_fline = 0;
+    g_blk_run = 0;
+    g_have_prev_line = 0;
+    g_diag_frame_start_ns = 0;
+    g_resyncs++;
 }
 
 // v4l2loopback (/dev/video42) をオープン。フォーマット設定は
@@ -1281,6 +1382,8 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     }
     int do_hexdump = env_hexdump && env_hexdump[0] && env_hexdump[0] != '0';
 
+    int packet_loss = 0;
+    size_t lost_bytes = 0;
     for (int i = 0; i < xfr->num_iso_packets; i++) {
         struct libusb_iso_packet_descriptor* d = &xfr->iso_packet_desc[i];
         if (d->status == LIBUSB_TRANSFER_COMPLETED) {
@@ -1289,7 +1392,7 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
                 // HEX DUMP hook - first 500 non-empty packets
                 if (do_hexdump && hexdump_count < 500) {
                     fprintf(stderr, "PKT[%d] len=%d: ", hexdump_count, d->actual_length);
-                    for (int b = 0; b < 32 && b < d->actual_length; b++) fprintf(stderr, "%02x", buf[b]);
+                    for (unsigned int b = 0; b < 32 && b < d->actual_length; b++) fprintf(stderr, "%02x", buf[b]);
                     fprintf(stderr, "\n");
                     hexdump_count++;
                 }
@@ -1306,12 +1409,29 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
                 // 逆に marker resync が増える → 触らないのが正解)。
                 pkt_empty++;
             }
-        } else pkt_err++;
+        } else {
+            pkt_err++;
+            packet_loss = 1;
+            lost_bytes += d->length;
+            if (xfr->status == LIBUSB_TRANSFER_NO_DEVICE ||
+                xfr->status == LIBUSB_TRANSFER_ERROR) {
+                usb_session_fatal = 1;
+                usb_session_error = xfr->status;
+            }
+        }
     }
-    if (keep_running) {
-        if (libusb_submit_transfer(xfr) < 0) {
+    if (packet_loss)
+        parser_notify_loss(lost_bytes);
+    if (keep_running && !usb_session_fatal) {
+        int submit_rc = libusb_submit_transfer(xfr);
+        if (submit_rc < 0) {
             inflight--;
             resubmit_fail++;
+            usb_session_fatal = 1;
+            usb_session_error = submit_rc;
+            keep_running = 0;
+            fprintf(stderr, "[iso] resubmit failed rc=%d (%s); ending USB session\n",
+                    submit_rc, libusb_error_name(submit_rc));
         }
     } else {
         inflight--;
@@ -1319,6 +1439,58 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     if ((++callback_count % 100) == 0)
         fprintf(stderr, "[iso-debug] callbacks=%lu ok=%ld empty=%ld err=%ld bytes=%lld frames=%llu\\n",
                 callback_count, pkt_ok, pkt_empty, pkt_err, total_bytes, g_frames_out);
+}
+
+// Stop every outstanding transfer before the device handle is released.  A
+// completed callback may resubmit the same transfer, so setting keep_running
+// alone is not enough: all still-submitted URBs must be cancelled and their
+// cancellation callbacks drained first.
+static void cleanup_iso_transfers(libusb_device_handle* h,
+                                  struct libusb_transfer** xfrs,
+                                  unsigned char** bufs,
+                                  const unsigned char* devmem,
+                                  int count, size_t buffer_bytes) {
+    if (!xfrs || !bufs) return;
+    keep_running = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (!xfrs[i]) continue;
+        int rc = libusb_cancel_transfer(xfrs[i]);
+        if (rc < 0 && rc != LIBUSB_ERROR_NOT_FOUND && rc != LIBUSB_ERROR_NO_DEVICE)
+            fprintf(stderr, "[iso] cancel%d failed rc=%d (%s)\n",
+                    i, rc, libusb_error_name(rc));
+    }
+
+    // Cancellation is asynchronous.  Let libusb deliver every callback so
+    // the inflight count reaches zero before transfer objects are freed.
+    struct timeval tv = {0, 20000};
+    for (int wait = 0; wait < 100 && inflight > 0; wait++) {
+        int rc = libusb_handle_events_timeout(NULL, &tv);
+        if (rc < 0 && rc != LIBUSB_ERROR_INTERRUPTED && rc != LIBUSB_ERROR_NO_DEVICE)
+            fprintf(stderr, "[iso] cancel-drain failed rc=%d (%s)\n",
+                    rc, libusb_error_name(rc));
+    }
+    if (inflight > 0)
+        fprintf(stderr, "[iso] warning: %d transfers remained after cancellation drain\n",
+                inflight);
+    if (inflight > 0) {
+        // Do not free a transfer object that libusb still considers active.
+        // The process is exiting and the handle teardown will reclaim the
+        // remaining OS resources; freeing here would be use-after-free if a
+        // late cancellation callback is delivered.
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (xfrs[i]) {
+            libusb_free_transfer(xfrs[i]);
+            xfrs[i] = NULL;
+        }
+        if (!bufs[i]) continue;
+        if (devmem && devmem[i]) libusb_dev_mem_free(h, bufs[i], buffer_bytes);
+        else free(bufs[i]);
+        bufs[i] = NULL;
+    }
 }
 
 // 呪文再生(TSV) ; 戻り値: (ok<<0) 実際はグローバルでカウント
@@ -1484,7 +1656,7 @@ int main(int argc, char** argv) {
     const char *packets_env = getenv("HD60S_ISO_PKTS");
     if (packets_env && *packets_env) iso_packets = atoi(packets_env);
     if (iso_packets < 1) iso_packets = 1;
-    fprintf(stderr, "[iso] per-transfer packet length=%d\n", iso_pkt_size);
+    fprintf(stderr, "[iso] requested packet length=%d\n", iso_pkt_size);
     // 5番目の引数が "pt" ならパススルー専用モード（iso張らず、9a burstだけ撃って維持）
     int passthrough_only = (argc > 5 && strcmp(argv[5], "pt") == 0);
     // ラベルは 5番目 (pt モードでは 6番目)
@@ -1496,9 +1668,18 @@ int main(int argc, char** argv) {
     // 重大な副作用が判明(再現確認済み, CPU 0%で停止)。mlockallのみ残す(害なし)。
     if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0) fprintf(stderr, "[main] mlockall 失敗: %s(続行)\n", strerror(errno));
 
-    if (libusb_init(NULL) < 0) { fprintf(stderr, "libusb_init失敗\n"); return 1; }
+    int libusb_rc = libusb_init(NULL);
+    if (libusb_rc < 0) {
+        fprintf(stderr, "libusb_init failed rc=%d (%s)\n", libusb_rc,
+                libusb_error_name(libusb_rc));
+        return 2;
+    }
     libusb_device_handle* h = libusb_open_device_with_vid_pid(NULL, VID, PID);
-    if (!h) { fprintf(stderr, "デバイスopen失敗 (0fd9:005e)\n"); return 1; }
+    if (!h) {
+        fprintf(stderr, "デバイスopen失敗 (0fd9:005e)\n");
+        libusb_exit(NULL);
+        return 2;
+    }
     libusb_set_auto_detach_kernel_driver(h, 1);
     // 2026-07-10 デバイス強制リセット: 前回異常終了後や物理抜き差し後にI2Cバスがロックしたり
     // 内部状態が乱れる問題への対策 (実測: reset無しだと 9d:0x12 が0x9d返しで100%空パケット)
@@ -1517,16 +1698,77 @@ int main(int argc, char** argv) {
             h = libusb_open_device_with_vid_pid(NULL, VID, PID);
             if (h) break;
         }
-        if (!h) { fprintf(stderr, "reset後デバイス再open失敗\n"); return 1; }
+        if (!h) {
+            fprintf(stderr, "reset後デバイス再open失敗\n");
+            libusb_exit(NULL);
+            return 2;
+        }
         libusb_set_auto_detach_kernel_driver(h, 1);
     } else if (rst < 0) {
-        fprintf(stderr, "[main] reset警告 (%d) - 続行\n", rst);
+        fprintf(stderr, "[main] reset failed rc=%d (%s); aborting USB session\n",
+                rst, libusb_error_name(rst));
+        libusb_close(h);
+        libusb_exit(NULL);
+        return 2;
     } else {
         fprintf(stderr, "[main] リセット成功\n");
     }
-    if (libusb_set_configuration(h, 1) < 0) fprintf(stderr, "set_config警告\n");
-    if (libusb_claim_interface(h, 0) < 0) { fprintf(stderr, "claim失敗\n"); return 1; }
+    int cfg_rc = libusb_set_configuration(h, 1);
+    if (cfg_rc < 0 && cfg_rc != LIBUSB_ERROR_BUSY) {
+        fprintf(stderr, "set_config failed rc=%d (%s)\n", cfg_rc, libusb_error_name(cfg_rc));
+        libusb_close(h);
+        libusb_exit(NULL);
+        return 2;
+    }
+    int claim_rc = libusb_claim_interface(h, 0);
+    if (claim_rc < 0) {
+        fprintf(stderr, "claim failed rc=%d (%s)\n", claim_rc, libusb_error_name(claim_rc));
+        libusb_close(h);
+        libusb_exit(NULL);
+        return 2;
+    }
     fprintf(stderr, "[main] open/claim OK (リセット後)\n");
+
+    if (alt != 4) {
+        int endpoint_capacity = 0;
+        int endpoint_superspeed = 0;
+        int endpoint_rc = iso_endpoint_capacity(h, alt, &endpoint_capacity,
+                                                 &endpoint_superspeed);
+        if (endpoint_rc < 0 || endpoint_capacity <= 0) {
+            fprintf(stderr, "[usb] no usable isochronous endpoint for alt=%d rc=%d (%s)\n",
+                    alt, endpoint_rc, libusb_error_name(endpoint_rc));
+            libusb_release_interface(h, 0);
+            libusb_close(h);
+            libusb_exit(NULL);
+            return 2;
+        }
+        if (pkt_env && *pkt_env) {
+            if (iso_pkt_size > endpoint_capacity) {
+                fprintf(stderr,
+                        "[usb] requested packet length %d exceeds advertised capacity %d; refusing URB\n",
+                        iso_pkt_size, endpoint_capacity);
+                libusb_release_interface(h, 0);
+                libusb_close(h);
+                libusb_exit(NULL);
+                return 2;
+            }
+        } else {
+            iso_pkt_size = endpoint_capacity;
+        }
+        if (endpoint_superspeed && iso_pkt_size > endpoint_capacity) {
+            fprintf(stderr, "[usb] packet length validation failed\n");
+            libusb_release_interface(h, 0);
+            libusb_close(h);
+            libusb_exit(NULL);
+            return 2;
+        }
+        iso_packets = (endpoint_capacity + iso_pkt_size - 1) / iso_pkt_size;
+        if (iso_packets < 1) iso_packets = 1;
+        if (packets_env && *packets_env) iso_packets = atoi(packets_env);
+        if (iso_packets < 1) iso_packets = 1;
+        fprintf(stderr, "[iso] packet length=%d descriptors/URB=%d\n",
+                iso_pkt_size, iso_packets);
+    }
 
     // 差分観測ログ: 5番目の引数をラベルに captures/reads-<label>.tsv へ全IN読みを記録
     const char* label = argc > 4 ? argv[4] : NULL;
@@ -1693,8 +1935,16 @@ int main(int argc, char** argv) {
         usleep(50000);  // 50ms sleep before alt=2 (Windows-observed)
     }
 
-    if (libusb_set_interface_alt_setting(h, 0, alt) < 0) fprintf(stderr, "set_alt(%d)失敗\n", alt);
-    else fprintf(stderr, "[main] alt=%d 選択OK\n", alt);
+    int alt_rc = libusb_set_interface_alt_setting(h, 0, alt);
+    if (alt_rc < 0) {
+        fprintf(stderr, "set_alt(%d) failed rc=%d (%s)\n", alt, alt_rc,
+                libusb_error_name(alt_rc));
+        libusb_release_interface(h, 0);
+        libusb_close(h);
+        libusb_exit(NULL);
+        return 2;
+    }
+    fprintf(stderr, "[main] alt=%d 選択OK\n", alt);
 
     // Diagnostic path for the USB 3 bulk alternate (alt=4).  The public
     // driver only exercised isochronous alternates; this bounded probe lets
@@ -1906,17 +2156,39 @@ int main(int argc, char** argv) {
         }
     }
 
-    struct libusb_transfer* xfrs[NUM_TRANSFERS];
-    unsigned char* bufs[NUM_TRANSFERS];
+    size_t transfer_bytes = (size_t)iso_packets * (size_t)iso_pkt_size;
+    if (transfer_bytes == 0 || transfer_bytes > INT_MAX) {
+        fprintf(stderr, "[iso] invalid transfer buffer size=%zu\n", transfer_bytes);
+        libusb_release_interface(h, 0);
+        libusb_close(h);
+        libusb_exit(NULL);
+        return 2;
+    }
+    struct libusb_transfer* xfrs[NUM_TRANSFERS] = {0};
+    unsigned char* bufs[NUM_TRANSFERS] = {0};
+    unsigned char devmem[NUM_TRANSFERS] = {0};
     for (int i = 0; i < NUM_TRANSFERS; i++) {
         // Zerocopy DMA バッファ (usbfs mmap経由) → CPU 使用率↓、tail latency↓。
         // 失敗時は malloc にフォールバック (小型ホストで KMS が確保できない場合)。
-        bufs[i] = libusb_dev_mem_alloc(h, iso_packets * iso_pkt_size);
-        if (!bufs[i]) bufs[i] = malloc(iso_packets * iso_pkt_size);
+        bufs[i] = libusb_dev_mem_alloc(h, (int)transfer_bytes);
+        if (bufs[i]) devmem[i] = 1;
+        if (!bufs[i]) bufs[i] = malloc(transfer_bytes);
+        if (!bufs[i]) {
+            usb_session_fatal = 1;
+            usb_session_error = LIBUSB_ERROR_NO_MEM;
+            fprintf(stderr, "[iso] buffer allocation failed at transfer %d\n", i);
+            break;
+        }
         xfrs[i] = libusb_alloc_transfer(iso_packets);
+        if (!xfrs[i]) {
+            usb_session_fatal = 1;
+            usb_session_error = LIBUSB_ERROR_NO_MEM;
+            fprintf(stderr, "[iso] transfer allocation failed at transfer %d\n", i);
+            break;
+        }
         // timeout=0 = 無限。連続isoで有限timeoutはURBキャンセルで in-flight packet 全て empty化する罠
         libusb_fill_iso_transfer(xfrs[i], h, EP_STREAM, bufs[i],
-            iso_packets * iso_pkt_size, iso_packets, iso_cb, NULL, 0);
+            (int)transfer_bytes, iso_packets, iso_cb, NULL, 0);
         libusb_set_iso_packet_lengths(xfrs[i], iso_pkt_size);
         int submit_rc = libusb_submit_transfer(xfrs[i]);
         if (submit_rc == 0) {
@@ -1932,6 +2204,13 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "[iso] submit summary ok=%lu fail=%lu max_inflight=%d current=%d\\n",
             submit_ok, submit_fail, max_inflight, inflight);
+    if (inflight == 0 || usb_session_fatal) {
+        usb_session_fatal = 1;
+        if (!usb_session_error) usb_session_error = LIBUSB_ERROR_OTHER;
+        keep_running = 0;
+        fprintf(stderr, "[iso] no active transfers or allocation failure; ending USB session before capture\\n");
+        goto capture_cleanup;
+    }
 
     // 🔍 IT66121 状態 dump (パススルー sequence 前後の切り分け用)
     // マクロは file 後半で定義されてるので inline で書く
@@ -2081,7 +2360,7 @@ int main(int argc, char** argv) {
     int pt_loop = (env_pt && env_pt[0] && env_pt[0] != '0' && env_pt[0] != 'n' && env_pt[0] != 'N');
     double last_pt_fire = 0.0;
     int pt_fires = 0;
-    while (now_s() - start < read_sec && inflight > 0) {
+    while (keep_running && now_s() - start < read_sec && inflight > 0) {
         double el = now_s() - start;
         while (bi < g_nburst && (g_burst[bi].t - burst_t0) <= el) {
             BurstCmd* b = &g_burst[bi];
@@ -2389,9 +2668,23 @@ int main(int argc, char** argv) {
             last_pt_fire = el;
             pt_fires++;
     }
-    libusb_handle_events_timeout(NULL, &tv);
+    int event_rc = libusb_handle_events_timeout(NULL, &tv);
+    if (event_rc == LIBUSB_ERROR_NO_DEVICE || event_rc == LIBUSB_ERROR_IO ||
+        event_rc == LIBUSB_ERROR_OTHER) {
+        usb_session_fatal = 1;
+        usb_session_error = event_rc;
+        keep_running = 0;
+        fprintf(stderr, "[iso] event handling failed rc=%d (%s)\\n",
+                event_rc, libusb_error_name(event_rc));
+    }
     pace_output_if_due();
     }
+    if (usb_session_fatal)
+        fprintf(stderr, "[iso] USB session ended: status=%d (%s)\n",
+                usb_session_error,
+                usb_session_error < 0 ? libusb_error_name(usb_session_error) : "transfer status");
+    if (usb_session_fatal)
+        goto capture_cleanup;
     if (pt_loop) fprintf(stderr, "[pt-loop] 継続発火 %d 回\n", pt_fires);
     fprintf(stderr, "[burst] 発行 %d/%d (ok=%d fail=%d)\n", bi, g_nburst, bok, bfail);
 
@@ -2480,6 +2773,8 @@ int main(int argc, char** argv) {
     struct timeval tv2 = {1, 0};
     for (int k = 0; k < 10 && inflight > 0; k++) libusb_handle_events_timeout(NULL, &tv2);
 
+capture_cleanup:
+    cleanup_iso_transfers(h, xfrs, bufs, devmem, NUM_TRANSFERS, transfer_bytes);
     if (outf) fclose(outf);
     if (g_v4l_fd >= 0) {
         enum v4l2_buf_type btype = V4L2_BUF_TYPE_VIDEO_OUTPUT;
@@ -2495,8 +2790,14 @@ int main(int argc, char** argv) {
             total_bytes, read_sec, total_bytes * 8.0 / read_sec / 1e6);
     fprintf(stderr, "parser:    frames_emitted=%llu resyncs=%llu (empty=%llu marker=%llu overflow=%llu)\n",
             g_frames_out, g_resyncs, g_resync_empty, g_resync_marker, g_resync_overflow);
-    fprintf(stderr, "audio:     frames=%llu underrun=%llu (%.2f s at 48kHz)\n",
-            g_audio_frames, g_audio_underrun, g_audio_frames / 48000.0);
+    fprintf(stderr, "audio:     packets=%llu bytes=%llu samples_in=%llu samples_out=%llu "
+                    "underrun=%llu pw_underflow=%llu\n",
+            atomic_load_explicit(&g_audio_packets, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_bytes, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_samples_in, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_samples_out, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_underrun, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_pw_underflow, memory_order_relaxed));
     // 2026-07-18 drop counters (PW ring): クリック/ジッター起因の切り分け用
     uint64_t drops_old = atomic_load_explicit(&g_pw_drops_old, memory_order_relaxed);
     uint64_t drops_new = atomic_load_explicit(&g_pw_drops_new, memory_order_relaxed);
@@ -2506,5 +2807,5 @@ int main(int argc, char** argv) {
     libusb_release_interface(h, 0);
     libusb_close(h);
     libusb_exit(NULL);
-    return 0;
+    return usb_session_fatal ? 2 : 0;
 }

@@ -15,6 +15,19 @@ usb_device_present() {
 }
 
 device_state=unknown
+child_pid=0
+
+stop_supervisor() {
+  trap - INT TERM HUP
+  if [ "$child_pid" -gt 0 ] 2>/dev/null; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+  fi
+  exit 0
+}
+
+trap stop_supervisor INT TERM HUP
+
 while :; do
   if ! usb_device_present; then
     if [ "$device_state" != absent ]; then
@@ -36,8 +49,11 @@ while :; do
     HD60S_AUDIO_PW=1 \
     HD60S_PACE_OUTPUT=1 \
     HD60S_VERBOSE=0 \
-    ./iso_capture 0 2 1
+    ./iso_capture 0 2 1 &
+  child_pid=$!
+  wait "$child_pid"
   rc=$?
+  child_pid=0
   set -e
   echo "[hd60s] iso_capture terminó (rc=$rc); esperando reconexión USB"
   sleep 2

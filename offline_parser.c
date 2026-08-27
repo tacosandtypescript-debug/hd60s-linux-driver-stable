@@ -46,7 +46,15 @@ int main(int argc, char** argv) {
     out_pat = argv[2];
     FILE* f = fopen(argv[1], "rb"); if (!f) { perror(argv[1]); return 1; }
     fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
-    uint8_t* d = malloc(sz); fread(d, 1, sz, f); fclose(f);
+    uint8_t* d = malloc(sz);
+    if (!d) { fprintf(stderr, "out of memory reading %zu bytes\n", sz); fclose(f); return 1; }
+    size_t got = fread(d, 1, sz, f);
+    fclose(f);
+    if (got != sz) {
+        fprintf(stderr, "short read: got %zu of %zu bytes\n", got, sz);
+        free(d);
+        return 1;
+    }
     fprintf(stderr, "read %zu bytes\n", sz);
 
     static uint8_t linebuf[LINE_BYTES];

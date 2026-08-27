@@ -1,0 +1,16 @@
+[Unit]
+Description=Elgato HD60 S capture supervisor
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=@LIBEXECDIR@/run-hd60s-obs.sh
+Restart=always
+RestartSec=2s
+KillMode=mixed
+TimeoutStopSec=10s
+Environment=HD60S_CADENCE_DIAG=1
+
+[Install]
+WantedBy=default.target
