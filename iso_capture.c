@@ -42,6 +42,7 @@
 #include <spa/pod/builder.h>
 #include <pthread.h>
 #include <limits.h>
+#include <signal.h>
 
 static double now_s(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -82,6 +83,22 @@ static int max_inflight = 0;
 static unsigned long submit_ok = 0, submit_fail = 0, resubmit_fail = 0;
 static int usb_session_fatal = 0;
 static int usb_session_error = 0;
+static volatile sig_atomic_t g_stop_requested = 0;
+
+static void request_stop(int signal_number) {
+    (void)signal_number;
+    g_stop_requested = 1;
+}
+
+static void install_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = request_stop;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+}
 
 // Return the payload capacity advertised for EP_STREAM in the selected
 // alternate setting.  On SuperSpeed devices the companion descriptor's
@@ -1422,7 +1439,7 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     }
     if (packet_loss)
         parser_notify_loss(lost_bytes);
-    if (keep_running && !usb_session_fatal) {
+    if (!g_stop_requested && keep_running && !usb_session_fatal) {
         int submit_rc = libusb_submit_transfer(xfr);
         if (submit_rc < 0) {
             inflight--;
@@ -1636,6 +1653,7 @@ int main(int argc, char** argv) {
     // ブロックバッファになってログが即表示されない問題の対策)
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
+    install_signal_handlers();
     int read_sec = argc > 1 ? atoi(argv[1]) : 6;
     // 秒数 0 or 負数を「実用上無限 (~68 年)」に扱う
     // 注: 100 年 = 3,153,600,000 は int overflow なので INT_MAX-3600 で安全
@@ -2360,7 +2378,7 @@ int main(int argc, char** argv) {
     int pt_loop = (env_pt && env_pt[0] && env_pt[0] != '0' && env_pt[0] != 'n' && env_pt[0] != 'N');
     double last_pt_fire = 0.0;
     int pt_fires = 0;
-    while (keep_running && now_s() - start < read_sec && inflight > 0) {
+    while (!g_stop_requested && keep_running && now_s() - start < read_sec && inflight > 0) {
         double el = now_s() - start;
         while (bi < g_nburst && (g_burst[bi].t - burst_t0) <= el) {
             BurstCmd* b = &g_burst[bi];
@@ -2677,7 +2695,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[iso] event handling failed rc=%d (%s)\\n",
                 event_rc, libusb_error_name(event_rc));
     }
-    pace_output_if_due();
+        pace_output_if_due();
+    }
+    if (g_stop_requested) {
+        keep_running = 0;
+        fprintf(stderr, "[main] stop requested; draining USB transfers\n");
     }
     if (usb_session_fatal)
         fprintf(stderr, "[iso] USB session ended: status=%d (%s)\n",
