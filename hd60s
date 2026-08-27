@@ -5,7 +5,8 @@ cd "$(dirname "$(readlink -f "$0")")"
 
 CMD="${1:-help}"; SEC="${2:-}"
 VDEV="/dev/video42"
-ADEV="hw:10,0"
+# snd-aloop: iso_capture writes to playback hw:10,0; consumers read capture hw:10,1.
+ADEV="hw:10,1"
 
 # ---------- helpers ----------
 say()  { echo "[hd60s] $*"; }
