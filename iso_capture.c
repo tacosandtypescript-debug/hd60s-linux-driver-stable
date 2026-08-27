@@ -275,6 +275,23 @@ static _Atomic unsigned long long g_audio_pw_underflow = 0;
 static int16_t g_audio_buf[AUDIO_BATCH_FRAMES];  // mono
 static int g_audio_buf_pos = 0;
 
+// ALSA playback must not run in the libusb callback.  snd_pcm_writei() can
+// wait for the hardware clock, and doing that in the USB event thread stalls
+// both parser_feed() and the resubmission path.  Keep a bounded SPSC queue of
+// short batches; the producer only copies and signals, while the writer owns
+// all blocking ALSA calls.
+#define AUDIO_QUEUE_BATCHES 64
+static int16_t g_audio_queue[AUDIO_QUEUE_BATCHES][AUDIO_BATCH_FRAMES];
+static uint16_t g_audio_queue_len[AUDIO_QUEUE_BATCHES];
+static _Atomic uint32_t g_audio_queue_head = 0;
+static _Atomic uint32_t g_audio_queue_tail = 0;
+static _Atomic unsigned long long g_audio_queue_drops = 0;
+static _Atomic int g_audio_writer_stop = 0;
+static pthread_t g_audio_writer_thread;
+static int g_audio_writer_started = 0;
+static pthread_mutex_t g_audio_writer_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_audio_writer_wake_cond = PTHREAD_COND_INITIALIZER;
+
 static int g_sep_count = 0;
 static double g_measure_start_s = 0.0;
 static int g_measure_done = 0;
@@ -309,6 +326,8 @@ static int audio_pw_open(void);
 static void audio_pw_close(void);
 static void audio_feed_sep_pw(const uint8_t* payload);
 extern int g_use_pw;
+static int audio_writer_start(void);
+static void audio_writer_stop(void);
 
 static void audio_open(const char* pcm_name) {
     // HD60S_AUDIO_PW=1 で PipeWire ネイティブ実装に分岐
@@ -340,20 +359,112 @@ static void audio_open(const char* pcm_name) {
         return;
     }
     fprintf(stderr, "[audio] ALSA %s opened (96kHz S16_LE mono bridge; SEP stereo downmix), 初 SEP 到着から 2 秒で実 rate 測定...\n", pcm_name);
+    audio_writer_start();
+}
+
+static void audio_write_samples(const int16_t* samples, int frames) {
+    if (!g_pcm || !samples || frames <= 0) return;
+    int offset = 0;
+    while (offset < frames) {
+        snd_pcm_sframes_t written = snd_pcm_writei(g_pcm, samples + offset,
+                                                   frames - offset);
+        if (written < 0) {
+            g_audio_underrun++;
+            int err = snd_pcm_recover(g_pcm, (int)written, 1);
+            if (err < 0) {
+                fprintf(stderr, "[audio] recover failed: %s\n", snd_strerror(err));
+                break;
+            }
+            continue;
+        }
+        if (written == 0) break;
+        offset += (int)written;
+    }
+    g_audio_frames += (unsigned long long)offset;
+    g_audio_samples_out += (unsigned long long)offset;
+}
+
+static void audio_writer_signal(void) {
+    pthread_mutex_lock(&g_audio_writer_wake_mutex);
+    pthread_cond_signal(&g_audio_writer_wake_cond);
+    pthread_mutex_unlock(&g_audio_writer_wake_mutex);
+}
+
+static int audio_queue_push(const int16_t* samples, int frames) {
+    uint32_t head = atomic_load_explicit(&g_audio_queue_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&g_audio_queue_tail, memory_order_acquire);
+    if (head - tail >= AUDIO_QUEUE_BATCHES) {
+        atomic_fetch_add_explicit(&g_audio_queue_drops, 1, memory_order_relaxed);
+        return -1;
+    }
+    uint32_t slot = head % AUDIO_QUEUE_BATCHES;
+    memcpy(g_audio_queue[slot], samples, (size_t)frames * sizeof(samples[0]));
+    g_audio_queue_len[slot] = (uint16_t)frames;
+    atomic_store_explicit(&g_audio_queue_head, head + 1, memory_order_release);
+    audio_writer_signal();
+    return 0;
+}
+
+static void* audio_writer_main(void* unused) {
+    (void)unused;
+    for (;;) {
+        uint32_t tail = atomic_load_explicit(&g_audio_queue_tail, memory_order_relaxed);
+        uint32_t head = atomic_load_explicit(&g_audio_queue_head, memory_order_acquire);
+        if (tail != head) {
+            uint32_t slot = tail % AUDIO_QUEUE_BATCHES;
+            audio_write_samples(g_audio_queue[slot], g_audio_queue_len[slot]);
+            atomic_store_explicit(&g_audio_queue_tail, tail + 1, memory_order_release);
+            continue;
+        }
+
+        pthread_mutex_lock(&g_audio_writer_wake_mutex);
+        while (!atomic_load_explicit(&g_audio_writer_stop, memory_order_acquire) &&
+               atomic_load_explicit(&g_audio_queue_head, memory_order_acquire) ==
+                   atomic_load_explicit(&g_audio_queue_tail, memory_order_relaxed)) {
+            pthread_cond_wait(&g_audio_writer_wake_cond, &g_audio_writer_wake_mutex);
+        }
+        int stop = atomic_load_explicit(&g_audio_writer_stop, memory_order_acquire);
+        pthread_mutex_unlock(&g_audio_writer_wake_mutex);
+
+        if (stop &&
+            atomic_load_explicit(&g_audio_queue_head, memory_order_acquire) ==
+                atomic_load_explicit(&g_audio_queue_tail, memory_order_relaxed))
+            break;
+    }
+    return NULL;
+}
+
+static int audio_writer_start(void) {
+    atomic_store_explicit(&g_audio_queue_head, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_audio_queue_tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_audio_writer_stop, 0, memory_order_relaxed);
+    int rc = pthread_create(&g_audio_writer_thread, NULL, audio_writer_main, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "[audio] async ALSA writer unavailable: %s; using direct fallback\n",
+                strerror(rc));
+        g_audio_writer_started = 0;
+        return -1;
+    }
+    g_audio_writer_started = 1;
+    fprintf(stderr, "[audio] async ALSA writer started (USB callback remains non-blocking)\n");
+    return 0;
+}
+
+static void audio_writer_stop(void) {
+    if (!g_audio_writer_started) return;
+    atomic_store_explicit(&g_audio_writer_stop, 1, memory_order_release);
+    audio_writer_signal();
+    pthread_join(g_audio_writer_thread, NULL);
+    g_audio_writer_started = 0;
 }
 
 static void audio_flush(void) {
-    if (!g_pcm || g_audio_buf_pos == 0) return;
-    snd_pcm_sframes_t written = snd_pcm_writei(g_pcm, g_audio_buf, g_audio_buf_pos);
-    if (written < 0) {
-        g_audio_underrun++;
-        int err = snd_pcm_recover(g_pcm, (int)written, 1);
-        if (err < 0) {
-            fprintf(stderr, "[audio] recover failed: %s\n", snd_strerror(err));
-        }
-    } else {
-        g_audio_frames += written;
-        g_audio_samples_out += (unsigned long long)written;
+    if (g_audio_buf_pos == 0) return;
+    if (g_pcm) {
+        if (g_audio_writer_started)
+            audio_queue_push(g_audio_buf, g_audio_buf_pos);
+        else
+            audio_write_samples(g_audio_buf, g_audio_buf_pos);
     }
     g_audio_buf_pos = 0;
 }
@@ -853,6 +964,7 @@ static void audio_close(void) {
     }
     if (!g_pcm) return;
     audio_flush();
+    audio_writer_stop();
     snd_pcm_drain(g_pcm);
     snd_pcm_close(g_pcm);
     g_pcm = NULL;
