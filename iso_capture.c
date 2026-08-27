@@ -1004,6 +1004,250 @@ static int g_have_prev_line = 0;
 // before resuming output.
 static int g_recovery_pending = 0;
 
+// Opt-in first-loss tracing.  This is deliberately separate from the normal
+// cadence counters: with HD60S_PARSER_TRACE unset it allocates no packet
+// storage and does not change parser decisions.  When enabled, it keeps the
+// last packets verbatim, records parser state around each packet, and captures
+// the first parser-loss context plus the next packets used for reacquisition.
+#define PARSER_TRACE_RING_DEPTH 64
+#define PARSER_TRACE_MAX_PACKET (64u << 10)
+#define PARSER_TRACE_AFTER_PACKETS 128
+typedef struct {
+    unsigned long long packet_no;
+    unsigned long long callback_no;
+    int packet_index;
+    int transfer_status;
+    int packet_status;
+    unsigned int requested_length;
+    unsigned int actual_length;
+    int synced_before;
+    int fline_before;
+    int blk_before;
+    size_t dyn_before;
+    int synced_after;
+    int fline_after;
+    int blk_after;
+    size_t dyn_after;
+    unsigned int raw_stored;
+    uint8_t head[16];
+    uint8_t tail[16];
+    uint8_t raw[PARSER_TRACE_MAX_PACKET];
+} ParserTracePacket;
+
+static int g_trace_enabled = 0;
+static int g_trace_loss_seen = 0;
+static unsigned long long g_trace_packet_no = 0;
+static unsigned long long g_trace_callback_no = 0;
+static unsigned int g_trace_after_remaining = 0;
+static unsigned int g_trace_current_slot = 0;
+static int g_trace_current_active = 0;
+static int g_trace_post_slot = -1;
+static unsigned int g_trace_ring_count = 0;
+static unsigned int g_trace_ring_next = 0;
+static ParserTracePacket* g_trace_packets = NULL;
+static FILE* g_trace_log = NULL;
+static FILE* g_trace_post_raw = NULL;
+static char g_trace_base[PATH_MAX] = "/tmp/hd60s-parser-first-loss";
+
+static unsigned long long g_trace_scan_count = 0;
+static size_t g_trace_last_scan_n = 0;
+static size_t g_trace_last_scan_start = 0;
+static size_t g_trace_last_scan_end = 0;
+static size_t g_trace_last_scan_q = SIZE_MAX;
+static size_t g_trace_last_scan_next = SIZE_MAX;
+static uint32_t g_trace_last_scan_tag = 0;
+static unsigned int g_trace_last_scan_candidates = 0;
+static unsigned int g_trace_last_scan_waiting = 0;
+static unsigned int g_trace_last_scan_rejected = 0;
+static unsigned int g_trace_last_scan_confirmed = 0;
+
+static int trace_env_enabled(const char* name) {
+    const char* value = getenv(name);
+    return value && value[0] && value[0] != '0' && value[0] != 'n' && value[0] != 'N';
+}
+
+static void trace_hex(FILE* fp, const uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len; ++i) fprintf(fp, "%02x", data[i]);
+}
+
+static void trace_path(char* out, size_t out_n, const char* suffix) {
+    if (!out_n) return;
+    size_t base_n = strlen(g_trace_base);
+    size_t suffix_n = strlen(suffix);
+    if (suffix_n >= out_n) suffix_n = out_n - 1;
+    size_t base_room = out_n - suffix_n - 1;
+    if (base_n > base_room) base_n = base_room;
+    memcpy(out, g_trace_base, base_n);
+    memcpy(out + base_n, suffix, suffix_n);
+    out[base_n + suffix_n] = '\0';
+}
+
+static void parser_trace_init(void) {
+    if (!trace_env_enabled("HD60S_PARSER_TRACE")) return;
+    g_trace_packets = calloc(PARSER_TRACE_RING_DEPTH, sizeof(*g_trace_packets));
+    if (!g_trace_packets) {
+        fprintf(stderr, "[parser-trace] packet ring allocation failed; tracing disabled\n");
+        return;
+    }
+    const char* base = getenv("HD60S_PARSER_TRACE_FILE");
+    if (base && *base) snprintf(g_trace_base, sizeof(g_trace_base), "%s", base);
+    char path[PATH_MAX];
+    trace_path(path, sizeof(path), ".log");
+    g_trace_log = fopen(path, "w");
+    if (!g_trace_log) {
+        fprintf(stderr, "[parser-trace] cannot open %s: %s; tracing disabled\n",
+                path, strerror(errno));
+        free(g_trace_packets);
+        g_trace_packets = NULL;
+        return;
+    }
+    setvbuf(g_trace_log, NULL, _IOLBF, 0);
+    g_trace_enabled = 1;
+    fprintf(stderr, "[parser-trace] enabled base=%s (first parser-loss only)\n", g_trace_base);
+    fprintf(g_trace_log, "trace_version=1 base=%s\n", g_trace_base);
+}
+
+static void parser_trace_begin(unsigned long long callback_no, int packet_index,
+                               int transfer_status,
+                               const struct libusb_iso_packet_descriptor* d,
+                               const uint8_t* data) {
+    if (!g_trace_enabled || !g_trace_packets || !d) return;
+    unsigned int slot = g_trace_ring_next;
+    ParserTracePacket* p = &g_trace_packets[slot];
+    memset(p, 0, sizeof(*p));
+    p->packet_no = ++g_trace_packet_no;
+    p->callback_no = callback_no;
+    p->packet_index = packet_index;
+    p->transfer_status = transfer_status;
+    p->packet_status = d->status;
+    p->requested_length = d->length;
+    p->actual_length = d->actual_length;
+    p->synced_before = g_parser_synced;
+    p->fline_before = g_fline;
+    p->blk_before = g_blk_run;
+    p->dyn_before = g_dyn_n;
+    if (data && d->actual_length) {
+        size_t n = d->actual_length;
+        size_t head_n = n < sizeof(p->head) ? n : sizeof(p->head);
+        size_t tail_n = n < sizeof(p->tail) ? n : sizeof(p->tail);
+        memcpy(p->head, data, head_n);
+        memcpy(p->tail, data + n - tail_n, tail_n);
+        p->raw_stored = n < PARSER_TRACE_MAX_PACKET ? (unsigned int)n : 0;
+        if (p->raw_stored) memcpy(p->raw, data, p->raw_stored);
+    }
+    g_trace_current_slot = slot;
+    g_trace_current_active = 1;
+    g_trace_ring_next = (g_trace_ring_next + 1) % PARSER_TRACE_RING_DEPTH;
+    if (g_trace_ring_count < PARSER_TRACE_RING_DEPTH) g_trace_ring_count++;
+
+    if (g_trace_after_remaining && g_trace_post_raw && data && d->actual_length) {
+        long offset = ftell(g_trace_post_raw);
+        fwrite(data, 1, d->actual_length, g_trace_post_raw);
+        fflush(g_trace_post_raw);
+        g_trace_post_slot = (int)slot;
+        fprintf(g_trace_log,
+                "post-begin packet=%llu callback=%llu index=%d offset=%ld len=%u "
+                "status=%d transfer=%d synced=%d ACT=%d BLK=%d dyn=%zu\n",
+                p->packet_no, p->callback_no, p->packet_index, offset,
+                p->actual_length, p->packet_status, p->transfer_status,
+                p->synced_before, p->fline_before, p->blk_before, p->dyn_before);
+        g_trace_after_remaining--;
+    }
+}
+
+static void parser_trace_end(void) {
+    if (!g_trace_enabled || !g_trace_packets || !g_trace_current_active) return;
+    ParserTracePacket* p = &g_trace_packets[g_trace_current_slot];
+    p->synced_after = g_parser_synced;
+    p->fline_after = g_fline;
+    p->blk_after = g_blk_run;
+    p->dyn_after = g_dyn_n;
+    if (g_trace_post_slot == (int)g_trace_current_slot) {
+        fprintf(g_trace_log,
+                "post-end packet=%llu synced=%d ACT=%d BLK=%d dyn=%zu\n",
+                p->packet_no, p->synced_after, p->fline_after,
+                p->blk_after, p->dyn_after);
+        g_trace_post_slot = -1;
+    }
+    g_trace_current_active = 0;
+}
+
+static void parser_trace_dump_loss(size_t bytes_lost, int partial_lines,
+                                   int partial_blks) {
+    if (!g_trace_enabled || g_trace_loss_seen) return;
+    g_trace_loss_seen = 1;
+    char path[PATH_MAX];
+    trace_path(path, sizeof(path), ".before.raw");
+    FILE* before = fopen(path, "wb");
+    trace_path(path, sizeof(path), ".dyn.bin");
+    FILE* dyn = fopen(path, "wb");
+    trace_path(path, sizeof(path), ".post.raw");
+    g_trace_post_raw = fopen(path, "wb");
+
+    fprintf(g_trace_log,
+            "loss bytes_lost=%zu partial_ACT=%d partial_BLK=%d synced=%d "
+            "g_fline=%d g_blk_run=%d dyn_n=%zu sync_n=%zu packet_no=%llu callback_no=%llu\n",
+            bytes_lost, partial_lines, partial_blks, g_parser_synced,
+            g_fline, g_blk_run, g_dyn_n, g_sync_n, g_trace_packet_no,
+            g_trace_callback_no);
+    fprintf(g_trace_log,
+            "last_scan count=%llu dyn_n=%zu range=%zu..%zu q=%zu next=%zu "
+            "tag=0x%08x candidates=%u waiting=%u rejected=%u confirmed=%u\n",
+            g_trace_scan_count, g_trace_last_scan_n, g_trace_last_scan_start,
+            g_trace_last_scan_end, g_trace_last_scan_q, g_trace_last_scan_next,
+            g_trace_last_scan_tag, g_trace_last_scan_candidates,
+            g_trace_last_scan_waiting, g_trace_last_scan_rejected,
+            g_trace_last_scan_confirmed);
+
+    if (dyn && g_dyn_n) {
+        fwrite(g_dyn_buf, 1, g_dyn_n, dyn);
+        fflush(dyn);
+    }
+    if (dyn) fclose(dyn);
+
+    if (before && g_trace_ring_count) {
+        unsigned int first = (g_trace_ring_next + PARSER_TRACE_RING_DEPTH -
+                              g_trace_ring_count) % PARSER_TRACE_RING_DEPTH;
+        long offset = 0;
+        for (unsigned int n = 0; n < g_trace_ring_count; ++n) {
+            ParserTracePacket* p = &g_trace_packets[(first + n) % PARSER_TRACE_RING_DEPTH];
+            fprintf(g_trace_log,
+                    "before-packet packet=%llu callback=%llu index=%d offset=%ld "
+                    "len=%u requested=%u status=%d transfer=%d "
+                    "before=%d/%d/%d/%zu after=%d/%d/%d/%zu raw_stored=%u head=",
+                    p->packet_no, p->callback_no, p->packet_index, offset,
+                    p->actual_length, p->requested_length, p->packet_status,
+                    p->transfer_status, p->synced_before, p->fline_before,
+                    p->blk_before, p->dyn_before, p->synced_after,
+                    p->fline_after, p->blk_after, p->dyn_after,
+                    p->raw_stored);
+            trace_hex(g_trace_log, p->head, sizeof(p->head));
+            fprintf(g_trace_log, " tail=");
+            trace_hex(g_trace_log, p->tail, sizeof(p->tail));
+            fprintf(g_trace_log, "\n");
+            if (p->raw_stored) {
+                fwrite(p->raw, 1, p->raw_stored, before);
+                offset += p->raw_stored;
+            }
+        }
+        fflush(before);
+    }
+    if (before) fclose(before);
+
+    if (g_trace_current_active) {
+        ParserTracePacket* p = &g_trace_packets[g_trace_current_slot];
+        fprintf(g_trace_log,
+                "trigger packet=%llu callback=%llu index=%d len=%u status=%d "
+                "before=%d/%d/%d/%zu current=%d/%d/%d/%zu\n",
+                p->packet_no, p->callback_no, p->packet_index, p->actual_length,
+                p->packet_status, p->synced_before, p->fline_before,
+                p->blk_before, p->dyn_before, g_parser_synced, g_fline,
+                g_blk_run, g_dyn_n);
+    }
+    fflush(g_trace_log);
+    g_trace_after_remaining = PARSER_TRACE_AFTER_PACKETS;
+}
+
 static void parser_notify_loss(size_t bytes_lost);
 
 static void parser_reset(const char* why) {
@@ -1189,15 +1433,36 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
         size_t best_q = SIZE_MAX;
         uint32_t best_tag = 0;
         int best_score = INT_MAX;
+        if (g_trace_enabled) {
+            g_trace_scan_count++;
+            g_trace_last_scan_n = g_dyn_n;
+            g_trace_last_scan_start = scan_start;
+            g_trace_last_scan_end = scan_end;
+            g_trace_last_scan_q = SIZE_MAX;
+            g_trace_last_scan_next = SIZE_MAX;
+            g_trace_last_scan_tag = 0;
+            g_trace_last_scan_candidates = 0;
+            g_trace_last_scan_waiting = 0;
+            g_trace_last_scan_rejected = 0;
+            g_trace_last_scan_confirmed = 0;
+        }
         for (size_t p = scan_start; p + 4 <= scan_end; ++p) {
             uint32_t candidate;
             memcpy(&candidate, g_dyn_buf + p, 4);
             if (candidate == MK_EOL_ACT || candidate == MK_EOL_BLK ||
                 candidate == MK_SEP || candidate == MK_SEP_BULK) {
+                if (g_trace_enabled) {
+                    g_trace_last_scan_candidates++;
+                    g_trace_last_scan_q = p;
+                    g_trace_last_scan_tag = candidate;
+                }
                 // A marker-looking sequence in the pixel payload is not
                 // sufficient.  Confirm the next protocol marker at the
                 // normal line distance before accepting this candidate.
-                if (g_dyn_n < p + 3004) break;
+                if (g_dyn_n < p + 3004) {
+                    if (g_trace_enabled) g_trace_last_scan_waiting++;
+                    break;
+                }
                 int next_ok = 0;
                 size_t next_pos = 0;
                 for (size_t s = p + 3000; s <= p + 4100 && s + 4 <= g_dyn_n; ++s) {
@@ -1211,6 +1476,10 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
                     }
                 }
                 if (next_ok) {
+                    if (g_trace_enabled) {
+                        g_trace_last_scan_confirmed++;
+                        g_trace_last_scan_next = next_pos;
+                    }
                     int score = abs((int)p - (LINE_BYTES + 6)) +
                                 abs((int)(next_pos - p) - (LINE_BYTES + 8));
                     if (score < best_score) {
@@ -1218,6 +1487,8 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
                         best_q = p;
                         best_tag = candidate;
                     }
+                } else if (g_trace_enabled) {
+                    g_trace_last_scan_rejected++;
                 }
             }
         }
@@ -1516,6 +1787,7 @@ static void parser_feed(const uint8_t* data, size_t len) {
 static void parser_notify_loss(size_t bytes_lost) {
     (void)bytes_lost;
     int partial_lines = g_fline;
+    parser_trace_dump_loss(bytes_lost, partial_lines, g_blk_run);
     if (g_diag) {
         if (partial_lines > 0) g_diag_partial++;
         g_diag_resets++;
@@ -1623,6 +1895,8 @@ static int hex2bin(const char* hex, unsigned char* out, int maxlen) {
 // ======================================================================
 static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     static unsigned long callback_count = 0;
+    unsigned long long trace_cb_no = 0;
+    if (g_trace_enabled) trace_cb_no = ++g_trace_callback_no;
     // HEX DUMP HOOK: HD60S_HEXDUMP=1 で iso packet の先頭 32B を最初 500 個 dump
     // 音声パケットと映像パケットを見分けるため (workflow suggestion 2026-07-11)
     static const char* env_hexdump = NULL;
@@ -1638,9 +1912,13 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     size_t lost_bytes = 0;
     for (int i = 0; i < xfr->num_iso_packets; i++) {
         struct libusb_iso_packet_descriptor* d = &xfr->iso_packet_desc[i];
+        unsigned char* packet_buf = NULL;
+        if (d->status == LIBUSB_TRANSFER_COMPLETED && d->actual_length > 0)
+            packet_buf = libusb_get_iso_packet_buffer_simple(xfr, i);
+        parser_trace_begin(trace_cb_no, i, xfr->status, d, packet_buf);
         if (d->status == LIBUSB_TRANSFER_COMPLETED) {
             if (d->actual_length > 0) {
-                unsigned char* buf = libusb_get_iso_packet_buffer_simple(xfr, i);
+                unsigned char* buf = packet_buf;
                 // HEX DUMP hook - first 500 non-empty packets
                 if (do_hexdump && hexdump_count < 500) {
                     fprintf(stderr, "PKT[%d] len=%d: ", hexdump_count, d->actual_length);
@@ -1655,11 +1933,13 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
                 total_bytes += d->actual_length;
                 if (g_diag) g_diag_input_bytes += d->actual_length;
                 pkt_ok++;
+                parser_trace_end();
             } else {
                 // iso 0-length pkt はブランキングによる正常な休止と考え、
                 // 進行中のライン位置には触れない (実測で empty時にg_lpos リセットすると
                 // 逆に marker resync が増える → 触らないのが正解)。
                 pkt_empty++;
+                parser_trace_end();
             }
         } else {
             pkt_err++;
@@ -1670,6 +1950,7 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
                 usb_session_fatal = 1;
                 usb_session_error = xfr->status;
             }
+            parser_trace_end();
         }
     }
     if (packet_loss)
@@ -1888,6 +2169,7 @@ int main(int argc, char** argv) {
     // ブロックバッファになってログが即表示されない問題の対策)
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
+    parser_trace_init();
     install_signal_handlers();
     int read_sec = argc > 1 ? atoi(argv[1]) : 6;
     // 秒数 0 or 負数を「実用上無限 (~68 年)」に扱う
