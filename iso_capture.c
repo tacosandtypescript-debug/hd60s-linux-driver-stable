@@ -1356,7 +1356,38 @@ static int v4l2_open(const char* devpath) {
     vf.fmt.pix.bytesperline = 3840;
     vf.fmt.pix.sizeimage = 4147200;
     vf.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
-    if (ioctl(fd, VIDIOC_S_FMT, &vf) < 0) fprintf(stderr, "[v4l2] S_FMT 失敗(続行): %s\n", strerror(errno));
+    if (ioctl(fd, VIDIOC_S_FMT, &vf) < 0) {
+        fprintf(stderr, "[v4l2] S_FMT 失敗: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    // S_FMT is a negotiation: the driver is allowed to change every field.
+    // Verify the negotiated format before any frame is written.  Accepting a
+    // different stride or size here would make a valid YUYV frame appear as a
+    // vertical roll or horizontal bands in the consumer.
+    struct v4l2_format actual;
+    memset(&actual, 0, sizeof(actual));
+    actual.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    if (ioctl(fd, VIDIOC_G_FMT, &actual) < 0) {
+        fprintf(stderr, "[v4l2] G_FMT 失敗: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    fprintf(stderr,
+            "[v4l2] negotiated %ux%u pixfmt=0x%08x field=%u bytesperline=%u sizeimage=%u\n",
+            actual.fmt.pix.width, actual.fmt.pix.height,
+            actual.fmt.pix.pixelformat, actual.fmt.pix.field,
+            actual.fmt.pix.bytesperline, actual.fmt.pix.sizeimage);
+    if (actual.fmt.pix.width != FRAME_W || actual.fmt.pix.height != FRAME_H ||
+        actual.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV ||
+        actual.fmt.pix.bytesperline != LINE_BYTES ||
+        actual.fmt.pix.sizeimage != FRAME_BYTES) {
+        fprintf(stderr,
+                "[v4l2] incompatible negotiated format; refusing frame writes\n");
+        close(fd);
+        return -1;
+    }
 
     struct v4l2_streamparm sp; memset(&sp, 0, sizeof(sp));
     sp.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
