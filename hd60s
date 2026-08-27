@@ -48,9 +48,9 @@ ensure_v4l2loopback() {
 }
 
 ensure_hd60s_device() {
-    # HD60S: VID 0fd9, PID 0074 (無印) / 0066 は別リビジョン
-    if ! lsusb 2>/dev/null | grep -qi "0fd9:0074"; then
-        die "HD60S (0fd9:0074) が USB に見つからない。ケーブル刺さってる? 電源入ってる?"
+    # HD60 S: VID 0fd9, PID 005e (the device supported by iso_capture).
+    if ! lsusb 2>/dev/null | grep -qi "0fd9:005e"; then
+        die "HD60 S (0fd9:005e) が USB に見つからない。ケーブル刺さってる? 電源入ってる?"
     fi
 }
 
