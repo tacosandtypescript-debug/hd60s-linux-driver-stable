@@ -2567,7 +2567,11 @@ int main(int argc, char** argv) {
         // Windows pcap では 40-300ms 周期で連続発射している。
         static double last_pt_ka = 0.0;
         static int pt_ka_fires = 0;
-        if ((el - last_pt_ka) >= 0.100) {
+        // In paced capture this synchronous five-transfer maintenance cycle
+        // blocks the same thread that must submit V4L2 frames at 60 Hz.  The
+        // passthrough keepalive is retained for unpaced/pass-through runs,
+        // but must not stall the capture presentation clock.
+        if (!g_pace_output && (el - last_pt_ka) >= 0.100) {
             // enable trio + keepalive pair を毎回発射
             // aa 12 34 90 05 00
             unsigned char w0a[6] = {0xaa, 0x12, 0x34, 0x90, 0x05, 0x00};
