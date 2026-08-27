@@ -258,13 +258,11 @@ static void diag_report_if_due(void) {
 // SECTION 2: ALSA 音声出力 (snd-aloop 経由)
 // ======================================================================
 // ALSA snd-aloop 出力
-// 🔥 2026-07-11 kusq A/B 試聴で判明: SEP 8B payload = 4 mono int16 LE samples
-// (連続 4 サンプル、stereo LRLRではない)。native = 96kHz mono (Switch HDMI)。
-// iso packet loss で実際に到着する SEP rate < 期待値 (24000/s) → 実効サンプル
-// レート < 96kHz → 96kHz で ALSA へ流すと足りない → underrun / 音が遅延。
-// 🔥 根本対策 (2026-07-11): 起動時に SEP marker rate を 2 秒実測 → 96kHz への
-// 補間比 upsample_ratio を算出 → ALSA は 96kHz 固定のまま、各 SEP からの
-// 4 samples を upsample_ratio 倍に線形補間して feed。結果: 音は本来速度で鳴る。
+// SEP payload の実測構造: 8B = 2 signed 24-bit PCM samples in little-endian
+// 32-bit slots (stereo L/R). The observed SEP cadence is about 24,000 records/s;
+// downmix one L/R frame to mono and resample it to the stable 96kHz OBS bridge.
+// The previous int16 interpretation used only the low 16 bits of each slot,
+// reducing an audible signal to near-silence.
 static snd_pcm_t* g_pcm = NULL;
 static _Atomic unsigned long long g_audio_frames = 0;
 static _Atomic unsigned long long g_audio_underrun = 0;
@@ -273,7 +271,7 @@ static _Atomic unsigned long long g_audio_bytes = 0;
 static _Atomic unsigned long long g_audio_samples_in = 0;
 static _Atomic unsigned long long g_audio_samples_out = 0;
 static _Atomic unsigned long long g_audio_pw_underflow = 0;
-#define AUDIO_BATCH_FRAMES 960  // 10ms 相当 (96kHz mono)
+#define AUDIO_BATCH_FRAMES 960  // 10ms 相当 (96kHz mono OBS bridge)
 static int16_t g_audio_buf[AUDIO_BATCH_FRAMES];  // mono
 static int g_audio_buf_pos = 0;
 
@@ -281,7 +279,7 @@ static int g_sep_count = 0;
 static double g_measure_start_s = 0.0;
 static int g_measure_done = 0;
 static int g_measure_started = 0;   // 初 SEP 到着で開始
-// 96kHz へアップサンプルする比率 (0=固定計算前)
+// 96kHz bridge へ補間する比率 (0=固定計算前)
 static double g_upsample_ratio = 0.0;
 // 補間状態: 前回の終点サンプル (次の補間の起点)
 static int16_t g_last_sample = 0;
@@ -292,6 +290,18 @@ static double now_monotonic_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+// SEP payload: two signed 24-bit PCM samples stored in little-endian
+// 32-bit slots (the upper byte is sign extension). Convert one slot to the
+// signed 16-bit range expected by the ALSA/PipeWire bridge.
+static int16_t decode_sep_s24(const uint8_t* p) {
+    uint32_t raw;
+    memcpy(&raw, p, sizeof(raw));
+    int32_t sample = (int32_t)raw >> 8;
+    if (sample > INT16_MAX) sample = INT16_MAX;
+    if (sample < INT16_MIN) sample = INT16_MIN;
+    return (int16_t)sample;
 }
 
 // PipeWire 版の前方宣言 (定義は後段)
@@ -321,7 +331,7 @@ static void audio_open(const char* pcm_name) {
         SND_PCM_FORMAT_S16_LE,
         SND_PCM_ACCESS_RW_INTERLEAVED,
         1,          // mono
-        96000,      // 常に 96kHz (下流の arecord|aplay と一致)
+        96000,      // OBS-facing snd-aloop bridge rate
         1,          // soft resample
         200000);    // 200ms latency (余裕を持たせる)
     if (err < 0) {
@@ -329,7 +339,7 @@ static void audio_open(const char* pcm_name) {
         snd_pcm_close(g_pcm); g_pcm = NULL;
         return;
     }
-    fprintf(stderr, "[audio] ALSA %s opened (96kHz S16_LE mono), 初 SEP 到着から 2 秒で実 rate 測定...\n", pcm_name);
+    fprintf(stderr, "[audio] ALSA %s opened (96kHz S16_LE mono bridge; SEP stereo downmix), 初 SEP 到着から 2 秒で実 rate 測定...\n", pcm_name);
 }
 
 static void audio_flush(void) {
@@ -348,8 +358,7 @@ static void audio_flush(void) {
     g_audio_buf_pos = 0;
 }
 
-// 補間 & 出力書き込み。samples[n] を effective rate × upsample_ratio 相当で
-// 96kHz に伸ばす (nearest / linear)。
+// SEP の L/R ペアを mono に downmix し、欠落分を 96kHz bridge へ線形補間して出力する。
 static void audio_feed_sep(const uint8_t* payload) {
     g_audio_packets++;
     g_audio_bytes += 8;
@@ -366,25 +375,34 @@ static void audio_feed_sep(const uint8_t* payload) {
         double el = now_monotonic_s() - g_measure_start_s;
         if (el < 2.0 || g_sep_count < 500) return;
         double sep_rate = g_sep_count / el;
-        double effective_sample_rate = sep_rate * 4.0;
+        double effective_sample_rate = sep_rate;
         // 2026-07-18 3-way snap: 48/96/192 kHz の HDMI 音源に対応。
         // 起動直後の SEP 取りこぼしで実効レートが誤検出されても、最近傍の "常識的"
         // レートに snap することで upsample 比率暴走で波形歪む問題を防ぐ。
-        // - 47-49 kHz: 48 kHz (PS5/Xbox/PC HDMI 出力の一般値)
-        // - 95-97 kHz: 96 kHz (Switch)
-        // - 190-194 kHz: 192 kHz (稀、高音質 AV 機器)
-        // - どれにも該当しない = 判別不能 → 96 kHz デフォルト (kusq 常用)
-        if (effective_sample_rate >= 47000.0 && effective_sample_rate <= 49000.0) {
+        // - 21-26 kHz: 24 kHz (この SEP stream の実測値)
+        // - 43-51 kHz: 48 kHz (一般的な HDMI PCM)
+        // - 95-97 kHz: 96 kHz
+        // - 190-194 kHz: 192 kHz
+        // - どれにも該当しない = 判別不能 → 24 kHz デフォルト
+        if (effective_sample_rate >= 21000.0 && effective_sample_rate <= 26000.0) {
+            effective_sample_rate = 24000.0;
+        } else if (effective_sample_rate >= 43000.0 && effective_sample_rate <= 51000.0) {
             effective_sample_rate = 48000.0;
         } else if (effective_sample_rate >= 95000.0 && effective_sample_rate <= 97000.0) {
             effective_sample_rate = 96000.0;
         } else if (effective_sample_rate >= 190000.0 && effective_sample_rate <= 194000.0) {
             effective_sample_rate = 192000.0;
         } else {
-            effective_sample_rate = 96000.0;  // 判別不能 → Switch 想定デフォルト
+            effective_sample_rate = 24000.0;
         }
-        g_upsample_ratio = 96000.0 / effective_sample_rate;
-        fprintf(stderr, "[audio] measured: %.1f SEP/s → %.0f Hz eff → upsample %.3fx to 96kHz\n",
+        // The parser cadence is the rate that actually feeds the resampler.
+        // Using only the nominal snapped rate would underfeed snd-aloop when
+        // some SEP markers are missed (for example 22.3k observed vs 24k
+        // nominal), eventually draining the 96kHz playback ring.
+        g_upsample_ratio = 96000.0 / sep_rate;
+        if (g_upsample_ratio < 0.5) g_upsample_ratio = 0.5;
+        if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
+        fprintf(stderr, "[audio] measured: %.1f SEP/s → %.0f Hz nominal → ratio %.3fx to 96kHz mono bridge\n",
                 sep_rate, effective_sample_rate, g_upsample_ratio);
         g_measure_done = 1;
         g_last_sample = 0;
@@ -394,25 +412,24 @@ static void audio_feed_sep(const uint8_t* payload) {
 
     if (!g_pcm || g_upsample_ratio <= 0) return;
 
-    // 8B payload → 4 mono int16 samples
-    const int16_t* s = (const int16_t*)payload;
-    for (int k = 0; k < 4; k++) {
-        int16_t cur = s[k];
-        // 各入力 sample を upsample_ratio 個の出力 sample に展開
-        // linear interpolation: prev (g_last_sample) → cur
-        double count = g_upsample_ratio + g_frac_pos;
-        int n = (int)count;
-        g_frac_pos = count - n;
-        for (int i = 1; i <= n; i++) {
-            double t = (double)i / (double)(n > 0 ? n : 1);
-            double v = g_last_sample + (cur - g_last_sample) * t;
-            if (v > 32767.0) v = 32767.0;
-            if (v < -32768.0) v = -32768.0;
-            if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
-            g_audio_buf[g_audio_buf_pos++] = (int16_t)v;
-        }
-        g_last_sample = cur;
+    // 8B payload = one stereo frame in two 32-bit S24 slots: L,R.
+    int32_t mix = (int32_t)decode_sep_s24(payload) +
+                 (int32_t)decode_sep_s24(payload + 4);
+    int16_t cur = (int16_t)(mix / 2);
+    // 各入力 sample を upsample_ratio 個の出力 sample に展開
+    // linear interpolation: prev (g_last_sample) → cur
+    double count = g_upsample_ratio + g_frac_pos;
+    int n = (int)count;
+    g_frac_pos = count - n;
+    for (int i = 1; i <= n; i++) {
+        double t = (double)i / (double)(n > 0 ? n : 1);
+        double v = g_last_sample + (cur - g_last_sample) * t;
+        if (v > 32767.0) v = 32767.0;
+        if (v < -32768.0) v = -32768.0;
+        if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
+        g_audio_buf[g_audio_buf_pos++] = (int16_t)v;
     }
+    g_last_sample = cur;
     if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
 }
 
@@ -691,29 +708,36 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         double el = now_monotonic_s() - g_measure_start_s;
         if (el < 2.0 || g_sep_count < 500) return;
         double sep_rate = g_sep_count / el;
-        double effective_sample_rate = sep_rate * 4.0;
+        double effective_sample_rate = sep_rate;
         // 2026-07-18 3-way snap: 48/96/192 kHz の HDMI 音源に対応。
         // 起動直後の SEP 取りこぼしで実効レートが誤検出されても、最近傍の "常識的"
         // レートに snap することで upsample 比率暴走で波形歪む問題を防ぐ。
-        // - 47-49 kHz: 48 kHz (PS5/Xbox/PC HDMI 出力の一般値)
-        // - 95-97 kHz: 96 kHz (Switch)
-        // - 190-194 kHz: 192 kHz (稀、高音質 AV 機器)
-        // - どれにも該当しない = 判別不能 → 96 kHz デフォルト (kusq 常用)
-        if (effective_sample_rate >= 47000.0 && effective_sample_rate <= 49000.0) {
+        // - 21-26 kHz: 24 kHz (この SEP stream の実測値)
+        // - 43-51 kHz: 48 kHz (一般的な HDMI PCM)
+        // - 95-97 kHz: 96 kHz
+        // - 190-194 kHz: 192 kHz
+        // - どれにも該当しない = 判別不能 → 24 kHz デフォルト
+        if (effective_sample_rate >= 21000.0 && effective_sample_rate <= 26000.0) {
+            effective_sample_rate = 24000.0;
+        } else if (effective_sample_rate >= 43000.0 && effective_sample_rate <= 51000.0) {
             effective_sample_rate = 48000.0;
         } else if (effective_sample_rate >= 95000.0 && effective_sample_rate <= 97000.0) {
             effective_sample_rate = 96000.0;
         } else if (effective_sample_rate >= 190000.0 && effective_sample_rate <= 194000.0) {
             effective_sample_rate = 192000.0;
         } else {
-            effective_sample_rate = 96000.0;  // 判別不能 → Switch 想定デフォルト
+            effective_sample_rate = 24000.0;
         }
         // 2026-07-21 P3-1: 48kHz stream 統合。Switch 96kHz なら ratio=0.5 (2:1 decimation)
         // libsamplerate SINC が anti-alias LPF 込みで Nyquist 超え成分を除去する。
-        g_upsample_ratio = 48000.0 / effective_sample_rate;
+        // Follow the observed parser cadence so the native 48kHz stream does
+        // not slowly starve when the marker rate is below its nominal value.
+        g_upsample_ratio = 48000.0 / sep_rate;
+        if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
+        if (g_upsample_ratio > 4.0) g_upsample_ratio = 4.0;
         g_pll_base_ratio = g_upsample_ratio;   // PLL の基準値として保存
         g_pll_last_update = now_monotonic_s();
-        fprintf(stderr, "[audio-pw] measured: %.1f SEP/s → %.0f Hz eff → ratio %.3fx to 48kHz stream\n",
+        fprintf(stderr, "[audio-pw] measured: %.1f SEP/s → %.0f Hz nominal → ratio %.3fx to 48kHz stream\n",
                 sep_rate, effective_sample_rate, g_upsample_ratio);
         g_measure_done = 1;
         g_last_sample = 0;
@@ -768,15 +792,16 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
     }
 
     // 2026-07-19 libsamplerate (SINC 補間) 経路。使えない時は旧 linear interp に fallback。
-    const int16_t* s = (const int16_t*)payload;
+    int32_t mix = (int32_t)decode_sep_s24(payload) +
+                 (int32_t)decode_sep_s24(payload + 4);
+    int16_t mono = (int16_t)(mix / 2);
     if (g_src_ok) {
         // int16 → float [-1,1)
-        float input[4];
-        for (int k = 0; k < 4; k++) input[k] = (float)s[k] / 32768.0f;
-        float output[32];  // 48kHz snap 時 ratio=2.0 → 8 samples 出、余裕 32
+        float input[1] = { (float)mono / 32768.0f };
+        float output[32];
         SRC_DATA data = {
             .data_in = input,
-            .input_frames = 4,
+            .input_frames = 1,
             .data_out = output,
             .output_frames = (long)(sizeof(output)/sizeof(output[0])),
             .src_ratio = g_upsample_ratio,
@@ -801,8 +826,8 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
     // Fallback: 旧 linear interp (libsamplerate init 失敗時のみ)
     int16_t batch[32];
     int bi = 0;
-    for (int k = 0; k < 4; k++) {
-        int16_t cur = s[k];
+    for (int k = 0; k < 1; k++) {
+        int16_t cur = mono;
         double count = g_upsample_ratio + g_frac_pos;
         int n = (int)count;
         g_frac_pos = count - n;
