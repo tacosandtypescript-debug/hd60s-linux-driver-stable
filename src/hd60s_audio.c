@@ -1,0 +1,831 @@
+#include "hd60s_audio.h"
+#include "hd60s_util.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <stdalign.h>
+#include <samplerate.h>
+#include <errno.h>
+#include <alsa/asoundlib.h>
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/pod/builder.h>
+#include <pthread.h>
+#include <limits.h>
+#include <math.h>
+
+static int g_use_pw = 0;
+
+// ======================================================================
+// SECTION 2: ALSA 音声出力 (snd-aloop 経由)
+// ======================================================================
+// ALSA snd-aloop 出力
+// SEP payload の実測構造: 8B = 2 stereo S16_LE frames, interleaved as
+// L0,R0,L1,R1. The observed SEP cadence is about 24,000 records/s, so each
+// record contains two audio frames at the normal 48kHz HDMI rate. Downmix
+// both frames to mono before resampling to the OBS bridge rate.
+static snd_pcm_t* g_pcm = NULL;
+static _Atomic unsigned long long g_audio_frames = 0;
+static _Atomic unsigned long long g_audio_underrun = 0;
+static _Atomic unsigned long long g_audio_packets = 0;
+static _Atomic unsigned long long g_audio_bytes = 0;
+static _Atomic unsigned long long g_audio_samples_in = 0;
+static _Atomic unsigned long long g_audio_samples_out = 0;
+static _Atomic unsigned long long g_audio_pw_underflow = 0;
+#define AUDIO_BATCH_FRAMES 960  // 10ms 相当 (96kHz mono OBS bridge)
+static int16_t g_audio_buf[AUDIO_BATCH_FRAMES];  // mono
+static int g_audio_buf_pos = 0;
+
+// ALSA playback must not run in the libusb callback.  snd_pcm_writei() can
+// wait for the hardware clock, and doing that in the USB event thread stalls
+// both parser_feed() and the resubmission path.  Keep a bounded SPSC queue of
+// short batches; the producer only copies and signals, while the writer owns
+// all blocking ALSA calls.
+#define AUDIO_QUEUE_BATCHES 64
+static int16_t g_audio_queue[AUDIO_QUEUE_BATCHES][AUDIO_BATCH_FRAMES];
+static uint16_t g_audio_queue_len[AUDIO_QUEUE_BATCHES];
+static _Atomic uint32_t g_audio_queue_head = 0;
+static _Atomic uint32_t g_audio_queue_tail = 0;
+static _Atomic unsigned long long g_audio_queue_drops = 0;
+static _Atomic int g_audio_writer_stop = 0;
+static pthread_t g_audio_writer_thread;
+static int g_audio_writer_started = 0;
+static pthread_mutex_t g_audio_writer_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_audio_writer_wake_cond = PTHREAD_COND_INITIALIZER;
+
+typedef struct {
+    double measure_start_s;
+    int measure_started;
+    int measure_done;
+    int sep_count;
+    int active_sep_count;
+    double last_recal_check_s;
+    int rolling_sep_count;
+    double measured_sep_rate;
+} AudioCadenceState;
+
+static AudioCadenceState g_audio_cadence = {0};
+static int g_sep_count = 0;
+// 96kHz bridge へ補間する比率 (0=固定計算前)
+static double g_upsample_ratio = 0.0;
+static double g_pll_base_ratio = 0.0;
+static double g_pll_last_update = 0.0;
+static double g_pll_integral = 0.0;
+static unsigned long long g_pll_updates = 0;
+// 補間状態: 前回の終点サンプル (次の補間の起点)
+static int16_t g_last_sample = 0;
+// 分数遅延累積 (次に何 samples 出すかの端数管理)
+static double g_frac_pos = 0.0;
+
+static void audio_track_cadence_and_recalibrate(int is_active) {
+    double now = now_monotonic_s();
+    g_sep_count++;
+    g_audio_cadence.sep_count++;
+    g_audio_cadence.rolling_sep_count++;
+    if (is_active) g_audio_cadence.active_sep_count++;
+
+    // 1. Initial measurement (ignoring early silence window)
+    if (!g_audio_cadence.measure_done) {
+        if (!g_audio_cadence.measure_started) {
+            // Do not start measurement window during initial silence/settling
+            if (!is_active || g_audio_cadence.active_sep_count < 100) {
+                if (g_upsample_ratio <= 0.0) {
+                    g_upsample_ratio = g_use_pw ? 1.0 : 2.0;
+                    g_pll_base_ratio = g_upsample_ratio;
+                }
+                return;
+            }
+            g_audio_cadence.measure_start_s = now;
+            g_audio_cadence.measure_started = 1;
+            g_audio_cadence.sep_count = 0;
+            g_audio_cadence.active_sep_count = 0;
+            if (g_upsample_ratio <= 0.0) {
+                g_upsample_ratio = g_use_pw ? 1.0 : 2.0;
+                g_pll_base_ratio = g_upsample_ratio;
+            }
+            return;
+        }
+
+        double el = now - g_audio_cadence.measure_start_s;
+        if (el >= 2.0 && g_audio_cadence.sep_count >= 500) {
+            double sep_rate = (double)g_audio_cadence.sep_count / el;
+            double audio_rate = sep_rate * 2.0;
+
+            // Guard against partial silence / ~12.2k SEP/s artifact:
+            // If sep_rate is < 18000 and the stream is still in its startup phase,
+            // reset window to wait for a clean steady-state measurement window
+            if (sep_rate < 18000.0 && el < 6.0) {
+                g_audio_cadence.measure_start_s = now;
+                g_audio_cadence.sep_count = 0;
+                g_audio_cadence.active_sep_count = 0;
+                return;
+            }
+
+            double effective_sample_rate = 48000.0;
+            if (audio_rate >= 40000.0 && audio_rate <= 60000.0) {
+                effective_sample_rate = 48000.0;
+            } else if (audio_rate >= 88000.0 && audio_rate <= 105000.0) {
+                effective_sample_rate = 96000.0;
+            } else if (audio_rate >= 176000.0 && audio_rate <= 200000.0) {
+                effective_sample_rate = 192000.0;
+            } else {
+                // Default fallback for standard HDMI 48kHz PCM
+                effective_sample_rate = 48000.0;
+            }
+
+            double target_rate = g_use_pw ? 48000.0 : 96000.0;
+            g_upsample_ratio = target_rate / effective_sample_rate;
+            if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
+            if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
+            g_pll_base_ratio = g_upsample_ratio;
+            g_pll_last_update = now;
+            g_audio_cadence.measured_sep_rate = sep_rate;
+            g_audio_cadence.measure_done = 1;
+            g_audio_cadence.last_recal_check_s = now;
+            g_audio_cadence.rolling_sep_count = 0;
+            g_last_sample = 0;
+            g_frac_pos = 0.0;
+
+            fprintf(stderr, "[audio%s] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to %.0fkHz %s\n",
+                    g_use_pw ? "-pw" : "", sep_rate, audio_rate, effective_sample_rate,
+                    g_upsample_ratio, target_rate / 1000.0, g_use_pw ? "stream" : "mono bridge");
+        }
+    } else {
+        // 2. Continuous Monitoring & Automatic Recalibration
+        double dt = now - g_audio_cadence.last_recal_check_s;
+        if (dt >= 1.0) {
+            double rolling_sep_rate = (double)g_audio_cadence.rolling_sep_count / dt;
+            g_audio_cadence.rolling_sep_count = 0;
+            g_audio_cadence.last_recal_check_s = now;
+
+            if (rolling_sep_rate >= 18000.0) {
+                double rolling_audio_rate = rolling_sep_rate * 2.0;
+                double nominal_rate = 48000.0;
+                if (rolling_audio_rate >= 40000.0 && rolling_audio_rate <= 60000.0) {
+                    nominal_rate = 48000.0;
+                } else if (rolling_audio_rate >= 88000.0 && rolling_audio_rate <= 105000.0) {
+                    nominal_rate = 96000.0;
+                } else if (rolling_audio_rate >= 176000.0 && rolling_audio_rate <= 200000.0) {
+                    nominal_rate = 192000.0;
+                }
+                double target_rate = g_use_pw ? 48000.0 : 96000.0;
+                double expected_ratio = target_rate / nominal_rate;
+                if (fabs(g_upsample_ratio - expected_ratio) > 0.02) {
+                    fprintf(stderr, "[audio%s-recalibrate] ratio adjusted from %.4f to expected %.4f (measured %.1f SEP/s, nominal %.0f Hz)\n",
+                            g_use_pw ? "-pw" : "", g_upsample_ratio, expected_ratio,
+                            rolling_sep_rate, nominal_rate);
+                    g_upsample_ratio = expected_ratio;
+                    g_pll_base_ratio = expected_ratio;
+                }
+            }
+        }
+    }
+}
+
+// SEP payload: two signed 16-bit stereo frames, little-endian, L0,R0,L1,R1.
+// Decode the four samples without relying on alignment, then downmix each
+// stereo frame independently so adjacent channels are never combined as one
+// 24-bit sample.
+static int16_t decode_sep_s16(const uint8_t* p) {
+    uint16_t raw;
+    memcpy(&raw, p, sizeof(raw));
+    return (int16_t)raw;
+}
+
+static void decode_sep_mono(const uint8_t* payload, int16_t mono[2]) {
+    int32_t l0 = decode_sep_s16(payload);
+    int32_t r0 = decode_sep_s16(payload + 2);
+    int32_t l1 = decode_sep_s16(payload + 4);
+    int32_t r1 = decode_sep_s16(payload + 6);
+    mono[0] = (int16_t)((l0 + r0) / 2);
+    mono[1] = (int16_t)((l1 + r1) / 2);
+}
+
+// PipeWire 版の前方宣言 (定義は後段)
+static int audio_pw_open(void);
+static void audio_pw_close(void);
+static void audio_feed_sep_pw(const uint8_t* payload);
+static int audio_writer_start(void);
+static void audio_writer_stop(void);
+
+static void audio_open(const char* pcm_name) {
+    // HD60S_AUDIO_PW=1 で PipeWire ネイティブ実装に分岐
+    const char* env_pw = getenv("HD60S_AUDIO_PW");
+    if (env_pw && env_pw[0] && env_pw[0] != '0' && env_pw[0] != 'n') {
+        if (audio_pw_open() == 0) {
+            g_use_pw = 1;
+            return;
+        }
+        fprintf(stderr, "[audio] PipeWire unavailable; falling back to ALSA %s\n", pcm_name);
+        g_use_pw = 0;
+    }
+    int err = snd_pcm_open(&g_pcm, pcm_name, SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        fprintf(stderr, "[audio] snd_pcm_open(%s) failed: %s\n", pcm_name, snd_strerror(err));
+        g_pcm = NULL;
+        return;
+    }
+    err = snd_pcm_set_params(g_pcm,
+        SND_PCM_FORMAT_S16_LE,
+        SND_PCM_ACCESS_RW_INTERLEAVED,
+        1,          // mono
+        96000,      // OBS-facing snd-aloop bridge rate
+        1,          // soft resample
+        200000);    // 200ms latency (余裕を持たせる)
+    if (err < 0) {
+        fprintf(stderr, "[audio] snd_pcm_set_params failed: %s\n", snd_strerror(err));
+        snd_pcm_close(g_pcm); g_pcm = NULL;
+        return;
+    }
+    fprintf(stderr, "[audio] ALSA %s opened (96kHz S16_LE mono bridge; SEP stereo downmix), 初 SEP 到着から 2 秒で実 rate 測定...\n", pcm_name);
+    audio_writer_start();
+}
+
+static void audio_write_samples(const int16_t* samples, int frames) {
+    if (!g_pcm || !samples || frames <= 0) return;
+    int offset = 0;
+    while (offset < frames) {
+        snd_pcm_sframes_t written = snd_pcm_writei(g_pcm, samples + offset,
+                                                   frames - offset);
+        if (written < 0) {
+            g_audio_underrun++;
+            int err = snd_pcm_recover(g_pcm, (int)written, 1);
+            if (err < 0) {
+                fprintf(stderr, "[audio] recover failed: %s\n", snd_strerror(err));
+                break;
+            }
+            continue;
+        }
+        if (written == 0) break;
+        offset += (int)written;
+    }
+    g_audio_frames += (unsigned long long)offset;
+    g_audio_samples_out += (unsigned long long)offset;
+}
+
+static void audio_writer_signal(void) {
+    pthread_mutex_lock(&g_audio_writer_wake_mutex);
+    pthread_cond_signal(&g_audio_writer_wake_cond);
+    pthread_mutex_unlock(&g_audio_writer_wake_mutex);
+}
+
+static int audio_queue_push(const int16_t* samples, int frames) {
+    uint32_t head = atomic_load_explicit(&g_audio_queue_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&g_audio_queue_tail, memory_order_acquire);
+    if (head - tail >= AUDIO_QUEUE_BATCHES) {
+        atomic_fetch_add_explicit(&g_audio_queue_drops, 1, memory_order_relaxed);
+        return -1;
+    }
+    uint32_t slot = head % AUDIO_QUEUE_BATCHES;
+    memcpy(g_audio_queue[slot], samples, (size_t)frames * sizeof(samples[0]));
+    g_audio_queue_len[slot] = (uint16_t)frames;
+    atomic_store_explicit(&g_audio_queue_head, head + 1, memory_order_release);
+    audio_writer_signal();
+    return 0;
+}
+
+static void* audio_writer_main(void* unused) {
+    (void)unused;
+    for (;;) {
+        uint32_t tail = atomic_load_explicit(&g_audio_queue_tail, memory_order_relaxed);
+        uint32_t head = atomic_load_explicit(&g_audio_queue_head, memory_order_acquire);
+        if (tail != head) {
+            uint32_t slot = tail % AUDIO_QUEUE_BATCHES;
+            audio_write_samples(g_audio_queue[slot], g_audio_queue_len[slot]);
+            atomic_store_explicit(&g_audio_queue_tail, tail + 1, memory_order_release);
+            continue;
+        }
+
+        pthread_mutex_lock(&g_audio_writer_wake_mutex);
+        while (!atomic_load_explicit(&g_audio_writer_stop, memory_order_acquire) &&
+               atomic_load_explicit(&g_audio_queue_head, memory_order_acquire) ==
+                   atomic_load_explicit(&g_audio_queue_tail, memory_order_relaxed)) {
+            pthread_cond_wait(&g_audio_writer_wake_cond, &g_audio_writer_wake_mutex);
+        }
+        int stop = atomic_load_explicit(&g_audio_writer_stop, memory_order_acquire);
+        pthread_mutex_unlock(&g_audio_writer_wake_mutex);
+
+        if (stop &&
+            atomic_load_explicit(&g_audio_queue_head, memory_order_acquire) ==
+                atomic_load_explicit(&g_audio_queue_tail, memory_order_relaxed))
+            break;
+    }
+    return NULL;
+}
+
+static int audio_writer_start(void) {
+    atomic_store_explicit(&g_audio_queue_head, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_audio_queue_tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_audio_writer_stop, 0, memory_order_relaxed);
+    int rc = pthread_create(&g_audio_writer_thread, NULL, audio_writer_main, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "[audio] async ALSA writer unavailable: %s; using direct fallback\n",
+                strerror(rc));
+        g_audio_writer_started = 0;
+        return -1;
+    }
+    g_audio_writer_started = 1;
+    fprintf(stderr, "[audio] async ALSA writer started (USB callback remains non-blocking)\n");
+    return 0;
+}
+
+static void audio_writer_stop(void) {
+    if (!g_audio_writer_started) return;
+    atomic_store_explicit(&g_audio_writer_stop, 1, memory_order_release);
+    audio_writer_signal();
+    pthread_join(g_audio_writer_thread, NULL);
+    g_audio_writer_started = 0;
+}
+
+static void audio_flush(void) {
+    if (g_audio_buf_pos == 0) return;
+    if (g_pcm) {
+        if (g_audio_writer_started)
+            audio_queue_push(g_audio_buf, g_audio_buf_pos);
+        else
+            audio_write_samples(g_audio_buf, g_audio_buf_pos);
+    }
+    g_audio_buf_pos = 0;
+}
+
+// SEP の L/R ペアを mono に downmix し、欠落分を 96kHz bridge へ線形補間して出力する。
+static void audio_feed_sep(const uint8_t* payload) {
+    g_audio_packets++;
+    g_audio_bytes += 8;
+
+    int16_t mono[2];
+    decode_sep_mono(payload, mono);
+    int is_active = (abs(mono[0]) > 32 || abs(mono[1]) > 32);
+
+    static int g_sep_diag_count = 0;
+    if (g_sep_diag_count < 10 || (is_active && g_sep_diag_count < 50)) {
+        fprintf(stderr, "[sep-raw #%d] raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x -> mono0=%d mono1=%d active=%d\n",
+                g_sep_diag_count,
+                payload[0], payload[1], payload[2], payload[3],
+                payload[4], payload[5], payload[6], payload[7],
+                mono[0], mono[1], is_active);
+        g_sep_diag_count++;
+    }
+
+    if (g_use_pw) { audio_feed_sep_pw(payload); return; }
+
+    audio_track_cadence_and_recalibrate(is_active);
+
+    if (!g_pcm || g_upsample_ratio <= 0) return;
+
+    for (int sample_index = 0; sample_index < 2; sample_index++) {
+        int16_t cur = mono[sample_index];
+        // 各入力 sample を upsample_ratio 個の出力 sample に展開
+        // linear interpolation: prev (g_last_sample) → cur
+        double count = g_upsample_ratio + g_frac_pos;
+        int n = (int)count;
+        g_frac_pos = count - n;
+        for (int i = 1; i <= n; i++) {
+            double t = (double)i / (double)(n > 0 ? n : 1);
+            double v = g_last_sample + (cur - g_last_sample) * t;
+            if (v > 32767.0) v = 32767.0;
+            if (v < -32768.0) v = -32768.0;
+            if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
+            g_audio_buf[g_audio_buf_pos++] = (int16_t)v;
+        }
+        g_last_sample = cur;
+    }
+    if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
+}
+
+// ======================================================================
+// 🔥 libpipewire ネイティブ実装 (Opus 4.8 提案、2026-07-11)
+// 前実装: iso_capture → snd_aloop → arecord|aplay → PipeWire = 4段バッファ
+// 新実装: iso_capture → pw_stream (直接) = 1段のみ、~2.6ms/quantum に到達
+// 環境変数 HD60S_AUDIO_PW=1 で有効化。ALSA 実装との A/B 比較用にフラグ化。
+// ======================================================================
+static struct pw_thread_loop* g_pw_loop = NULL;
+static struct pw_stream* g_pw_stream = NULL;
+static int g_pw_initialized = 0;
+static int g_pw_started = 0;
+// ring buffer (mono int16 samples). Producer: iso_capture (audio_feed_sep 経由).
+// Consumer: pipewire process コールバック (別スレッド)。
+// 🔥 kusq テストで判明: 683ms は大きすぎて古い音蓄積 → 遅延。
+// 4096 samples @ 96kHz = 43ms に削減、さらに満杯で古いのから破棄 (最新優先)。
+#define PW_RING_SIZE 16384
+// PW スレッドが「読み残し」しないように、目標水位 = 1 quantum 分 (128 samples ~1.3ms).
+#define PW_TARGET_FILL 1024
+// 2026-07-18 lock-free SPSC ring: producer は head のみ更新、consumer は tail のみ更新。
+// pthread_mutex 撤廃で priority inversion (RT thread が producer の mutex を待つ) を根絶。
+// release/acquire ordering で書いた samples が cross-thread に可視化されることを保証。
+// alignas(64): false sharing 回避 (producer/consumer が別 CPU で走る時、head と tail が
+// 同じキャッシュラインだと片方書くたびに逆側 invalidate = SPSC のコアメリット消える)。
+alignas(64) static _Atomic uint32_t g_pw_ring_head = 0;  // producer 専用 (iso スレッド)
+alignas(64) static _Atomic uint32_t g_pw_ring_tail = 0;  // consumer 専用 (pw スレッド)
+alignas(64) static int16_t g_pw_ring[PW_RING_SIZE];
+// drop counters (障害調査用、毎秒 24k SEP でも atomic incr のオーバーヘッド無視可)
+static _Atomic uint64_t g_pw_drops_old = 0;   // consumer 側 fast-forward した sample 数
+static _Atomic uint64_t g_pw_drops_new = 0;   // producer 側で full により書けなかった数
+static _Atomic uint64_t g_pw_process_calls = 0;
+static _Atomic uint64_t g_pw_output_writes = 0;
+static _Atomic uint64_t g_pw_output_frames = 0;
+static _Atomic uint64_t g_pw_output_errors = 0;
+static _Atomic uint32_t g_pw_fill_min = UINT32_MAX;
+static _Atomic uint32_t g_pw_fill_max = 0;
+
+// PW process コールバック用の状態
+static int16_t g_pw_last_sample = 0;  // underflow 時の連続性維持用
+
+// pw_stream process コールバック: PipeWire RT スレッドから呼ばれる。ring から
+// dequeue して PW バッファに書き込む。
+// 🔥 音割れ対策: underflow 時は 0 埋めでなく last_sample を decay させる
+// 🔥 2026-07-18 lock-free SPSC: producer と mutex 争わない。溜まりすぎ時の drop-old
+//    責任を consumer 側に集約 (SPSC の tail 単一書き込み者ルールを守るため)。
+static void pw_on_process(void* userdata) {
+    (void)userdata;
+    atomic_fetch_add_explicit(&g_pw_process_calls, 1, memory_order_relaxed);
+    struct pw_buffer* b = pw_stream_dequeue_buffer(g_pw_stream);
+    if (!b) {
+        atomic_fetch_add_explicit(&g_pw_output_errors, 1, memory_order_relaxed);
+        return;
+    }
+    struct spa_buffer* buf = b->buffer;
+    if (!buf->datas[0].data) {
+        atomic_fetch_add_explicit(&g_pw_output_errors, 1, memory_order_relaxed);
+        pw_stream_queue_buffer(g_pw_stream, b);
+        return;
+    }
+
+    int16_t* dst = (int16_t*)buf->datas[0].data;
+    uint32_t max_frames = buf->datas[0].maxsize / sizeof(int16_t);
+    uint32_t want = b->requested;
+    // requested==0 は「PW 側で決めて」の合図。max_frames まで消費すると ring 空 →
+    // 次コールで無音 40ms、なので 1 quantum 目安の TARGET_FILL に抑える
+    if (want == 0) want = PW_TARGET_FILL;
+    if (want > max_frames) want = max_frames;
+
+    // acquire: producer が書いた samples が可視化されることを保証
+    uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
+    uint32_t avail = (head - tail) & (PW_RING_SIZE - 1);
+    uint32_t old_min = atomic_load_explicit(&g_pw_fill_min, memory_order_relaxed);
+    while (avail < old_min && !atomic_compare_exchange_weak_explicit(
+        &g_pw_fill_min, &old_min, avail, memory_order_relaxed, memory_order_relaxed)) {}
+    uint32_t old_max = atomic_load_explicit(&g_pw_fill_max, memory_order_relaxed);
+    while (avail > old_max && !atomic_compare_exchange_weak_explicit(
+        &g_pw_fill_max, &old_max, avail, memory_order_relaxed, memory_order_relaxed)) {}
+
+    // 2026-07-18 soft-drop: 一度に大量捨てると可聴クリックが出るので、TARGET*3 (~8ms)
+    // 超えを検出したら 128 samples (1.3ms, 1 quantum) だけ捨てる。発動頻度は上がるが
+    // 1 回のジャンプが小さくなりクリック体感 << ハード drop。
+    if (avail > PW_TARGET_FILL * 3) {
+        uint32_t drop = 128;
+        tail = (tail + drop) & (PW_RING_SIZE - 1);
+        avail = (head - tail) & (PW_RING_SIZE - 1);
+        atomic_fetch_add_explicit(&g_pw_drops_old, drop, memory_order_relaxed);
+    }
+
+    uint32_t n = (want < avail) ? want : avail;
+    if (n < want) g_audio_pw_underflow++;
+    for (uint32_t i = 0; i < n; i++) {
+        dst[i] = g_pw_ring[(tail + i) & (PW_RING_SIZE - 1)];
+    }
+    if (n > 0) g_pw_last_sample = dst[n-1];
+    g_audio_samples_out += n;
+
+    // 🔥 underflow 埋め: 0 でなく last_sample を高速に減衰 (連続性維持でクリック回避)
+    int32_t decay = g_pw_last_sample;
+    for (uint32_t i = n; i < want; i++) {
+        // 指数減衰: 25 samples ごとに 3/4 (~1ms で急速に silence)
+        decay = decay * 245 / 256;  // 0.957x per sample
+        dst[i] = (int16_t)decay;
+    }
+    g_pw_last_sample = decay;
+
+    // release: 次の pop_process 呼び出し時に、samples 読み込みより先に tail 更新が
+    // 見えても副作用ないよう (自分自身しか tail 書かないので単純だが、producer 側の
+    // fill 判定に影響するので明示的に release)
+    atomic_store_explicit(&g_pw_ring_tail, (tail + n) & (PW_RING_SIZE - 1),
+                          memory_order_release);
+
+    buf->datas[0].chunk->offset = 0;
+    buf->datas[0].chunk->stride = sizeof(int16_t);
+    buf->datas[0].chunk->size = want * sizeof(int16_t);
+    atomic_fetch_add_explicit(&g_pw_output_writes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pw_output_frames, want, memory_order_relaxed);
+    pw_stream_queue_buffer(g_pw_stream, b);
+}
+
+static const struct pw_stream_events g_pw_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = pw_on_process,
+};
+
+// 2026-07-19 libsamplerate 導入: linear interp の高音色付け (Opus 4.8 A1 指摘) 対策。
+// SRC_SINC_MEDIUM_QUALITY = 位相・振幅ともに ~-100 dB THD、i7-12700 で <1% CPU 予想。
+static SRC_STATE* g_src = NULL;
+static int g_src_ok = 0;
+
+// ring バッファに samples を batch で書き込む (iso スレッドから)
+// 🔥 2026-07-18 lock-free SPSC + batch: 従来 per-sample の mutex を排除。
+//    full なら drop-new (書かない)。drop-old ロジックは consumer (pw_on_process) 側で。
+static void pw_ring_push_batch(const int16_t* samples, int n) {
+    if (n <= 0) return;
+    // relaxed: head は自分専用書き込み、ここでは最新値だけ拾えれば OK
+    uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_relaxed);
+    // acquire: consumer が tail を進めた分の空き space が自分に見えるように
+    uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_acquire);
+    uint32_t fill = (head - tail) & (PW_RING_SIZE - 1);
+    uint32_t space = PW_RING_SIZE - 1 - fill;   // -1 は full/empty 区別のため
+    int to_write = (n < (int)space) ? n : (int)space;
+    int dropped = n - to_write;
+    g_audio_samples_in += (unsigned long long)n;
+    if (dropped > 0) {
+        atomic_fetch_add_explicit(&g_pw_drops_new, (uint64_t)dropped, memory_order_relaxed);
+    }
+    for (int i = 0; i < to_write; i++) {
+        g_pw_ring[(head + i) & (PW_RING_SIZE - 1)] = samples[i];
+    }
+    // release: consumer が新しい head を見た時に samples 書き込みも見えることを保証
+    atomic_store_explicit(&g_pw_ring_head, (head + to_write) & (PW_RING_SIZE - 1),
+                          memory_order_release);
+}
+
+static int audio_pw_open(void) {
+    pw_init(NULL, NULL);
+    g_pw_initialized = 1;
+    g_pw_loop = pw_thread_loop_new("hd60s-audio", NULL);
+    if (!g_pw_loop) {
+        fprintf(stderr, "[audio-pw] pw_thread_loop_new failed\n");
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
+    }
+    pw_thread_loop_lock(g_pw_loop);
+
+    struct pw_properties* props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CLASS, "Audio/Source",
+        PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE, "Game",
+        PW_KEY_MEDIA_NAME, "hd60s_capture",
+        PW_KEY_NODE_NAME, "hd60s_capture",
+        PW_KEY_NODE_DESCRIPTION, "Elgato HD60 S Audio Capture",
+        PW_KEY_NODE_LATENCY, "128/48000",   // 128 samples @ 48kHz = 2.6ms
+        PW_KEY_NODE_ALWAYS_PROCESS, "true",
+        NULL);
+
+    g_pw_stream = pw_stream_new_simple(
+        pw_thread_loop_get_loop(g_pw_loop),
+        "hd60s_capture",
+        props,
+        &g_pw_events,
+        NULL);
+
+    if (!g_pw_stream) {
+        fprintf(stderr, "[audio-pw] pw_stream_new_simple failed\n");
+        pw_thread_loop_unlock(g_pw_loop);
+        pw_thread_loop_destroy(g_pw_loop);
+        g_pw_loop = NULL;
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
+    }
+
+    // 2026-07-21 P3-1: PW stream rate を 48kHz に統合。graph rate と一致するので
+    // PipeWire の内部 96→48 リサンプラー段が消滅、高音の色付け・ジッター (「ポポポ」
+    // 音の一因) の主犯を潰す。iso_capture 側で libsamplerate SINC が Switch 96kHz →
+    // 48kHz の anti-alias 込みダウンサンプルを担う。
+    uint8_t buffer[1024];
+    struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    struct spa_audio_info_raw info = SPA_AUDIO_INFO_RAW_INIT(
+        .format = SPA_AUDIO_FORMAT_S16_LE,
+        .channels = 1,
+        .rate = 48000
+    );
+    const struct spa_pod* params[1];
+    params[0] = spa_format_audio_raw_build(&pod_builder, SPA_PARAM_EnumFormat, &info);
+
+    int r = pw_stream_connect(g_pw_stream,
+        PW_DIRECTION_OUTPUT,
+        PW_ID_ANY,
+        PW_STREAM_FLAG_AUTOCONNECT |
+        PW_STREAM_FLAG_MAP_BUFFERS |
+        PW_STREAM_FLAG_RT_PROCESS,
+        params, 1);
+    if (r < 0) {
+        fprintf(stderr, "[audio-pw] pw_stream_connect failed: %d\n", r);
+        pw_stream_destroy(g_pw_stream);
+        g_pw_stream = NULL;
+        pw_thread_loop_unlock(g_pw_loop);
+        pw_thread_loop_destroy(g_pw_loop);
+        g_pw_loop = NULL;
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
+    }
+
+    pw_thread_loop_unlock(g_pw_loop);
+    r = pw_thread_loop_start(g_pw_loop);
+    if (r < 0) {
+        fprintf(stderr, "[audio-pw] pw_thread_loop_start failed: %d\n", r);
+        pw_stream_disconnect(g_pw_stream);
+        pw_stream_destroy(g_pw_stream);
+        g_pw_stream = NULL;
+        pw_thread_loop_destroy(g_pw_loop);
+        g_pw_loop = NULL;
+        pw_deinit();
+        g_pw_initialized = 0;
+        return -1;
+    }
+    g_pw_started = 1;
+    fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE mono)\n");
+
+    // 2026-07-19 libsamplerate 初期化 (SINC MEDIUM QUALITY): linear interp より
+    // 位相・振幅の色付けが激減。SEP レート測定完了後に src_ratio を set する。
+    int src_err = 0;
+    g_src = src_new(SRC_SINC_MEDIUM_QUALITY, 1, &src_err);
+    if (!g_src) {
+        fprintf(stderr, "[audio-pw] src_new failed: %s → linear fallback\n", src_strerror(src_err));
+        g_src_ok = 0;
+    } else {
+        g_src_ok = 1;
+        fprintf(stderr, "[audio-pw] libsamplerate SINC_MEDIUM_QUALITY 有効\n");
+    }
+    return 0;
+}
+
+static void audio_pw_close(void) {
+    if (g_pw_started && g_pw_loop) {
+        pw_thread_loop_stop(g_pw_loop);
+        g_pw_started = 0;
+    }
+    if (g_pw_stream) {
+        pw_stream_disconnect(g_pw_stream);
+        pw_stream_destroy(g_pw_stream);
+        g_pw_stream = NULL;
+    }
+    if (g_pw_loop) {
+        pw_thread_loop_destroy(g_pw_loop);
+        g_pw_loop = NULL;
+    }
+    if (g_src) { src_delete(g_src); g_src = NULL; g_src_ok = 0; }
+    if (g_pw_initialized) {
+        pw_deinit();
+        g_pw_initialized = 0;
+    }
+}
+
+// audio_feed_sep の PipeWire 版: upsample した samples を ring に push
+static void audio_feed_sep_pw(const uint8_t* payload) {
+    int16_t mono[2];
+    decode_sep_mono(payload, mono);
+    int is_active = (abs(mono[0]) > 32 || abs(mono[1]) > 32);
+
+    audio_track_cadence_and_recalibrate(is_active);
+    if (!g_pw_stream || g_upsample_ratio <= 0) return;
+
+    // 2026-07-19 PLL update: 1 秒周期で ring fill error から upsample_ratio を微調整。
+    // drift 起因の時間経過ジリジリ悪化を吸収する adaptive rate follow。
+    // ゲイン: 100ppm drift = 9.6 samples/s のズレ、Kp=1e-6, Ki=1e-7 で 30-60秒で追従。
+    // ⚠️ 2026-07-19 kusq 実聴: PLL が動的に ratio を変えることで "不協和音気味" の副作用
+    //    (音程がゆらぐ) 発生。default 無効化、HD60S_PLL_ENABLE=1 で opt-in に変更。
+    static int pll_checked = 0, pll_enabled = 0;
+    if (!pll_checked) {
+        pll_enabled = getenv("HD60S_PLL_ENABLE") ? 1 : 0;
+        pll_checked = 1;
+    }
+    if (pll_enabled) {
+        double now = now_monotonic_s();
+        double dt = now - g_pll_last_update;
+        if (dt >= 1.0) {
+            g_pll_last_update = now;
+            uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_relaxed);
+            uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
+            int32_t fill = (int32_t)((head - tail) & (PW_RING_SIZE - 1));
+            int32_t err = fill - (int32_t)PW_TARGET_FILL;  // +=溜まりすぎ、-=足りない
+            g_pll_integral += (double)err * dt;
+            // 積分暴走防止クランプ
+            if (g_pll_integral > 100000.0) g_pll_integral = 100000.0;
+            if (g_pll_integral < -100000.0) g_pll_integral = -100000.0;
+            double kp = 1e-6, ki = 1e-7;
+            double adjust = kp * (double)err + ki * g_pll_integral;
+            // 1 回の補正量にクランプ (暴走発振防止)
+            if (adjust > 5e-4) adjust = 5e-4;
+            if (adjust < -5e-4) adjust = -5e-4;
+            // ratio 減らす = 出力サンプル減る = 溜まってる時 (err>0) は減らす
+            double new_ratio = g_upsample_ratio - adjust;
+            // 基準値から ±5% を絶対上限 (95kHz snap 時 base=1.000, 範囲 [0.95, 1.05])
+            double lo = g_pll_base_ratio * 0.95;
+            double hi = g_pll_base_ratio * 1.05;
+            if (new_ratio < lo) new_ratio = lo;
+            if (new_ratio > hi) new_ratio = hi;
+            g_upsample_ratio = new_ratio;
+            g_pll_updates++;
+            if (hd60s_env_present("HD60S_PLL_DEBUG")) {
+                fprintf(stderr, "[pll] #%llu fill=%d err=%+d int=%+.1f adj=%+.6f ratio=%.6f\n",
+                        (unsigned long long)g_pll_updates, fill, err,
+                        g_pll_integral, adjust, g_upsample_ratio);
+            }
+        }
+    }
+
+    // 2026-07-19 libsamplerate (SINC 補間) 経路。使えない時は旧 linear interp に fallback。
+    if (g_src_ok) {
+        // int16 → float [-1,1)
+        float input[2] = {
+            (float)mono[0] / 32768.0f,
+            (float)mono[1] / 32768.0f,
+        };
+        float output[32];
+        SRC_DATA data = {
+            .data_in = input,
+            .input_frames = 2,
+            .data_out = output,
+            .output_frames = (long)(sizeof(output)/sizeof(output[0])),
+            .src_ratio = g_upsample_ratio,
+            .end_of_input = 0,
+        };
+        int r = src_process(g_src, &data);
+        if (r == 0) {
+            int16_t batch[32];
+            int bi = 0;
+            for (long i = 0; i < data.output_frames_gen && bi < 32; i++) {
+                float v = output[i] * 32768.0f;
+                if (v > 32767.0f) v = 32767.0f;
+                if (v < -32768.0f) v = -32768.0f;
+                batch[bi++] = (int16_t)v;
+            }
+            pw_ring_push_batch(batch, bi);
+            return;
+        }
+        // src_process 失敗時は fallback へ落ちる (稀)
+    }
+
+    // Fallback: 旧 linear interp (libsamplerate init 失敗時のみ)
+    int16_t batch[32];
+    int bi = 0;
+    for (int k = 0; k < 2; k++) {
+        int16_t cur = mono[k];
+        double count = g_upsample_ratio + g_frac_pos;
+        int n = (int)count;
+        g_frac_pos = count - n;
+        for (int i = 1; i <= n && bi < (int)(sizeof(batch)/sizeof(batch[0])); i++) {
+            double t = (double)i / (double)(n > 0 ? n : 1);
+            double v = g_last_sample + (cur - g_last_sample) * t;
+            if (v > 32767.0) v = 32767.0;
+            if (v < -32768.0) v = -32768.0;
+            batch[bi++] = (int16_t)v;
+        }
+        g_last_sample = cur;
+    }
+    pw_ring_push_batch(batch, bi);
+}
+
+
+static void audio_close(void) {
+    if (g_use_pw) {
+        audio_pw_close();
+        return;
+    }
+    if (!g_pcm) return;
+    audio_flush();
+    audio_writer_stop();
+    snd_pcm_drain(g_pcm);
+    snd_pcm_close(g_pcm);
+    g_pcm = NULL;
+}
+
+
+void hd60s_audio_open(const char *alsa_dev) {
+    audio_open(alsa_dev);
+}
+
+void hd60s_audio_feed_sep(const uint8_t *payload12) {
+    audio_feed_sep(payload12);
+}
+
+void hd60s_audio_close(void) {
+    audio_close();
+}
+
+void hd60s_audio_dump_stats(FILE *fp) {
+    if (!fp) fp = stderr;
+    fprintf(fp, "audio:     packets=%llu bytes=%llu samples_in=%llu samples_out=%llu "
+                    "underrun=%llu pw_underflow=%llu\n",
+            atomic_load_explicit(&g_audio_packets, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_bytes, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_samples_in, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_samples_out, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_underrun, memory_order_relaxed),
+            atomic_load_explicit(&g_audio_pw_underflow, memory_order_relaxed));
+    uint64_t drops_old = atomic_load_explicit(&g_pw_drops_old, memory_order_relaxed);
+    uint64_t drops_new = atomic_load_explicit(&g_pw_drops_new, memory_order_relaxed);
+    fprintf(fp, "pw ring:   drops_old=%llu (consumer fast-forward) drops_new=%llu (producer full)\n",
+            (unsigned long long)drops_old, (unsigned long long)drops_new);
+    fprintf(fp, "pw output: process_calls=%llu writes=%llu frames=%llu errors=%llu fill_min=%u fill_max=%u\n",
+            (unsigned long long)atomic_load_explicit(&g_pw_process_calls, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pw_output_writes, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pw_output_frames, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pw_output_errors, memory_order_relaxed),
+            atomic_load_explicit(&g_pw_fill_min, memory_order_relaxed),
+            atomic_load_explicit(&g_pw_fill_max, memory_order_relaxed));
+}
