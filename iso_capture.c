@@ -1404,6 +1404,67 @@ static void pace_output_if_due(void) {
 // revision can lose a USB block and can insert SEP records at a line edge.
 // Assemble by locating the next protocol marker, padding a short line and
 // discarding surplus bytes, rather than assuming a fixed marker offset.
+#define MARKER_GAP_MIN 3000
+#define MARKER_GAP_MAX 4100
+#define AMBIGUOUS_MARKER_CONFIRM_RUN 8
+
+static int is_protocol_marker(const uint8_t *data, size_t len, size_t pos,
+                              uint32_t *tag_out) {
+    if (pos > len || len - pos < 4) return 0;
+    uint32_t tag;
+    memcpy(&tag, data + pos, 4);
+    if (tag != MK_EOL_ACT && tag != MK_EOL_BLK &&
+        tag != MK_SEP && tag != MK_SEP_BULK)
+        return 0;
+    if (tag_out) *tag_out = tag;
+    return 1;
+}
+
+// A four-byte marker can occur in YUYV pixel data.  When the normal one-line
+// look-ahead rejects a candidate, look for a longer run of line-spaced
+// markers before allowing the buffer to grow to the overflow limit.  This is
+// only a recovery decision: an ambiguous partial frame is discarded and the
+// parser reacquires from BLK->ACT, so no uncertain bytes can enter a frame.
+static int find_ambiguous_marker_run(const uint8_t *data, size_t len,
+                                     size_t start, size_t end,
+                                     size_t *run_pos, uint32_t *run_tag) {
+    if (len < 4 || start > len - 4) return 0;
+    if (end > len - 4) end = len - 4;
+    enum { MAX_RECOVERY_MARKERS = 512 };
+    size_t positions[MAX_RECOVERY_MARKERS];
+    uint32_t tags[MAX_RECOVERY_MARKERS];
+    size_t marker_count = 0;
+    for (size_t p = start; p <= end && marker_count < MAX_RECOVERY_MARKERS; ++p) {
+        uint32_t tag;
+        if (!is_protocol_marker(data, len, p, &tag)) continue;
+        positions[marker_count] = p;
+        tags[marker_count] = tag;
+        marker_count++;
+    }
+
+    for (size_t first = 0; first < marker_count; ++first) {
+        size_t cursor_index = first;
+        int matched = 0;
+        while (matched < AMBIGUOUS_MARKER_CONFIRM_RUN) {
+            size_t next_index = cursor_index + 1;
+            while (next_index < marker_count &&
+                   positions[next_index] - positions[cursor_index] < MARKER_GAP_MIN)
+                next_index++;
+            if (next_index >= marker_count ||
+                positions[next_index] - positions[cursor_index] > MARKER_GAP_MAX)
+                break;
+            cursor_index = next_index;
+            matched++;
+        }
+        if (matched == AMBIGUOUS_MARKER_CONFIRM_RUN) {
+            if (run_pos) *run_pos = positions[first];
+            if (run_tag) *run_tag = tags[first];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void dynamic_video_feed(const uint8_t *data, size_t len) {
     if (len > sizeof(g_dyn_buf) - g_dyn_n) {
         // Once the line buffer is full, its byte alignment is no longer
@@ -1494,6 +1555,28 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
         }
         if (best_q != SIZE_MAX) { q = best_q; tag = best_tag; }
         if (!q) {
+            // If a candidate in the first-line window was rejected, do not
+            // wait for the 64 KiB overflow guard.  A later run of markers at
+            // line cadence proves that the current partial image is
+            // ambiguous; discard it immediately and reacquire at the next
+            // vertical BLK->ACT transition.  This specifically handles a
+            // pixel false positive such as the repeatable 2732-byte gap seen
+            // in the first parser-loss trace.
+            if (g_dyn_n > LINE_BYTES + MARKER_GAP_MAX) {
+                size_t run_pos = SIZE_MAX;
+                uint32_t run_tag = 0;
+                size_t search_end = g_dyn_n < 65536 ? g_dyn_n : 65536;
+                if (find_ambiguous_marker_run(g_dyn_buf, g_dyn_n,
+                                               scan_start, search_end,
+                                               &run_pos, &run_tag)) {
+                    fprintf(stderr,
+                            "[parser-loss] ambiguous marker run at offset=%zu "
+                            "tag=0x%08x; reacquiring at next BLK->ACT\n",
+                            run_pos, run_tag);
+                    parser_notify_loss(g_dyn_n);
+                    return;
+                }
+            }
             // A vertical blanking interval can be much larger than the
             // normal 4/16-byte line padding.  If the buffer grows without a
             // confirmed marker, the byte alignment is lost; discard the
