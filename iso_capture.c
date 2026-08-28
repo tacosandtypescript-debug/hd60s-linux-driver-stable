@@ -533,11 +533,12 @@ static void audio_feed_sep(const uint8_t* payload) {
         } else {
             effective_sample_rate = 24000.0;
         }
-        // The parser cadence is the rate that actually feeds the resampler.
-        // Each SEP contains two input audio frames, so use audio_rate rather
-        // than the marker rate. This preserves the 96kHz bridge rate even
-        // when some SEP markers are missed.
-        g_upsample_ratio = 96000.0 / audio_rate;
+        // Each SEP contains two input audio frames.  This ALSA bridge is fixed
+        // at 96 kHz, while the observed SEP cadence represents 24 kHz audio
+        // frames (two frames per marker). Use the nominal detected rate rather
+        // than a transient half-rate marker count, which otherwise changes the
+        // pitch and creates the demon/slow-voice effect.
+        g_upsample_ratio = 96000.0 / effective_sample_rate;
         if (g_upsample_ratio < 0.5) g_upsample_ratio = 0.5;
         if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
         fprintf(stderr, "[audio] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to 96kHz mono bridge\n",
@@ -2964,21 +2965,30 @@ int main(int argc, char** argv) {
             }
             fprintf(stderr, "[post-iso-audio] fired %d/%d OK\n", ok_pia, post_iso_audio_n);
         }
-        // 変形: 0x94 audio bank writes だけを撃つ (IT66121 TX 系列は skip)
-        // 環境変数 HD60S_POST_ISO_AUDIO94=1 で有効化
+
+    }
+
+    // The Windows post-ISO audio-bank setup must be applied before the first
+    // audio SEP is measured.  Otherwise the IT6802E can initially emit a
+    // half-rate/muted SEP cadence and the bridge would lock to the wrong pitch.
+    {
         const char* env_pia94 = getenv("HD60S_POST_ISO_AUDIO94");
-        int do_pia94 = (env_pia94 && env_pia94[0] && env_pia94[0] != '0' && env_pia94[0] != 'n' && env_pia94[0] != 'N');
+        int do_pia94 = env_pia94 && env_pia94[0] && env_pia94[0] != '0' &&
+                       env_pia94[0] != 'n' && env_pia94[0] != 'N';
         if (do_pia94) {
             #include "post_iso_audio94.inc"
-            fprintf(stderr, "[post-iso-audio94] firing %d writes to slave 0x94 (audio bank)...\n", post_iso_audio94_n);
             int ok94 = 0;
+            fprintf(stderr, "[post-iso-audio94] applying %d writes before SEP measurement\n",
+                    post_iso_audio94_n);
             for (int u = 0; u < post_iso_audio94_n; u++) {
-                unsigned char w[3] = {post_iso_audio94[u].b0, post_iso_audio94[u].b1, post_iso_audio94[u].b2};
+                unsigned char w[3] = {post_iso_audio94[u].b0,
+                                      post_iso_audio94[u].b1,
+                                      post_iso_audio94[u].b2};
                 int r = libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w, 3, 200);
                 if (r == 3) ok94++;
                 usleep(600);
             }
-            fprintf(stderr, "[post-iso-audio94] %d/%d OK\n", ok94, post_iso_audio94_n);
+            fprintf(stderr, "[post-iso-audio94] applied %d/%d OK\n", ok94, post_iso_audio94_n);
         }
     }
 

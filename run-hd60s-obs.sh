@@ -91,6 +91,7 @@ while :; do
     HD60S_INIT_TSV="${HD60S_INIT_TSV:-analysis/init-p2-audio-fast.tsv}" \
     HD60S_BURST_TSV="${HD60S_BURST_TSV:-analysis/poststream-no9a.tsv}" \
     HD60S_AUDIO_PW="${HD60S_AUDIO_PW:-0}" \
+    HD60S_POST_ISO_AUDIO94=1 \
     HD60S_CADENCE_DIAG="${HD60S_CADENCE_DIAG:-0}" \
     HD60S_PACE_OUTPUT=1 \
     HD60S_VERBOSE=0 \
