@@ -1,7 +1,7 @@
 // HD60 S: 呪文再生 + iso(alt2) キャプチャ (libusb-1.0, C)
 // node-usb が iso 非対応なので C で実装。Windows と同じ iso 経路で EP0x83 から映像(生YUYV想定)を吸う。
 //
-// build: gcc -O2 iso_capture.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
+// build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
 // run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (映像は captures/stream-iso.bin へ)
 //
 // ======================================================================
@@ -44,16 +44,8 @@
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
+#include "hd60s_util.h"
 
-static double now_s(void) {
-    struct timeval tv; gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
-}
-static uint64_t now_mono_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
 #define MAX_WRITE_BYTES (64LL << 20)  // 出力ファイルは先頭64MBまで(2Gbpsで肥大化防止)
 
 #define VID 0x0fd9              // Elgato USB vendor ID
@@ -84,23 +76,6 @@ static int max_inflight = 0;
 static unsigned long submit_ok = 0, submit_fail = 0, resubmit_fail = 0;
 static int usb_session_fatal = 0;
 static int usb_session_error = 0;
-static volatile sig_atomic_t g_stop_requested = 0;
-
-static void request_stop(int signal_number) {
-    (void)signal_number;
-    g_stop_requested = 1;
-}
-
-static void install_signal_handlers(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sigemptyset(&sa.sa_mask);
-    sa.sa_handler = request_stop;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
-}
-
 // Return the payload capacity advertised for EP_STREAM in the selected
 // alternate setting.  On SuperSpeed devices the companion descriptor's
 // wBytesPerInterval is the authoritative service-interval capacity; for
@@ -335,12 +310,6 @@ static int16_t g_last_sample = 0;
 // 分数遅延累積 (次に何 samples 出すかの端数管理)
 static double g_frac_pos = 0.0;
 extern int g_use_pw;
-
-static double now_monotonic_s(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
-}
 
 static void audio_track_cadence_and_recalibrate(int is_active) {
     double now = now_monotonic_s();
@@ -983,7 +952,7 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
             if (new_ratio > hi) new_ratio = hi;
             g_upsample_ratio = new_ratio;
             g_pll_updates++;
-            if (getenv("HD60S_PLL_DEBUG")) {
+            if (hd60s_env_present("HD60S_PLL_DEBUG")) {
                 fprintf(stderr, "[pll] #%llu fill=%d err=%+d int=%+.1f adj=%+.6f ratio=%.6f\n",
                         (unsigned long long)g_pll_updates, fill, err,
                         g_pll_integral, adjust, g_upsample_ratio);
@@ -1397,7 +1366,7 @@ static void emit_frame(void) {
     }
     g_frames_out++;
     // 2026-07-18 debug dump は HD60S_DEBUG_DUMP=1 の時のみ (常時 4MB × 3 個の write は無駄)
-    if (getenv("HD60S_DEBUG_DUMP") &&
+    if (hd60s_env_present("HD60S_DEBUG_DUMP") &&
         (g_frames_out == 1 || g_frames_out == 60 || g_frames_out == 300 || g_frames_out == 600)) {
         char path[256];
         snprintf(path, sizeof(path), "captures/proof/live_frame_%llu.yuv", g_frames_out);
@@ -2032,17 +2001,6 @@ static int v4l2_open(const char* devpath) {
     // A complete frame is submitted by each write(FRAME_BYTES) below.
     fprintf(stderr, "[v4l2] %s opened (YUYV 1920x1080 @60fps, S_FMT/write mode)\n", devpath);
     return fd;
-}
-
-static int hex2bin(const char* hex, unsigned char* out, int maxlen) {
-    int n = 0; const char* p = hex;
-    while (p[0] && p[1] && n < maxlen) {
-        int hi, lo;
-        char c = p[0]; hi = (c<='9')?c-'0':(c|32)-'a'+10;
-        c = p[1]; lo = (c<='9')?c-'0':(c|32)-'a'+10;
-        out[n++] = (hi<<4)|lo; p += 2;
-    }
-    return n;
 }
 
 // ======================================================================
