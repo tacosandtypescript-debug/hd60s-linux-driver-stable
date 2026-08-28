@@ -1,8 +1,16 @@
 #!/bin/bash
 # HD60S ラッパースクリプト
 set -e
-cd "$(dirname "$(readlink -f "$0")")"
-source "./hd60s-lib.sh"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+if [ -x "$SCRIPT_DIR/iso_capture" ]; then
+  ROOT="$SCRIPT_DIR"
+elif [ -x "$SCRIPT_DIR/../iso_capture" ]; then
+  ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+  ROOT="$SCRIPT_DIR"
+fi
+source "$SCRIPT_DIR/hd60s-lib.sh"
+cd "$ROOT"
 
 CMD="${1:-help}"; SEC="${2:-}"
 VDEV="/dev/video42"
@@ -27,7 +35,7 @@ case "$CMD" in
         -e "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" -e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
     # ペイン1 (上): iso_capture — Ctrl+C まで無限実行 (argv[1]=0 で 100年扱い)
     # 音声は snd-aloop の hw:10,0 → hw:10,1 経由で hd60s_capture に公開される
-    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 ./run-hd60s-obs.sh" Enter
+    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 \"$SCRIPT_DIR\"/run-hd60s-obs.sh" Enter
     # ペイン2 (下): mpv 映像プレビュー - 13秒後起動 (HD60S_NO_MPV=1 で抑制)
     # OBS 使うなら mpv は不要 → プレビューが要らないなら NO_MPV=1 で起動しない
     if [ -z "${HD60S_NO_MPV:-}" ]; then
@@ -52,7 +60,7 @@ case "$CMD" in
     kill_capture
     HERE="$PWD"
     tmux new-session -d -s hd60s -x 200 -y 50
-    tmux send-keys -t hd60s "cd $HERE && ./run-hd60s-obs.sh" Enter
+    tmux send-keys -t hd60s "cd $HERE && \"$SCRIPT_DIR\"/run-hd60s-obs.sh" Enter
     say "iso_capture arrancado (tmux 'hd60s'). Esperando lock de vídeo 12s..."
     sleep 12
     say "arrancando OBS..."

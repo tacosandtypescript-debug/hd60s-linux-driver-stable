@@ -1,7 +1,14 @@
 #!/bin/sh
 set -eu
 
-DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -x "$SCRIPT_DIR/iso_capture" ]; then
+  DIR="$SCRIPT_DIR"
+elif [ -x "$SCRIPT_DIR/../iso_capture" ]; then
+  DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+else
+  DIR="$SCRIPT_DIR"
+fi
 cd "$DIR"
 
 # HD60 S 0fd9:005e → libusb → v4l2loopback (/dev/video42).
