@@ -9,7 +9,7 @@
 
 FILE *g_rdlog = NULL;
 
-// 呪文再生(TSV) ; 戻り値: (ok<<0) 実際はグローバルでカウント
+// replay de hechizo (TSV) ; retorno: (ok<<0) en la práctica se cuenta en globales
 void hd60s_replay_spell(libusb_device_handle* h, const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) { fprintf(stderr, "TSV開けない: %s\n", path); return; }
@@ -18,7 +18,7 @@ void hd60s_replay_spell(libusb_device_handle* h, const char* path) {
     unsigned char data[4096];
     double prev_t = -1;
     int n5066 = 0; char last5066[64] = "";
-    int rd_idx = 0; char prev_out[64] = "";   // 差分観測: 直前OUTペイロード
+    int rd_idx = 0; char prev_out[64] = "";   // observación de diffs: payload OUT anterior
     while (fgets(line, sizeof(line), f)) {
         if (first) { first=0; continue; }              // header
         char c_frame[32], c_time[32], c_brt[16], c_br[16], c_wv[16], c_wi[16], c_wl[16], c_data[8000];
@@ -26,11 +26,11 @@ void hd60s_replay_spell(libusb_device_handle* h, const char* path) {
         int nf = sscanf(line, "%31[^\t]\t%31[^\t]\t%15[^\t]\t%15[^\t]\t%15[^\t]\t%15[^\t]\t%15[^\t]\t%7999[^\t\n]",
                         c_frame, c_time, c_brt, c_br, c_wv, c_wi, c_wl, c_data);
         if (nf < 7) continue;
-        // 元キャプチャのタイミングを再現(コマンド間をsleep)。HDMIロック待ちの150ms間隔もここで再現される。
+        // reproduce el timing de la captura original (sleep entre comandos). El intervalo 150ms de espera de lock HDMI también sale aquí.
         double t = atof(c_time);
         if (prev_t >= 0) {
             double dt = t - prev_t;
-            if (dt > 0 && dt < 2.0) usleep((useconds_t)(dt * 1e6));   // 上限2s
+            if (dt > 0 && dt < 2.0) usleep((useconds_t)(dt * 1e6));   // tope 2s
         }
         prev_t = t;
         unsigned char brt = (unsigned char)strtol(c_brt, NULL, 16);
@@ -43,11 +43,11 @@ void hd60s_replay_spell(libusb_device_handle* h, const char* path) {
         if (is_out) {
             int dlen = (nf>=8 && c_data[0]) ? hex2bin(c_data, data, sizeof(data)) : 0;
             r = libusb_control_transfer(h, brt, br, wv, wi, data, dlen, 1000);
-            // 差分観測: このOUT(=I2Cセットアップ)を記録。次のIN読みと紐付ける。
+            // observación de diffs: registra este OUT (=setup I2C). Se ata a la siguiente lectura IN.
             if (nf>=8 && c_data[0]) { strncpy(prev_out, c_data, sizeof(prev_out)-1); prev_out[sizeof(prev_out)-1]=0; }
         } else {
             r = libusb_control_transfer(h, brt, br, wv, wi, data, wl, 1000);
-            // 差分観測ログ: 全IN読みを「位置idx / wValue / 直前OUT(I2C対象) / 応答」で記録。
+            // log de diffs: todos los IN como «posición idx / wValue / OUT anterior (objetivo I2C) / respuesta».
             if (g_rdlog) {
                 char rh[64]; int p=0;
                 for (int j=0;j<r && j<16;j++) p+=sprintf(rh+p,"%02x",data[j]);
@@ -55,11 +55,11 @@ void hd60s_replay_spell(libusb_device_handle* h, const char* path) {
                 fprintf(g_rdlog, "%d\t0x%04x\t%s\t%s\n", rd_idx, wv, prev_out[0]?prev_out:"-", rh);
             }
             rd_idx++;
-            // 診断: ステータスポーリング読み(wV=0x5066)の応答を記録し、変化(=ロック検出)を見る
+            // diagnóstico: registra respuestas del poll de status (wV=0x5066) y mira cambios (=detección de lock)
             if (r > 0 && wv == 0x5066 && n5066 < 4000) {
                 char hex[64]; int p=0;
                 for (int j=0;j<r && j<16;j++) p+=sprintf(hex+p,"%02x",data[j]);
-                // 直近と違う応答だけ表示(変化点を捉える)
+                // muestra solo respuestas distintas a la última (para pillar el punto de cambio)
                 if (strcmp(hex, last5066) != 0) {
                     fprintf(stderr, "  [poll@%.2fs] wV5066 resp: %s\n", t, hex);
                     snprintf(last5066, sizeof(last5066), "%s", hex);
@@ -73,9 +73,9 @@ void hd60s_replay_spell(libusb_device_handle* h, const char* path) {
     fprintf(stderr, "[replay] 呪文再生: ok=%d fail=%d / wV5066ポーリング読み %d回\n", ok, fail, n5066);
 }
 
-// SCDT(信号ロック)候補ビット待ち: `9d`バンク reg 0x12 の bit0x80 が
-// 0(=信号あり,実測ON=0x11) になるまでポーリングする。
-// 2026-07-09 kusq協力の信号あり/なし差分実験で特定(FINDINGS.md参照)。
+// espera del bit candidato SCDT (lock de señal): bit0x80 de reg 0x12 del bank `9d`
+// hasta que sea 0 (=hay señal, medido ON=0x11).
+// fijado el 2026-07-09 en el experimento de diffs con/sin señal de kusq (ver FINDINGS.md).
 int hd60s_wait_for_lock(libusb_device_handle* h, int timeout_ms, int poll_interval_ms) {
     unsigned char setup[3] = {0x9d, 0x01, 0x12};
     unsigned char resp[4];
@@ -86,7 +86,7 @@ int hd60s_wait_for_lock(libusb_device_handle* h, int timeout_ms, int poll_interv
         if (r1 >= 0 && r2 >= 1) {
             fprintf(stderr, "[lock] 9d:0x12 = 0x%02x (%s)\n", resp[0],
                     (resp[0] & 0x80) ? "信号なし" : "ロック済み!");
-            if (!(resp[0] & 0x80)) return 1;   // bit7クリア = ロック
+            if (!(resp[0] & 0x80)) return 1;   // bit7 clear = lock
         } else {
             fprintf(stderr, "[lock] ポーリング失敗 r1=%d r2=%d\n", r1, r2);
         }
@@ -94,12 +94,12 @@ int hd60s_wait_for_lock(libusb_device_handle* h, int timeout_ms, int poll_interv
         libusb_handle_events_timeout(NULL, &tv);
         waited += poll_interval_ms;
     }
-    return 0; // タイムアウト
+    return 0; // timeout
 }
 
-// --- ポストストリーム点火バースト（frame8637-13573） ---
-// alt2でisoを開いた"後"にWindowsが送る映像パイプ有効化コマンド群。
-// これが実際にIT6802Eフォーマッタ+FX3 DMAを起動する本体（2026-07-09 workflow解析で特定）。
+// --- burst de ignición post-stream (frame8637-13573) ---
+// comandos que Windows manda *después* de abrir iso en alt2 para habilitar el pipe de vídeo.
+// esto es lo que realmente arranca el formateador IT6802E + DMA FX3 (hallado en workflow 2026-07-09).
 BurstCmd g_burst[2048];
 int g_nburst = 0;
 
