@@ -687,6 +687,12 @@ alignas(64) static int16_t g_pw_ring[PW_RING_SIZE];
 // drop counters (障害調査用、毎秒 24k SEP でも atomic incr のオーバーヘッド無視可)
 static _Atomic uint64_t g_pw_drops_old = 0;   // consumer 側 fast-forward した sample 数
 static _Atomic uint64_t g_pw_drops_new = 0;   // producer 側で full により書けなかった数
+static _Atomic uint64_t g_pw_process_calls = 0;
+static _Atomic uint64_t g_pw_output_writes = 0;
+static _Atomic uint64_t g_pw_output_frames = 0;
+static _Atomic uint64_t g_pw_output_errors = 0;
+static _Atomic uint32_t g_pw_fill_min = UINT32_MAX;
+static _Atomic uint32_t g_pw_fill_max = 0;
 
 // PW process コールバック用の状態
 static int16_t g_pw_last_sample = 0;  // underflow 時の連続性維持用
@@ -698,10 +704,18 @@ static int16_t g_pw_last_sample = 0;  // underflow 時の連続性維持用
 //    責任を consumer 側に集約 (SPSC の tail 単一書き込み者ルールを守るため)。
 static void pw_on_process(void* userdata) {
     (void)userdata;
+    atomic_fetch_add_explicit(&g_pw_process_calls, 1, memory_order_relaxed);
     struct pw_buffer* b = pw_stream_dequeue_buffer(g_pw_stream);
-    if (!b) return;
+    if (!b) {
+        atomic_fetch_add_explicit(&g_pw_output_errors, 1, memory_order_relaxed);
+        return;
+    }
     struct spa_buffer* buf = b->buffer;
-    if (!buf->datas[0].data) { pw_stream_queue_buffer(g_pw_stream, b); return; }
+    if (!buf->datas[0].data) {
+        atomic_fetch_add_explicit(&g_pw_output_errors, 1, memory_order_relaxed);
+        pw_stream_queue_buffer(g_pw_stream, b);
+        return;
+    }
 
     int16_t* dst = (int16_t*)buf->datas[0].data;
     uint32_t max_frames = buf->datas[0].maxsize / sizeof(int16_t);
@@ -715,6 +729,12 @@ static void pw_on_process(void* userdata) {
     uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_acquire);
     uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
     uint32_t avail = (head - tail) & (PW_RING_SIZE - 1);
+    uint32_t old_min = atomic_load_explicit(&g_pw_fill_min, memory_order_relaxed);
+    while (avail < old_min && !atomic_compare_exchange_weak_explicit(
+        &g_pw_fill_min, &old_min, avail, memory_order_relaxed, memory_order_relaxed)) {}
+    uint32_t old_max = atomic_load_explicit(&g_pw_fill_max, memory_order_relaxed);
+    while (avail > old_max && !atomic_compare_exchange_weak_explicit(
+        &g_pw_fill_max, &old_max, avail, memory_order_relaxed, memory_order_relaxed)) {}
 
     // 2026-07-18 soft-drop: 一度に大量捨てると可聴クリックが出るので、TARGET*3 (~8ms)
     // 超えを検出したら 128 samples (1.3ms, 1 quantum) だけ捨てる。発動頻度は上がるが
@@ -752,6 +772,8 @@ static void pw_on_process(void* userdata) {
     buf->datas[0].chunk->offset = 0;
     buf->datas[0].chunk->stride = sizeof(int16_t);
     buf->datas[0].chunk->size = want * sizeof(int16_t);
+    atomic_fetch_add_explicit(&g_pw_output_writes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pw_output_frames, want, memory_order_relaxed);
     pw_stream_queue_buffer(g_pw_stream, b);
 }
 
@@ -3474,6 +3496,13 @@ capture_cleanup:
     uint64_t drops_new = atomic_load_explicit(&g_pw_drops_new, memory_order_relaxed);
     fprintf(stderr, "pw ring:   drops_old=%llu (consumer fast-forward) drops_new=%llu (producer full)\n",
             (unsigned long long)drops_old, (unsigned long long)drops_new);
+    fprintf(stderr, "pw output: process_calls=%llu writes=%llu frames=%llu errors=%llu fill_min=%u fill_max=%u\n",
+            (unsigned long long)atomic_load_explicit(&g_pw_process_calls, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pw_output_writes, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pw_output_frames, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pw_output_errors, memory_order_relaxed),
+            atomic_load_explicit(&g_pw_fill_min, memory_order_relaxed),
+            atomic_load_explicit(&g_pw_fill_max, memory_order_relaxed));
 
     libusb_release_interface(h, 0);
     libusb_close(h);
