@@ -37,7 +37,7 @@ install-symlink:
 
 install: all
 	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)"
-	install -m 0755 iso_capture probe_iso hd60s run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
+	install -m 0755 iso_capture probe_iso hd60s hd60s-lib.sh run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
 	install -m 0644 analysis/*.tsv "$(DESTDIR)$(LIBEXECDIR)/analysis/"
 	install -m 0644 "$(WIREPLUMBER_RULE)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/"
 	@sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' "$(SYSTEMD_USER_UNIT_TEMPLATE)" > "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s.service"
