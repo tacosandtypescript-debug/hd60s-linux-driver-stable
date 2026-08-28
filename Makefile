@@ -18,8 +18,8 @@ BINS = iso_capture audio_extract offline_parser spi_dump probe_iso
 
 all: $(BINS)
 
-iso_capture: src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c
-	$(CC) $(CFLAGS) -Isrc $(LIBUSB_CFLAGS) $(PIPEWIRE_CFLAGS) src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c -o $@ $(LIBUSB_LIBS) $(ALSA_LIBS) $(PIPEWIRE_LIBS) -lpthread -lsamplerate
+iso_capture: src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c
+	$(CC) $(CFLAGS) -Isrc $(LIBUSB_CFLAGS) $(PIPEWIRE_CFLAGS) src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c -o $@ $(LIBUSB_LIBS) $(ALSA_LIBS) $(PIPEWIRE_LIBS) -lpthread -lsamplerate
 
 audio_extract: tools/audio_extract.c
 	$(CC) $(CFLAGS) $< -o $@
