@@ -1,7 +1,7 @@
 // HD60 S: 呪文再生 + iso(alt2) キャプチャ (libusb-1.0, C)
 // node-usb が iso 非対応なので C で実装。Windows と同じ iso 経路で EP0x83 から映像(生YUYV想定)を吸う。
 //
-// build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c src/hd60s_pace.c src/hd60s_parser.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
+// build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c src/hd60s_pace.c src/hd60s_parser.c src/hd60s_usb.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
 // run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (映像は captures/stream-iso.bin へ)
 //
 // ======================================================================
@@ -50,230 +50,9 @@
 #include "hd60s_replay.h"
 #include "hd60s_pace.h"
 #include "hd60s_parser.h"
+#include "hd60s_usb.h"
 
 #define MAX_WRITE_BYTES (64LL << 20)  // 出力ファイルは先頭64MBまで(2Gbpsで肥大化防止)
-
-#define VID 0x0fd9              // Elgato USB vendor ID
-#define PID 0x005e              // Original HD60 S detected on this PC
-#define EP_STREAM 0x83          // iso IN endpoint (映像+SEP embedded audio)
-// マジックナンバーの意味:
-//   wValue = 0x5066  → I2C ブリッジ経路 (bank+reg 指定で IT6802E/IT66121 を叩く)
-//   wValue = 0x509c  → MCU コマンド経路 (Cypress FX3 内の MCU 相当への 2B コマンド)
-//   bRequest = 0xC0/0xC6 → ベンダ固有 (詳細は notes/protocol.md 参照予定)
-//   bank 0x9a=IT66121 write, 0x9b=IT66121 read setup, 0x9c=IT6802E write, 0x9d=IT6802E read setup
-    // SuperSpeed iso: each libusb iso descriptor represents one service
-    // interval payload for this device.  The SS companion descriptors report:
-    // Alt2: wMaxPacketSize=1024, bMaxBurst=15, Mult=1 -> 32768 B/interval.
-    // Alt3: wMaxPacketSize=1024, bMaxBurst=12, Mult=2 -> 39936 B/interval.
-    // The multiplier is zero-based in the descriptor.
-// Windows実測: 32 iso pkt/URB × 16 in-flight = 16MB/64ms でempty 0.07%。
-// Linuxではさらにキュー深度を増やして URB 完了→再サブミット遅延の吸収余裕を確保。
-// libuvcのLinuxデフォルト=100本。8-64本試行で empty% と CPU 負荷のバランスを取る。
-#define NUM_TRANSFERS 506     // tested xHCI ceiling: 512 attempted, 506 accepted
-
-static FILE* outf;
-static long long total_bytes = 0;
-static long pkt_ok = 0, pkt_empty = 0, pkt_err = 0;
-static int keep_running = 1;
-static int inflight = 0;
-static int max_inflight = 0;
-static unsigned long submit_ok = 0, submit_fail = 0, resubmit_fail = 0;
-static int usb_session_fatal = 0;
-static int usb_session_error = 0;
-// Return the payload capacity advertised for EP_STREAM in the selected
-// alternate setting.  On SuperSpeed devices the companion descriptor's
-// wBytesPerInterval is the authoritative service-interval capacity; for
-// high-speed descriptors, derive it from wMaxPacketSize and its transaction
-// multiplier.  Keeping this check next to URB construction prevents a
-// total-interval size from being silently used as an oversized packet.
-static int iso_endpoint_capacity(libusb_device_handle* h, int alt,
-                                 int* capacity, int* superspeed) {
-    struct libusb_config_descriptor* cfg = NULL;
-    libusb_device* dev = libusb_get_device(h);
-    int rc = libusb_get_active_config_descriptor(dev, &cfg);
-    if (rc < 0) rc = libusb_get_config_descriptor(dev, 0, &cfg);
-    if (rc < 0 || !cfg) return rc < 0 ? rc : LIBUSB_ERROR_OTHER;
-
-    int found = LIBUSB_ERROR_NOT_FOUND;
-    *capacity = 0;
-    *superspeed = 0;
-    for (int i = 0; i < cfg->bNumInterfaces; i++) {
-        const struct libusb_interface* iface = &cfg->interface[i];
-        for (int a = 0; a < iface->num_altsetting; a++) {
-            const struct libusb_interface_descriptor* setting = &iface->altsetting[a];
-            if (setting->bInterfaceNumber != 0 || setting->bAlternateSetting != alt)
-                continue;
-            for (int e = 0; e < setting->bNumEndpoints; e++) {
-                const struct libusb_endpoint_descriptor* ep = &setting->endpoint[e];
-                if (ep->bEndpointAddress != EP_STREAM ||
-                    (ep->bmAttributes & 3) != LIBUSB_TRANSFER_TYPE_ISOCHRONOUS)
-                    continue;
-
-                int max_packet = ep->wMaxPacketSize & 0x07ff;
-                int transactions = ((ep->wMaxPacketSize >> 11) & 3) + 1;
-                struct libusb_ss_endpoint_companion_descriptor* ss = NULL;
-                int ss_rc = libusb_get_ss_endpoint_companion_descriptor(NULL, ep, &ss);
-                if (ss_rc == 0 && ss) {
-                    *superspeed = 1;
-                    *capacity = ss->wBytesPerInterval;
-                    fprintf(stderr,
-                            "[usb] alt=%d ep=0x%02x wMax=0x%04x SS burst=%u mult=%u bytes/interval=%u\n",
-                            alt, ep->bEndpointAddress, ep->wMaxPacketSize,
-                            ss->bMaxBurst, ss->bmAttributes & 3,
-                            ss->wBytesPerInterval);
-                    libusb_free_ss_endpoint_companion_descriptor(ss);
-                } else {
-                    *capacity = max_packet * transactions;
-                    fprintf(stderr,
-                            "[usb] alt=%d ep=0x%02x wMax=0x%04x max_packet=%d transactions=%d bytes/interval=%d\n",
-                            alt, ep->bEndpointAddress, ep->wMaxPacketSize,
-                            max_packet, transactions, *capacity);
-                }
-                found = (*capacity > 0) ? 0 : LIBUSB_ERROR_INVALID_PARAM;
-                break;
-            }
-        }
-    }
-    libusb_free_config_descriptor(cfg);
-    return found;
-}
-
-
-// ======================================================================
-// SECTION 3: USB 送受信 (呪文再生 / iso コールバック / burst 発火)
-// ======================================================================
-static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
-    static unsigned long callback_count = 0;
-    unsigned long long trace_cb_no = 0;
-    if (g_trace_enabled) trace_cb_no = ++g_trace_callback_no;
-    // HEX DUMP HOOK: HD60S_HEXDUMP=1 で iso packet の先頭 32B を最初 500 個 dump
-    // 音声パケットと映像パケットを見分けるため (workflow suggestion 2026-07-11)
-    static const char* env_hexdump = NULL;
-    static int hexdump_check = 0;
-    static int hexdump_count = 0;
-    if (!hexdump_check) {
-        env_hexdump = getenv("HD60S_HEXDUMP");
-        hexdump_check = 1;
-    }
-    int do_hexdump = env_hexdump && env_hexdump[0] && env_hexdump[0] != '0';
-
-    int packet_loss = 0;
-    size_t lost_bytes = 0;
-    for (int i = 0; i < xfr->num_iso_packets; i++) {
-        struct libusb_iso_packet_descriptor* d = &xfr->iso_packet_desc[i];
-        unsigned char* packet_buf = NULL;
-        if (d->status == LIBUSB_TRANSFER_COMPLETED && d->actual_length > 0)
-            packet_buf = libusb_get_iso_packet_buffer_simple(xfr, i);
-        hd60s_parser_trace_begin(trace_cb_no, i, xfr->status, d, packet_buf);
-        if (d->status == LIBUSB_TRANSFER_COMPLETED) {
-            if (d->actual_length > 0) {
-                unsigned char* buf = packet_buf;
-                // HEX DUMP hook - first 500 non-empty packets
-                if (do_hexdump && hexdump_count < 500) {
-                    fprintf(stderr, "PKT[%d] len=%d: ", hexdump_count, d->actual_length);
-                    for (unsigned int b = 0; b < 32 && b < d->actual_length; b++) fprintf(stderr, "%02x", buf[b]);
-                    fprintf(stderr, "\n");
-                    hexdump_count++;
-                }
-                // parser にライブ供給 (v4l2loopback へ流す)
-                hd60s_parser_feed(buf, d->actual_length);
-                // 検証用: 先頭512MBだけ生ストリームを保存 (音声解析用に増量)
-                if (total_bytes < (512LL << 20) && outf) fwrite(buf, 1, d->actual_length, outf);
-                total_bytes += d->actual_length;
-                if (g_diag) g_diag_input_bytes += d->actual_length;
-                pkt_ok++;
-                hd60s_parser_trace_end();
-            } else {
-                // iso 0-length pkt はブランキングによる正常な休止と考え、
-                // 進行中のライン位置には触れない (実測で empty時にg_lpos リセットすると
-                // 逆に marker resync が増える → 触らないのが正解)。
-                pkt_empty++;
-                hd60s_parser_trace_end();
-            }
-        } else {
-            pkt_err++;
-            packet_loss = 1;
-            lost_bytes += d->length;
-            if (xfr->status == LIBUSB_TRANSFER_NO_DEVICE ||
-                xfr->status == LIBUSB_TRANSFER_ERROR) {
-                usb_session_fatal = 1;
-                usb_session_error = xfr->status;
-            }
-            hd60s_parser_trace_end();
-        }
-    }
-    if (packet_loss)
-        hd60s_parser_notify_loss(lost_bytes);
-    if (!g_stop_requested && keep_running && !usb_session_fatal) {
-        int submit_rc = libusb_submit_transfer(xfr);
-        if (submit_rc < 0) {
-            inflight--;
-            resubmit_fail++;
-            usb_session_fatal = 1;
-            usb_session_error = submit_rc;
-            keep_running = 0;
-            fprintf(stderr, "[iso] resubmit failed rc=%d (%s); ending USB session\n",
-                    submit_rc, libusb_error_name(submit_rc));
-        }
-    } else {
-        inflight--;
-    }
-    if ((++callback_count % 100) == 0)
-        fprintf(stderr, "[iso-debug] callbacks=%lu ok=%ld empty=%ld err=%ld bytes=%lld frames=%llu\\n",
-                callback_count, pkt_ok, pkt_empty, pkt_err, total_bytes, g_frames_out);
-}
-
-// Stop every outstanding transfer before the device handle is released.  A
-// completed callback may resubmit the same transfer, so setting keep_running
-// alone is not enough: all still-submitted URBs must be cancelled and their
-// cancellation callbacks drained first.
-static void cleanup_iso_transfers(libusb_device_handle* h,
-                                  struct libusb_transfer** xfrs,
-                                  unsigned char** bufs,
-                                  const unsigned char* devmem,
-                                  int count, size_t buffer_bytes) {
-    if (!xfrs || !bufs) return;
-    keep_running = 0;
-
-    for (int i = 0; i < count; i++) {
-        if (!xfrs[i]) continue;
-        int rc = libusb_cancel_transfer(xfrs[i]);
-        if (rc < 0 && rc != LIBUSB_ERROR_NOT_FOUND && rc != LIBUSB_ERROR_NO_DEVICE)
-            fprintf(stderr, "[iso] cancel%d failed rc=%d (%s)\n",
-                    i, rc, libusb_error_name(rc));
-    }
-
-    // Cancellation is asynchronous.  Let libusb deliver every callback so
-    // the inflight count reaches zero before transfer objects are freed.
-    struct timeval tv = {0, 20000};
-    for (int wait = 0; wait < 100 && inflight > 0; wait++) {
-        int rc = libusb_handle_events_timeout(NULL, &tv);
-        if (rc < 0 && rc != LIBUSB_ERROR_INTERRUPTED && rc != LIBUSB_ERROR_NO_DEVICE)
-            fprintf(stderr, "[iso] cancel-drain failed rc=%d (%s)\n",
-                    rc, libusb_error_name(rc));
-    }
-    if (inflight > 0)
-        fprintf(stderr, "[iso] warning: %d transfers remained after cancellation drain\n",
-                inflight);
-    if (inflight > 0) {
-        // Do not free a transfer object that libusb still considers active.
-        // The process is exiting and the handle teardown will reclaim the
-        // remaining OS resources; freeing here would be use-after-free if a
-        // late cancellation callback is delivered.
-        return;
-    }
-
-    for (int i = 0; i < count; i++) {
-        if (xfrs[i]) {
-            libusb_free_transfer(xfrs[i]);
-            xfrs[i] = NULL;
-        }
-        if (!bufs[i]) continue;
-        if (devmem && devmem[i]) libusb_dev_mem_free(h, bufs[i], buffer_bytes);
-        else free(bufs[i]);
-        bufs[i] = NULL;
-    }
-}
 
 // ======================================================================
 // SECTION 4: main (デバイス open → 呪文再生 → iso キャプチャ → 統計出力)
@@ -389,7 +168,7 @@ int main(int argc, char** argv) {
     if (alt != 4) {
         int endpoint_capacity = 0;
         int endpoint_superspeed = 0;
-        int endpoint_rc = iso_endpoint_capacity(h, alt, &endpoint_capacity,
+        int endpoint_rc = hd60s_usb_endpoint_capacity(h, alt, &endpoint_capacity,
                                                  &endpoint_superspeed);
         if (endpoint_rc < 0 || endpoint_capacity <= 0) {
             fprintf(stderr, "[usb] no usable isochronous endpoint for alt=%d rc=%d (%s)\n",
@@ -608,9 +387,8 @@ int main(int argc, char** argv) {
             if (rc == 0 && actual > 0) {
                 if (bulk_dump) fwrite(bulk_buf, 1, (size_t)actual, bulk_dump);
                 hd60s_parser_feed(bulk_buf, actual);
-                total_bytes += actual;
+                hd60s_usb_note_ok(actual);
                 if (g_diag) g_diag_input_bytes += actual;
-                pkt_ok++;
                 if (nonempty++ < 8) {
                     fprintf(stderr, "[bulk] n=%d len=%d head=", n, actual);
                     for (int b = 0; b < actual && b < 16; ++b)
@@ -626,7 +404,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[bulk] nonempty_transfers=%d\n", nonempty);
         hd60s_v4l2_close();
         fprintf(stderr, "[bulk] bytes=%lld frames=%llu resyncs=%llu\n",
-                total_bytes, g_frames_out, g_resyncs);
+                hd60s_usb_total_bytes(), g_frames_out, g_resyncs);
         libusb_release_interface(h, 0);
         libusb_close(h);
         libusb_exit(NULL);
@@ -652,8 +430,7 @@ int main(int argc, char** argv) {
     if (!alsa_dev) alsa_dev = "hw:10,0";
     hd60s_audio_open(alsa_dev);
 
-    outf = fopen("captures/stream-iso.bin", "wb");
-    if (!outf) fprintf(stderr, "生ストリーム出力ファイル開けず(続行)\n");
+    hd60s_usb_open_dump();
 
     // firmware解析結果に基づき 0x509c (MCU bridge) audio init sequence を replay
     // pcap init-timed t=6.5-7.2s から抽出した 236個の 2byte writes
@@ -801,59 +578,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    size_t transfer_bytes = (size_t)iso_packets * (size_t)iso_pkt_size;
-    if (transfer_bytes == 0 || transfer_bytes > INT_MAX) {
-        fprintf(stderr, "[iso] invalid transfer buffer size=%zu\n", transfer_bytes);
-        libusb_release_interface(h, 0);
-        libusb_close(h);
-        libusb_exit(NULL);
-        return 2;
-    }
-    struct libusb_transfer* xfrs[NUM_TRANSFERS] = {0};
-    unsigned char* bufs[NUM_TRANSFERS] = {0};
-    unsigned char devmem[NUM_TRANSFERS] = {0};
-    for (int i = 0; i < NUM_TRANSFERS; i++) {
-        // Zerocopy DMA バッファ (usbfs mmap経由) → CPU 使用率↓、tail latency↓。
-        // 失敗時は malloc にフォールバック (小型ホストで KMS が確保できない場合)。
-        bufs[i] = libusb_dev_mem_alloc(h, (int)transfer_bytes);
-        if (bufs[i]) devmem[i] = 1;
-        if (!bufs[i]) bufs[i] = malloc(transfer_bytes);
-        if (!bufs[i]) {
-            usb_session_fatal = 1;
-            usb_session_error = LIBUSB_ERROR_NO_MEM;
-            fprintf(stderr, "[iso] buffer allocation failed at transfer %d\n", i);
-            break;
-        }
-        xfrs[i] = libusb_alloc_transfer(iso_packets);
-        if (!xfrs[i]) {
-            usb_session_fatal = 1;
-            usb_session_error = LIBUSB_ERROR_NO_MEM;
-            fprintf(stderr, "[iso] transfer allocation failed at transfer %d\n", i);
-            break;
-        }
-        // timeout=0 = 無限。連続isoで有限timeoutはURBキャンセルで in-flight packet 全て empty化する罠
-        libusb_fill_iso_transfer(xfrs[i], h, EP_STREAM, bufs[i],
-            (int)transfer_bytes, iso_packets, iso_cb, NULL, 0);
-        libusb_set_iso_packet_lengths(xfrs[i], iso_pkt_size);
-        int submit_rc = libusb_submit_transfer(xfrs[i]);
-        if (submit_rc == 0) {
-            inflight++;
-            submit_ok++;
-            if (inflight > max_inflight) max_inflight = inflight;
-        } else {
-            submit_fail++;
-            fprintf(stderr, "submit%d failed rc=%d (%s)\\n", i, submit_rc, libusb_error_name(submit_rc));
-        }
-    }
-    fprintf(stderr, "[main] iso転送 %d 本投入\n", inflight);
-
-    fprintf(stderr, "[iso] submit summary ok=%lu fail=%lu max_inflight=%d current=%d\\n",
-            submit_ok, submit_fail, max_inflight, inflight);
-    if (inflight == 0 || usb_session_fatal) {
-        usb_session_fatal = 1;
-        if (!usb_session_error) usb_session_error = LIBUSB_ERROR_OTHER;
-        keep_running = 0;
-        fprintf(stderr, "[iso] no active transfers or allocation failure; ending USB session before capture\\n");
+    if (hd60s_usb_start_iso(h, iso_pkt_size, iso_packets) < 0) {
         goto capture_cleanup;
     }
 
@@ -986,7 +711,7 @@ int main(int argc, char** argv) {
     int pt_loop = (env_pt && env_pt[0] && env_pt[0] != '0' && env_pt[0] != 'n' && env_pt[0] != 'N');
     double last_pt_fire = 0.0;
     int pt_fires = 0;
-    while (!g_stop_requested && keep_running && now_s() - start < read_sec && inflight > 0) {
+    while (!g_stop_requested && hd60s_usb_keep_running() && now_s() - start < read_sec && hd60s_usb_inflight() > 0) {
         double el = now_s() - start;
         while (bi < g_nburst && (g_burst[bi].t - burst_t0) <= el) {
             BurstCmd* b = &g_burst[bi];
@@ -1279,26 +1004,18 @@ int main(int argc, char** argv) {
             last_pt_fire = el;
             pt_fires++;
     }
-    int event_rc = libusb_handle_events_timeout(NULL, &tv);
-    if (event_rc == LIBUSB_ERROR_NO_DEVICE || event_rc == LIBUSB_ERROR_IO ||
-        event_rc == LIBUSB_ERROR_OTHER) {
-        usb_session_fatal = 1;
-        usb_session_error = event_rc;
-        keep_running = 0;
-        fprintf(stderr, "[iso] event handling failed rc=%d (%s)\\n",
-                event_rc, libusb_error_name(event_rc));
-    }
+    hd60s_usb_handle_events(&tv);
         hd60s_pace_output_if_due();
     }
     if (g_stop_requested) {
-        keep_running = 0;
+        hd60s_usb_request_stop();
         fprintf(stderr, "[main] stop requested; draining USB transfers\n");
     }
-    if (usb_session_fatal)
+    if (hd60s_usb_fatal())
         fprintf(stderr, "[iso] USB session ended: status=%d (%s)\n",
-                usb_session_error,
-                usb_session_error < 0 ? libusb_error_name(usb_session_error) : "transfer status");
-    if (usb_session_fatal)
+                hd60s_usb_error(),
+                hd60s_usb_error() < 0 ? libusb_error_name(hd60s_usb_error()) : "transfer status");
+    if (hd60s_usb_fatal())
         goto capture_cleanup;
     if (pt_loop) fprintf(stderr, "[pt-loop] 継続発火 %d 回\n", pt_fires);
     fprintf(stderr, "[burst] 発行 %d/%d (ok=%d fail=%d)\n", bi, g_nburst, bok, bfail);
@@ -1377,22 +1094,21 @@ int main(int argc, char** argv) {
 
     usleep(500 * 1000);
     IT66121_SNAP("+500ms   ");
-    keep_running = 0;
+    hd60s_usb_request_stop();
     // 残りを回収
     struct timeval tv2 = {1, 0};
-    for (int k = 0; k < 10 && inflight > 0; k++) libusb_handle_events_timeout(NULL, &tv2);
+    for (int k = 0; k < 10 && hd60s_usb_inflight() > 0; k++) libusb_handle_events_timeout(NULL, &tv2);
 
 capture_cleanup:
-    cleanup_iso_transfers(h, xfrs, bufs, devmem, NUM_TRANSFERS, transfer_bytes);
-    if (outf) fclose(outf);
+    hd60s_usb_stop(h);
     hd60s_v4l2_close();
     hd60s_audio_close();
     fprintf(stderr, "\n=== HD60S Linux driver stats ===\n");
     fprintf(stderr, "iso pkts:  ok=%ld empty=%ld err=%ld (empty=%.2f%%)\n",
-            pkt_ok, pkt_empty, pkt_err,
-            (pkt_ok + pkt_empty) ? 100.0 * pkt_empty / (pkt_ok + pkt_empty) : 0.0);
+            hd60s_usb_pkt_ok(), hd60s_usb_pkt_empty(), hd60s_usb_pkt_err(),
+            (hd60s_usb_pkt_ok() + hd60s_usb_pkt_empty()) ? 100.0 * hd60s_usb_pkt_empty() / (hd60s_usb_pkt_ok() + hd60s_usb_pkt_empty()) : 0.0);
     fprintf(stderr, "iso total: %lld bytes / %d s = %.1f Mbps\n",
-            total_bytes, read_sec, total_bytes * 8.0 / read_sec / 1e6);
+            hd60s_usb_total_bytes(), read_sec, hd60s_usb_total_bytes() * 8.0 / read_sec / 1e6);
     fprintf(stderr, "parser:    frames_emitted=%llu resyncs=%llu (empty=%llu marker=%llu overflow=%llu)\n",
             g_frames_out, g_resyncs, g_resync_empty, g_resync_marker, g_resync_overflow);
     hd60s_audio_dump_stats(stderr);
@@ -1400,5 +1116,5 @@ capture_cleanup:
     libusb_release_interface(h, 0);
     libusb_close(h);
     libusb_exit(NULL);
-    return usb_session_fatal ? 2 : 0;
+    return hd60s_usb_fatal() ? 2 : 0;
 }
