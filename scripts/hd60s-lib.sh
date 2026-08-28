@@ -8,7 +8,7 @@ need_cmd() {
 }
 
 need_sudo() {
-    # sudo が使えて、パスワードキャッシュされてるか / 通せるか一応確認
+    # comprueba que sudo existe y que hay caché de contraseña (o se puede autenticar)
     command -v sudo >/dev/null 2>&1 || die "hace falta sudo"
     sudo -n true 2>/dev/null || {
         say "sudo va a pedir contraseña (mejor adelantarlo):"
@@ -67,7 +67,7 @@ kill_capture() {
     sudo pkill -9 -x iso_capture 2>/dev/null || true
 }
 
-# 動作準備一括
+# preparación de runtime de una vez
 prep() {
     ensure_iso_capture
     ensure_hd60s_device
