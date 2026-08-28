@@ -24,10 +24,10 @@ int hd60s_v4l2_open(const char* devpath) {
     // OBS has not opened the consumer side yet.
     int fd = open(devpath, O_WRONLY | O_NONBLOCK);
     if (fd < 0) { perror("open v4l2loopback"); g_v4l_fd = -1; return -1; }
-    // 🔥 2026-07-11 Opus 4.8 診断: write() only では v4l2loopback の timestamp state
-    // machine が初期化されず、consumer側でフレーム表示が止まる (VLC "Timestamp conversion
-    // failed", ffplay fd=0, mpv hang などの症状)。VIDIOC_S_FMT + STREAMON を明示して
-    // OUTPUT ストリームを"公式に開始"する。
+    // 🔥 2026-07-11 diagnóstico Opus 4.8: con solo write() la máquina de estado de timestamp
+    // de v4l2loopback no se inicializa y el consumer deja de mostrar frames (síntomas: VLC "Timestamp conversion
+    // failed", ffplay fd=0, hang de mpv, etc.). Hay que hacer VIDIOC_S_FMT + STREAMON explícitos para
+    // "arrancar oficialmente" el stream OUTPUT.
     struct v4l2_format vf; memset(&vf, 0, sizeof(vf));
     vf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     vf.fmt.pix.width = 1920;
