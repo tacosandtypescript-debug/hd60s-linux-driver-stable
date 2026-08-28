@@ -1,5 +1,5 @@
 #!/bin/bash
-# HD60S ラッパースクリプト
+# envoltorio HD60S
 set -e
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 if [ -x "$SCRIPT_DIR/iso_capture" ]; then
@@ -28,16 +28,16 @@ case "$CMD" in
     tmux kill-session -t hd60s 2>/dev/null || true
     kill_capture
     HERE="$PWD"
-    # Wayland env: tmux が session に env を継承しない場合があるので明示的に発掘
+    # Wayland: tmux a veces no hereda el env de la sesión, así que lo fijamos
     : "${WAYLAND_DISPLAY:=wayland-0}"
     : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
     tmux new-session -d -s hd60s -x 220 -y 55 \
         -e "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" -e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
-    # ペイン1 (上): iso_capture — Ctrl+C まで無限実行 (argv[1]=0 で 100年扱い)
-    # 音声は snd-aloop の hw:10,0 → hw:10,1 経由で hd60s_capture に公開される
+    # panel 1 (arriba): iso_capture — corre sin límite hasta Ctrl+C (argv[1]=0 ≈ 100 años)
+    # el audio sale por snd-aloop hw:10,0 → hw:10,1 hacia hd60s_capture
     tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 \"$SCRIPT_DIR\"/run-hd60s-obs.sh" Enter
-    # ペイン2 (下): mpv 映像プレビュー - 13秒後起動 (HD60S_NO_MPV=1 で抑制)
-    # OBS 使うなら mpv は不要 → プレビューが要らないなら NO_MPV=1 で起動しない
+    # panel 2 (abajo): vista previa mpv — arranca a los 13s (HD60S_NO_MPV=1 lo desactiva)
+    # si usas OBS, mpv no hace falta; sin preview: HD60S_NO_MPV=1
     if [ -z "${HD60S_NO_MPV:-}" ]; then
         tmux split-window -v -t hd60s
         tmux send-keys -t hd60s "sleep 13 && mpv --vo=wlshm --untimed --profile=low-latency --no-audio --demuxer-lavf-o=input_format=yuyv422,video_size=1920x1080 av://v4l2:$VDEV" Enter
@@ -162,7 +162,7 @@ case "$CMD" in
     ;;
 
   audio-v2)
-    # IT6802 正しい reg (0x7D 系) で音声 unmute リトライ
+    # unmute de audio IT6802 con el reg correcto (serie 0x7D)
     SEC="${SEC:-30}"
     prep
     say "prueba unmute V2 ${SEC}s: IT6802 REG_RX_HWMuteCtrl=0x7D"
@@ -170,7 +170,7 @@ case "$CMD" in
     ;;
 
   audio-win)
-    # Windows Elgato pcap から抽出した audio init コマンドを merge した init 使う
+    # usa el init que mezcla comandos de audio sacados del pcap de Windows Elgato
     SEC="${SEC:-15}"
     prep
     say "prueba audio init de Windows ${SEC}s: analysis/init-p2-audio-fast.tsv"
