@@ -577,9 +577,9 @@ static int g_pw_started = 0;
 // Consumer: pipewire process コールバック (別スレッド)。
 // 🔥 kusq テストで判明: 683ms は大きすぎて古い音蓄積 → 遅延。
 // 4096 samples @ 96kHz = 43ms に削減、さらに満杯で古いのから破棄 (最新優先)。
-#define PW_RING_SIZE 4096
+#define PW_RING_SIZE 16384
 // PW スレッドが「読み残し」しないように、目標水位 = 1 quantum 分 (128 samples ~1.3ms).
-#define PW_TARGET_FILL 256
+#define PW_TARGET_FILL 1024
 // 2026-07-18 lock-free SPSC ring: producer は head のみ更新、consumer は tail のみ更新。
 // pthread_mutex 撤廃で priority inversion (RT thread が producer の mutex を待つ) を根絶。
 // release/acquire ordering で書いた samples が cross-thread に可視化されることを保証。
