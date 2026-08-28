@@ -214,6 +214,7 @@ static unsigned long long g_diag_partial = 0, g_diag_resets = 0;
 static unsigned long long g_diag_writes = 0, g_diag_write_fail = 0;
 static unsigned long long g_diag_discarded = 0;
 static unsigned long long g_diag_paced_new = 0, g_diag_paced_repeat = 0;
+static unsigned long long g_diag_paced_wait = 0;
 static unsigned long long g_diag_pace_queue_drops = 0;
 static unsigned long long g_diag_interval_n = 0, g_diag_latency_n = 0, g_diag_write_dur_n = 0;
 static unsigned long long g_diag_markers = 0, g_diag_q_bad = 0;
@@ -234,7 +235,7 @@ static void diag_report_if_due(void) {
     fprintf(stderr,
             "[cadence] %.3fs BLK=%llu complete=%llu partial=%llu resets=%llu discarded=%llu "
             "v4l_write=%llu fail=%llu fps_complete=%.3f fps_write=%.3f "
-            "paced_new=%llu paced_repeat=%llu queue_drop=%llu "
+            "paced_new=%llu paced_repeat=%llu paced_wait=%llu queue_drop=%llu "
             "write_dt_us[min/avg/max]=%llu/%.1f/%llu latency_us[min/avg/max]=%llu/%.1f/%llu "
             "write_call_us[min/avg/max]=%llu/%.1f/%llu markers[A/B]=%llu/%llu "
             "marker_q[min/max/bad]=%zu/%zu/%llu input_MBps=%.2f\n",
@@ -242,7 +243,8 @@ static void diag_report_if_due(void) {
             g_diag_discarded,
             g_diag_writes, g_diag_write_fail,
             g_diag_complete / sec, g_diag_writes / sec,
-            g_diag_paced_new, g_diag_paced_repeat, g_diag_pace_queue_drops,
+            g_diag_paced_new, g_diag_paced_repeat, g_diag_paced_wait,
+            g_diag_pace_queue_drops,
             g_diag_interval_n ? (unsigned long long)(g_diag_interval_min / 1000) : 0,
             g_diag_interval_n ? (double)(g_diag_interval_sum / g_diag_interval_n / 1000.0) : 0.0,
             g_diag_interval_n ? (unsigned long long)(g_diag_interval_max / 1000) : 0,
@@ -259,7 +261,7 @@ static void diag_report_if_due(void) {
     g_diag_blk = g_diag_complete = g_diag_partial = g_diag_resets = 0;
     g_diag_writes = g_diag_write_fail = 0;
     g_diag_discarded = 0;
-    g_diag_paced_new = g_diag_paced_repeat = 0;
+    g_diag_paced_new = g_diag_paced_repeat = g_diag_paced_wait = 0;
     g_diag_pace_queue_drops = 0;
     g_diag_interval_n = g_diag_latency_n = g_diag_write_dur_n = 0;
     g_diag_markers = g_diag_q_bad = 0;
@@ -1344,19 +1346,21 @@ static void emit_frame(void) {
 }
 
 static void pace_output_if_due(void) {
-    if (!g_pace_output || g_v4l_fd < 0 ||
-        (g_pace_queue_count == 0 && !g_pace_have_frame)) return;
+    if (!g_pace_output || g_v4l_fd < 0) return;
+    if (g_pace_queue_count == 0) {
+        // Never publish the previous frame a second time.  A small source /
+        // pacing-clock drift can temporarily empty the queue even though the
+        // capture is healthy; waiting for the next complete frame preserves
+        // frame identity and lets the consumer hold its last image naturally.
+        if (g_pace_have_frame && g_diag) g_diag_paced_wait++;
+        return;
+    }
     const uint64_t period = 16666667ull; // 60 Hz
     uint64_t now = now_mono_ns();
     if (!g_pace_next_ns) g_pace_next_ns = now;
     if (now < g_pace_next_ns) return;
-    const uint8_t* frame = g_pace_frame;
-    unsigned long long frame_seq = g_pace_frame_seq;
-    int queued = g_pace_queue_count > 0;
-    if (queued) {
-        frame = g_pace_queue[g_pace_queue_tail];
-        frame_seq = g_pace_queue_seq[g_pace_queue_tail];
-    }
+    const uint8_t* frame = g_pace_queue[g_pace_queue_tail];
+    unsigned long long frame_seq = g_pace_queue_seq[g_pace_queue_tail];
     uint64_t write_start_ns = now;
     ssize_t w = write(g_v4l_fd, frame, FRAME_BYTES);
     uint64_t write_done_ns = now_mono_ns();
@@ -1378,13 +1382,11 @@ static void pace_output_if_due(void) {
                 g_diag_paced_new++;
         }
         g_pace_last_written_seq = frame_seq;
-        if (queued) {
-            memcpy(g_pace_frame, frame, FRAME_BYTES);
-            g_pace_frame_seq = frame_seq;
-            g_pace_have_frame = 1;
-            g_pace_queue_tail = (g_pace_queue_tail + 1) % PACE_QUEUE_DEPTH;
-            g_pace_queue_count--;
-        }
+        memcpy(g_pace_frame, frame, FRAME_BYTES);
+        g_pace_frame_seq = frame_seq;
+        g_pace_have_frame = 1;
+        g_pace_queue_tail = (g_pace_queue_tail + 1) % PACE_QUEUE_DEPTH;
+        g_pace_queue_count--;
         g_diag_writes++;
         if (g_diag_last_write_ns) {
             uint64_t dt = write_done_ns - g_diag_last_write_ns;
