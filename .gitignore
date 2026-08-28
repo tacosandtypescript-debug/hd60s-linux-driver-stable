@@ -1,4 +1,4 @@
-# Build artifacts (hd60s は shell script なので除外しない)
+# artefactos de build (hd60s es un script shell; no lo ignores)
 *.o
 *.obj
 *.a
@@ -12,7 +12,7 @@ probe_iso
 captures/
 !captures/proof/.gitkeep
 
-# Elgato reference materials (再配布不可 — 各自 Windows ドライバ install から抽出)
+# material de referencia Elgato (no redistribuir: cada quien lo extrae del instalador Windows)
 reference/*.dll
 reference/*.DLL
 reference/*.sys
@@ -21,7 +21,7 @@ reference/*.inf
 reference/*.INF
 !reference/it680x_regs.h
 
-# Elgato firmware (再配布不可)
+# firmware Elgato (no redistribuir)
 firmware/*.bin
 firmware/*.img
 firmware/*.fw
