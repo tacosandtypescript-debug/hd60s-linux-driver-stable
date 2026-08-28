@@ -1,7 +1,7 @@
 // HD60 S: 呪文再生 + iso(alt2) キャプチャ (libusb-1.0, C)
 // node-usb が iso 非対応なので C で実装。Windows と同じ iso 経路で EP0x83 から映像(生YUYV想定)を吸う。
 //
-// build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
+// build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c src/hd60s_pace.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
 // run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (映像は captures/stream-iso.bin へ)
 //
 // ======================================================================
@@ -48,6 +48,7 @@
 #include "hd60s_v4l2.h"
 #include "hd60s_audio.h"
 #include "hd60s_replay.h"
+#include "hd60s_pace.h"
 
 #define MAX_WRITE_BYTES (64LL << 20)  // 出力ファイルは先頭64MBまで(2Gbpsで肥大化防止)
 
@@ -167,88 +168,6 @@ static int g_blk_run = 0;                          // 連続BLKカウンタ
 // 32bitマーカーが行またぎで壊れないように、直前の3バイト+SEP繰越を保持する pending バッファ
 static uint8_t g_pend[16];
 static int g_pend_n = 0;
-
-static int g_pace_output = 0;
-static uint8_t g_pace_frame[FRAME_BYTES];
-#define PACE_QUEUE_DEPTH 4
-static uint8_t g_pace_queue[PACE_QUEUE_DEPTH][FRAME_BYTES];
-static unsigned long long g_pace_queue_seq[PACE_QUEUE_DEPTH];
-static unsigned int g_pace_queue_head = 0;
-static unsigned int g_pace_queue_tail = 0;
-static unsigned int g_pace_queue_count = 0;
-static int g_pace_have_frame = 0;
-static uint64_t g_pace_next_ns = 0;
-static unsigned long long g_v4l_write_seq = 0;
-static unsigned long long g_pace_frame_seq = 0;
-static unsigned long long g_pace_last_written_seq = 0;
-
-// Temporary cadence diagnostics.  These counters do not alter capture logic.
-static int g_diag = 0;
-static uint64_t g_diag_window_ns = 0, g_diag_frame_start_ns = 0;
-static uint64_t g_diag_last_write_ns = 0;
-static unsigned long long g_diag_blk = 0, g_diag_complete = 0;
-static unsigned long long g_diag_partial = 0, g_diag_resets = 0;
-static unsigned long long g_diag_writes = 0, g_diag_write_fail = 0;
-static unsigned long long g_diag_discarded = 0;
-static unsigned long long g_diag_paced_new = 0, g_diag_paced_repeat = 0;
-static unsigned long long g_diag_paced_wait = 0;
-static unsigned long long g_diag_pace_queue_drops = 0;
-static unsigned long long g_diag_interval_n = 0, g_diag_latency_n = 0, g_diag_write_dur_n = 0;
-static unsigned long long g_diag_markers = 0, g_diag_q_bad = 0;
-static unsigned long long g_diag_act = 0;
-static unsigned long long g_diag_input_bytes = 0;
-static size_t g_diag_q_min = SIZE_MAX, g_diag_q_max = 0;
-static uint64_t g_diag_interval_min = UINT64_MAX, g_diag_interval_max = 0;
-static uint64_t g_diag_latency_min = UINT64_MAX, g_diag_latency_max = 0;
-static uint64_t g_diag_write_dur_min = UINT64_MAX, g_diag_write_dur_max = 0;
-static long double g_diag_interval_sum = 0, g_diag_latency_sum = 0, g_diag_write_dur_sum = 0;
-
-static void diag_report_if_due(void) {
-    if (!g_diag) return;
-    uint64_t now = now_mono_ns();
-    if (!g_diag_window_ns) { g_diag_window_ns = now; return; }
-    if (now - g_diag_window_ns < 1000000000ull) return;
-    double sec = (double)(now - g_diag_window_ns) / 1e9;
-    fprintf(stderr,
-            "[cadence] %.3fs BLK=%llu complete=%llu partial=%llu resets=%llu discarded=%llu "
-            "v4l_write=%llu fail=%llu fps_complete=%.3f fps_write=%.3f "
-            "paced_new=%llu paced_repeat=%llu paced_wait=%llu queue_drop=%llu "
-            "write_dt_us[min/avg/max]=%llu/%.1f/%llu latency_us[min/avg/max]=%llu/%.1f/%llu "
-            "write_call_us[min/avg/max]=%llu/%.1f/%llu markers[A/B]=%llu/%llu "
-            "marker_q[min/max/bad]=%zu/%zu/%llu input_MBps=%.2f\n",
-            sec, g_diag_blk, g_diag_complete, g_diag_partial, g_diag_resets,
-            g_diag_discarded,
-            g_diag_writes, g_diag_write_fail,
-            g_diag_complete / sec, g_diag_writes / sec,
-            g_diag_paced_new, g_diag_paced_repeat, g_diag_paced_wait,
-            g_diag_pace_queue_drops,
-            g_diag_interval_n ? (unsigned long long)(g_diag_interval_min / 1000) : 0,
-            g_diag_interval_n ? (double)(g_diag_interval_sum / g_diag_interval_n / 1000.0) : 0.0,
-            g_diag_interval_n ? (unsigned long long)(g_diag_interval_max / 1000) : 0,
-            g_diag_latency_n ? (unsigned long long)(g_diag_latency_min / 1000) : 0,
-            g_diag_latency_n ? (double)(g_diag_latency_sum / g_diag_latency_n / 1000.0) : 0.0,
-            g_diag_latency_n ? (unsigned long long)(g_diag_latency_max / 1000) : 0,
-            g_diag_write_dur_n ? (unsigned long long)(g_diag_write_dur_min / 1000) : 0,
-            g_diag_write_dur_n ? (double)(g_diag_write_dur_sum / g_diag_write_dur_n / 1000.0) : 0.0,
-            g_diag_write_dur_n ? (unsigned long long)(g_diag_write_dur_max / 1000) : 0,
-            g_diag_act, g_diag_blk, g_diag_markers ? g_diag_q_min : 0,
-            g_diag_markers ? g_diag_q_max : 0, g_diag_q_bad,
-            (double)g_diag_input_bytes / sec / 1000000.0);
-    g_diag_window_ns = now;
-    g_diag_blk = g_diag_complete = g_diag_partial = g_diag_resets = 0;
-    g_diag_writes = g_diag_write_fail = 0;
-    g_diag_discarded = 0;
-    g_diag_paced_new = g_diag_paced_repeat = g_diag_paced_wait = 0;
-    g_diag_pace_queue_drops = 0;
-    g_diag_interval_n = g_diag_latency_n = g_diag_write_dur_n = 0;
-    g_diag_markers = g_diag_q_bad = 0;
-    g_diag_act = 0;
-    g_diag_input_bytes = 0;
-    g_diag_q_min = SIZE_MAX; g_diag_q_max = 0;
-    g_diag_interval_min = g_diag_latency_min = UINT64_MAX;
-    g_diag_interval_max = g_diag_latency_max = 0;
-    g_diag_interval_sum = g_diag_latency_sum = g_diag_write_dur_sum = 0;
-}
 
 static unsigned long long g_frames_out = 0;
 static unsigned long long g_resyncs = 0;
@@ -543,20 +462,7 @@ static void emit_frame(void) {
                 (double)sum / (FRAME_BYTES / 4096));
     }
     if (hd60s_v4l2_is_open() && g_pace_output) {
-        // Presentation is paced by the main loop at 60 Hz.  Queue complete
-        // frames in order so normal USB/parser jitter does not repeat the
-        // previous frame at a pacing tick.  If the queue is full, discard
-        // the oldest queued frame to keep latency bounded and prefer fresh
-        // content.
-        if (g_pace_queue_count == PACE_QUEUE_DEPTH) {
-            g_pace_queue_tail = (g_pace_queue_tail + 1) % PACE_QUEUE_DEPTH;
-            g_pace_queue_count--;
-            if (g_diag) g_diag_pace_queue_drops++;
-        }
-        memcpy(g_pace_queue[g_pace_queue_head], g_framebuf, FRAME_BYTES);
-        g_pace_queue_seq[g_pace_queue_head] = g_frames_out + 1;
-        g_pace_queue_head = (g_pace_queue_head + 1) % PACE_QUEUE_DEPTH;
-        g_pace_queue_count++;
+        hd60s_pace_push_frame(g_framebuf, g_frames_out + 1);
     } else if (hd60s_v4l2_is_open()) {
         uint64_t write_start_ns = now_mono_ns();
         ssize_t w = hd60s_v4l2_write_frame(g_framebuf, FRAME_BYTES);
@@ -603,64 +509,7 @@ static void emit_frame(void) {
     if (!verbose_checked) { verbose = getenv("HD60S_VERBOSE") ? 1 : 0; verbose_checked = 1; }
     unsigned long long interval = verbose ? 60 : 300;
     if ((g_frames_out % interval) == 0) fprintf(stderr, "[emit] %llu frames\n", g_frames_out);
-    diag_report_if_due();
-}
-
-static void pace_output_if_due(void) {
-    if (!g_pace_output || !hd60s_v4l2_is_open()) return;
-    if (g_pace_queue_count == 0) {
-        // Never publish the previous frame a second time.  A small source /
-        // pacing-clock drift can temporarily empty the queue even though the
-        // capture is healthy; waiting for the next complete frame preserves
-        // frame identity and lets the consumer hold its last image naturally.
-        if (g_pace_have_frame && g_diag) g_diag_paced_wait++;
-        return;
-    }
-    const uint64_t period = 16666667ull; // 60 Hz
-    uint64_t now = now_mono_ns();
-    if (!g_pace_next_ns) g_pace_next_ns = now;
-    if (now < g_pace_next_ns) return;
-    const uint8_t* frame = g_pace_queue[g_pace_queue_tail];
-    unsigned long long frame_seq = g_pace_queue_seq[g_pace_queue_tail];
-    uint64_t write_start_ns = now;
-    ssize_t w = hd60s_v4l2_write_frame(frame, FRAME_BYTES);
-    uint64_t write_done_ns = now_mono_ns();
-    fprintf(stderr, "[v4l-write] seq=%llu mode=paced bytes=%zd expected=%zu %s\n",
-            ++g_v4l_write_seq, w, (size_t)FRAME_BYTES,
-            w == FRAME_BYTES ? "OK" : "ANOMALY");
-    if (g_diag) {
-        uint64_t dur = write_done_ns - write_start_ns;
-        g_diag_write_dur_n++;
-        g_diag_write_dur_sum += dur;
-        if (dur < g_diag_write_dur_min) g_diag_write_dur_min = dur;
-        if (dur > g_diag_write_dur_max) g_diag_write_dur_max = dur;
-    }
-    if (w == FRAME_BYTES) {
-        if (g_diag) {
-            if (frame_seq == g_pace_last_written_seq)
-                g_diag_paced_repeat++;
-            else
-                g_diag_paced_new++;
-        }
-        g_pace_last_written_seq = frame_seq;
-        memcpy(g_pace_frame, frame, FRAME_BYTES);
-        g_pace_frame_seq = frame_seq;
-        g_pace_have_frame = 1;
-        g_pace_queue_tail = (g_pace_queue_tail + 1) % PACE_QUEUE_DEPTH;
-        g_pace_queue_count--;
-        g_diag_writes++;
-        if (g_diag_last_write_ns) {
-            uint64_t dt = write_done_ns - g_diag_last_write_ns;
-            g_diag_interval_n++; g_diag_interval_sum += dt;
-            if (dt < g_diag_interval_min) g_diag_interval_min = dt;
-            if (dt > g_diag_interval_max) g_diag_interval_max = dt;
-        }
-        g_diag_last_write_ns = write_done_ns;
-    } else {
-        g_diag_write_fail++;
-    }
-    do { g_pace_next_ns += period; } while (g_pace_next_ns <= write_done_ns);
-    diag_report_if_due();
+    hd60s_diag_report_if_due();
 }
 
 // HD60 S 0fd9:005e line assembler.  Unlike the older 0074 stream, this
@@ -928,7 +777,7 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
         if (consume > g_dyn_n) break;
         memmove(g_dyn_buf, g_dyn_buf + consume, g_dyn_n - consume);
         g_dyn_n -= consume;
-        diag_report_if_due();
+        hd60s_diag_report_if_due();
     }
 }
 
@@ -1298,10 +1147,10 @@ static void cleanup_iso_transfers(libusb_device_handle* h,
 // TODO: パススルー (HDMI ループスルー) の恒久有効化と、それを維持したまま
 // キャプチャする経路の両立が未解決。現状は pt-only モードで一時的に維持のみ。
 int main(int argc, char** argv) {
-    g_diag = getenv("HD60S_CADENCE_DIAG") ? 1 : 0;
+    hd60s_diag_set(getenv("HD60S_CADENCE_DIAG") ? 1 : 0);
     const char *pace_env = getenv("HD60S_PACE_OUTPUT");
-    g_pace_output = pace_env && pace_env[0] && pace_env[0] != '0' &&
-                    pace_env[0] != 'n' && pace_env[0] != 'N';
+    hd60s_pace_configure(pace_env && pace_env[0] && pace_env[0] != '0' &&
+                    pace_env[0] != 'n' && pace_env[0] != 'N');
     if (g_diag) fprintf(stderr, "[cadence] diagnostics enabled (no capture parameters changed)\n");
     if (g_pace_output) fprintf(stderr, "[cadence] V4L2 output pacing enabled at 60 Hz\n");
     // stderr を無バッファに (SCHED_FIFO でリアルタイム優先度にすると
@@ -2305,7 +2154,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[iso] event handling failed rc=%d (%s)\\n",
                 event_rc, libusb_error_name(event_rc));
     }
-        pace_output_if_due();
+        hd60s_pace_output_if_due();
     }
     if (g_stop_requested) {
         keep_running = 0;
