@@ -20,7 +20,7 @@
 `./hd60s live` 一発で:
 
 - ✅ **1080p60 YUYV 映像キャプチャ** → `/dev/video42` (v4l2loopback) → OBS Studio / mpv / ffmpeg などから利用
-- ✅ **96kHz mono 音声出力** (SEP 24-bit stereo slots → L/R downmix + bridge resample) → `snd-aloop` playback `hw:10,0` / capture `hw:10,1` → PipeWire source `hd60s_capture` → OBS
+- ✅ **96kHz mono 音声出力** (SEP の 2 stereo `S16_LE` frames `L0,R0,L1,R1` → L/R downmix + bridge resample) → `snd-aloop` playback `hw:10,0` / capture `hw:10,1` → PipeWire source `hd60s_capture` → OBS
 - ✅ **音声ソース自動公開** → supervisor が `module-alsa-source` を重複なくロードし、OBS から選択可能
 - ✅ **HDMI パススルー** (HD60 S HDMI OUT → TV) を並行して 低遅延で維持 (ゲームプレイに使える)
 - ✅ **iso capture と パススルー 同時動作** (Windows Elgato Game Capture ソフトと同じ運用パターンが可能)
@@ -215,7 +215,7 @@ HD60 S は 5 チップ構成: **Cypress FX3** (USB3 SuperSpeed) + **Nuvoton M031
 ### 音声フォーマット
 - SEP marker (`ff 00 ff 02`) + 8 バイト payload
 - 8B payload = **2 stereo int16 LE frames** interleaved as `L0,R0,L1,R1`
-- Payload = **signed 24-bit PCM in two little-endian 32-bit slots** (L/R); the bridge downmixes and exposes mono at 96 kHz
+- Payload = **four signed 16-bit little-endian samples** (`L0,R0,L1,R1`); the bridge downmixes both frames and exposes mono at 96 kHz
 
 ### 音声 100ms cutoff の解決 (FIX_ID_023)
 IT6802 の audio state machine が HDMI audio channel status を誤検出 → 100ms 前後で HW mute。ITE 公式 SDK の `AudioFsCal()` + `aud_fiforst()` + Force FS 48kHz recovery loop を 100ms 周期で発射することで解消。
