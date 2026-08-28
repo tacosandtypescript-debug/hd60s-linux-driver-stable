@@ -1,7 +1,7 @@
-// stream-iso.bin(生キャプチャ)からSEPペイロード(8B)を抜き出して、
-// ・出現数を数える
-// ・ペイロードだけをファイルに書き出す(音声候補)
-// ラインパースは offline_parser.c と同じロジック。
+// extrae el payload SEP (8B) de stream-iso.bin (captura cruda) y
+// - cuenta apariciones
+// - escribe solo el payload a fichero (candidato de audio)
+// el parse de líneas es la misma lógica que offline_parser.c.
 //   build: gcc -O2 audio_extract.c -o audio_extract
 //   run  : ./audio_extract captures/stream-iso.bin sep.raw [duration_sec_of_capture]
 #include <stdio.h>

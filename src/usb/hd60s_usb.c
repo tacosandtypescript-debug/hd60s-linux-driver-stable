@@ -94,8 +94,8 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     static unsigned long callback_count = 0;
     unsigned long long trace_cb_no = 0;
     if (g_trace_enabled) trace_cb_no = ++g_trace_callback_no;
-    // HEX DUMP HOOK: HD60S_HEXDUMP=1 で iso packet の先頭 32B を最初 500 個 dump
-    // 音声パケットと映像パケットを見分けるため (workflow suggestion 2026-07-11)
+    // HEX DUMP HOOK: HD60S_HEXDUMP=1 vuelca los primeros 32B de los primeros 500 iso packet
+    // para distinguir paquetes de audio y de vídeo (workflow suggestion 2026-07-11)
     static const char* env_hexdump = NULL;
     static int hexdump_check = 0;
     static int hexdump_count = 0;
@@ -123,18 +123,18 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
                     fprintf(stderr, "\n");
                     hexdump_count++;
                 }
-                // parser にライブ供給 (v4l2loopback へ流す)
+                // alimentación en vivo al parser (hacia v4l2loopback)
                 hd60s_parser_feed(buf, d->actual_length);
-                // 検証用: 先頭512MBだけ生ストリームを保存 (音声解析用に増量)
+                // para verificación: solo se guarda el stream crudo de los primeros 512MB (aumentado para análisis de audio)
                 if (s->total_bytes < (512LL << 20) && s->outf) fwrite(buf, 1, d->actual_length, s->outf);
                 s->total_bytes += d->actual_length;
                 if (g_diag) g_diag_input_bytes += d->actual_length;
                 s->pkt_ok++;
                 hd60s_parser_trace_end();
             } else {
-                // iso 0-length pkt はブランキングによる正常な休止と考え、
-                // 進行中のライン位置には触れない (実測で empty時にg_lpos リセットすると
-                // 逆に marker resync が増える → 触らないのが正解)。
+                // un iso pkt de 0-length se considera pausa normal de blanking;
+                // no se toca la posición de línea en curso (medido: resetear g_lpos en empty
+                // aumenta el marker resync → lo correcto es no tocarlo).
                 s->pkt_empty++;
                 hd60s_parser_trace_end();
             }
@@ -255,8 +255,8 @@ int hd60s_usb_start_iso(libusb_device_handle *h, int pkt_size, int n_pkts) {
         return -1;
     }
     for (int i = 0; i < NUM_TRANSFERS; i++) {
-        // Zerocopy DMA バッファ (usbfs mmap経由) → CPU 使用率↓、tail latency↓。
-        // 失敗時は malloc にフォールバック (小型ホストで KMS が確保できない場合)。
+        // buffer DMA zerocopy (vía usbfs mmap) → CPU↓, tail latency↓.
+        // si falla, fallback a malloc (hosts pequeños donde KMS no puede reservar).
         s->bufs[i] = libusb_dev_mem_alloc(h, (int)s->buffer_bytes);
         if (s->bufs[i]) s->devmem[i] = 1;
         if (!s->bufs[i]) s->bufs[i] = malloc(s->buffer_bytes);
@@ -273,7 +273,7 @@ int hd60s_usb_start_iso(libusb_device_handle *h, int pkt_size, int n_pkts) {
             fprintf(stderr, "[iso] transfer allocation failed at transfer %d\n", i);
             break;
         }
-        // timeout=0 = 無限。連続isoで有限timeoutはURBキャンセルで in-flight packet 全て empty化する罠
+        // timeout=0 = infinito. Con iso continuo un timeout finito cancela URB y vacía todos los in-flight packet: trampa
         libusb_fill_iso_transfer(s->xfrs[i], h, EP_STREAM, s->bufs[i],
             (int)s->buffer_bytes, n_pkts, iso_cb, s, 0);
         libusb_set_iso_packet_lengths(s->xfrs[i], pkt_size);

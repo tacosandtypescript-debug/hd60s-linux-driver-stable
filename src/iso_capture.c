@@ -1,22 +1,22 @@
-// HD60 S: 呪文再生 + iso(alt2) キャプチャ (libusb-1.0, C)
-// node-usb が iso 非対応なので C で実装。Windows と同じ iso 経路で EP0x83 から映像(生YUYV想定)を吸う。
+// HD60 S: replay de hechizo + captura iso(alt2) (libusb-1.0, C)
+// node-usb no soporta iso, así que está en C. Misma ruta iso que Windows: chupa vídeo (YUYV crudo) de EP0x83.
 //
 // build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c src/hd60s_pace.c src/hd60s_parser.c src/hd60s_usb.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
-// run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (映像は captures/stream-iso.bin へ)
+// run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (el vídeo va a captures/stream-iso.bin)
 //
 // ======================================================================
-// TODO (未解決の残作業):
-//   - MCU 経由の音声パス確立: 現状 SEP payload 8B から音声を抜いているが、
-//     ソースによっては無音のまま。IT6802E/IT66121 の unmute 手順 (HD60S_UNMUTE)
-//     と 0x509c MCU コマンドの組み合わせが未確定。
-//   - パススルー (HDMI OUT へのループスルー): pt-only モードで一時的に
-//     出力するが、IT66121 の AV_MUTE/SW_RST/AFE の恒久的解放シーケンスが
-//     ホスト側/MCU側どちらの責務か未特定。keepalive-cycle を回避する形の
-//     "投げっぱなし" 経路を探索中。
+// TODO (trabajo pendiente):
+//   - Ruta de audio vía MCU: ahora se extrae audio del SEP payload 8B, pero
+//     según la fuente sigue en silencio. La secuencia unmute de IT6802E/IT66121 (HD60S_UNMUTE)
+//     y su combinación con comandos MCU 0x509c aún no está fijada.
+//   - Passthrough (loop-through a HDMI OUT): en modo pt-only se mantiene
+//     de forma temporal, pero la secuencia permanente de liberación AV_MUTE/SW_RST/AFE de IT66121
+//     no está claro si es responsabilidad del host o del MCU. Se busca una ruta
+//     "fire-and-forget" que evite el keepalive-cycle.
 // ======================================================================
 //
 // ======================================================================
-// SECTION 0: ヘッダ / 定数 / グローバル状態
+// SECTION 0: cabeceras / constantes / estado global
 // ======================================================================
 #include <libusb-1.0/libusb.h>
 #include <stdio.h>
@@ -52,13 +52,13 @@
 #include "hd60s_parser.h"
 #include "hd60s_usb.h"
 
-#define MAX_WRITE_BYTES (64LL << 20)  // 出力ファイルは先頭64MBまで(2Gbpsで肥大化防止)
+#define MAX_WRITE_BYTES (64LL << 20)  // el fichero de salida se corta a 64MB (evitar hinchazón a 2Gbps)
 
 // ======================================================================
-// SECTION 4: main (デバイス open → 呪文再生 → iso キャプチャ → 統計出力)
+// SECTION 4: main (open del dispositivo → replay de hechizo → captura iso → estadísticas)
 // ======================================================================
-// TODO: パススルー (HDMI ループスルー) の恒久有効化と、それを維持したまま
-// キャプチャする経路の両立が未解決。現状は pt-only モードで一時的に維持のみ。
+// TODO: activar passthrough (HDMI loop-through) de forma permanente y, a la vez,
+// capturar. Aún no resuelto; hoy pt-only solo lo mantiene un rato.
 int main(int argc, char** argv) {
     hd60s_diag_set(getenv("HD60S_CADENCE_DIAG") ? 1 : 0);
     const char *pace_env = getenv("HD60S_PACE_OUTPUT");
@@ -66,15 +66,15 @@ int main(int argc, char** argv) {
                     pace_env[0] != 'n' && pace_env[0] != 'N');
     if (g_diag) fprintf(stderr, "[cadence] diagnostics enabled (no capture parameters changed)\n");
     if (g_pace_output) fprintf(stderr, "[cadence] V4L2 output pacing enabled at 60 Hz\n");
-    // stderr を無バッファに (SCHED_FIFO でリアルタイム優先度にすると
-    // ブロックバッファになってログが即表示されない問題の対策)
+    // stderr sin buffer (con prioridad RT SCHED_FIFO el buffer por bloques
+    // retrasa los logs; esto lo evita)
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     hd60s_parser_trace_init();
     install_signal_handlers();
     int read_sec = argc > 1 ? atoi(argv[1]) : 6;
-    // 秒数 0 or 負数を「実用上無限 (~68 年)」に扱う
-    // 注: 100 年 = 3,153,600,000 は int overflow なので INT_MAX-3600 で安全
+    // 0 o negativo se trata como «infinito práctico» (~68 años)
+    // nota: 100 años = 3,153,600,000 desborda int; INT_MAX-3600 es seguro
     if (read_sec <= 0) read_sec = 2147480047;  // INT_MAX - 3600, ~68 years
     // The default is Alt2, confirmed from the device descriptor as
     // bMaxBurst=15, Mult=1, with 32768 bytes per service interval.
@@ -93,15 +93,15 @@ int main(int argc, char** argv) {
     if (packets_env && *packets_env) iso_packets = atoi(packets_env);
     if (iso_packets < 1) iso_packets = 1;
     fprintf(stderr, "[iso] requested packet length=%d\n", iso_pkt_size);
-    // 5番目の引数が "pt" ならパススルー専用モード（iso張らず、9a burstだけ撃って維持）
+    // si el 5º arg es "pt": modo solo passthrough (sin iso; solo dispara burst 9a y mantiene)
     int passthrough_only = (argc > 5 && strcmp(argv[5], "pt") == 0);
-    // ラベルは 5番目 (pt モードでは 6番目)
+    // la etiqueta es el 5º (en modo pt, el 6º)
     if (passthrough_only && argc > 6) argv[4] = argv[6];
 
-    // 2026-07-10 SCHED_FIFO を撤去: カクツキ改善効果が実測ゼロだった一方、
-    // このプロセスがCPUを独占しlibusbの内部処理(別スレッド/カーネルワーカー)が
-    // スケジューリングされず replay_spell が "open/claim OK" 以降ハングする
-    // 重大な副作用が判明(再現確認済み, CPU 0%で停止)。mlockallのみ残す(害なし)。
+    // 2026-07-10 se retira SCHED_FIFO: mejora de stutter medida = cero, y además
+    // este proceso monopoliza la CPU y el trabajo interno de libusb (otro hilo/worker del kernel)
+    // no se agenda: replay_spell se cuelga tras "open/claim OK"
+    // efecto grave confirmado (reproducido; CPU 0% y parado). Se deja solo mlockall (sin daño).
     if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0) fprintf(stderr, "[main] mlockall 失敗: %s(続行)\n", strerror(errno));
 
     int libusb_rc = libusb_init(NULL);
@@ -117,15 +117,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     libusb_set_auto_detach_kernel_driver(h, 1);
-    // 2026-07-10 デバイス強制リセット: 前回異常終了後や物理抜き差し後にI2Cバスがロックしたり
-    // 内部状態が乱れる問題への対策 (実測: reset無しだと 9d:0x12 が0x9d返しで100%空パケット)
-    // HD60S_NO_RESET=1 で skip (passthrough 状態を壊したくない時用)
+    // 2026-07-10 reset forzado del dispositivo: tras un crash o un unplug el bus I2C se bloquea
+    // o el estado interno se corrompe (medido: sin reset, 9d:0x12 devuelve 0x9d y 100% paquetes vacíos)
+    // HD60S_NO_RESET=1 para saltarlo (cuando no se quiere romper el passthrough)
     const char* env_no_reset = getenv("HD60S_NO_RESET");
     int no_reset = (env_no_reset && env_no_reset[0] && env_no_reset[0] != '0' && env_no_reset[0] != 'n' && env_no_reset[0] != 'N');
     int rst = no_reset ? 0 : libusb_reset_device(h);
     if (no_reset) fprintf(stderr, "[main] reset 省略 (HD60S_NO_RESET)\n");
     if (rst == LIBUSB_ERROR_NOT_FOUND) {
-        // reset後にデバイスIDが変わることがある→再オープン
+        // tras el reset el ID del dispositivo a veces cambia → reabrir
         fprintf(stderr, "[main] reset後デバイス再列挙、再オープン中...\n");
         libusb_close(h);
         int retry = 0;
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
                 iso_pkt_size, iso_packets);
     }
 
-    // 差分観測ログ: 5番目の引数をラベルに captures/reads-<label>.tsv へ全IN読みを記録
+    // log de observación de diffs: el 5º arg es etiqueta; todos los IN van a captures/reads-<label>.tsv
     const char* label = argc > 4 ? argv[4] : NULL;
     if (label) {
         char lp[256]; snprintf(lp, sizeof(lp), "captures/reads-%s.tsv", label);
@@ -214,12 +214,12 @@ int main(int argc, char** argv) {
         if (g_rdlog) { fprintf(g_rdlog, "idx\twValue\tsetupOUT\tresponse\n"); fprintf(stderr, "[main] 読みログ: %s\n", lp); }
     }
 
-    // HD60S_SKIP_INIT=1 で init 呪文 replay + burst を丸ごとスキップ
-    // (HD60S が既に別セッションで init 済みなら、我々が触ると passthrough が壊れる仮説)
+    // HD60S_SKIP_INIT=1 omite por completo el replay del hechizo init + burst
+    // (hipótesis: si HD60S ya está init en otra sesión, tocarlo rompe el passthrough)
     const char* env_skip_init = getenv("HD60S_SKIP_INIT");
     int skip_init = (env_skip_init && env_skip_init[0] && env_skip_init[0] != '0' && env_skip_init[0] != 'n' && env_skip_init[0] != 'N');
     if (!skip_init) {
-        // 環境変数 HD60S_INIT_TSV で init TSV path を切り替え可能
+        // la env HD60S_INIT_TSV permite cambiar el path del TSV de init
         const char* init_tsv = getenv("HD60S_INIT_TSV");
         if (!init_tsv || !*init_tsv) init_tsv = "analysis/init-p2-audio-fast.tsv";
         fprintf(stderr, "[main] init: %s\n", init_tsv);
@@ -229,8 +229,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[main] HD60S_SKIP_INIT=1: init replay 省略\n");
     }
 
-    // HDMI受信の信号ロックを"実際に見て"待つ(2026-07-09特定: 9d:0x12 bit0x80)。
-    // 引数3が負数なら旧来の固定秒数待ちにフォールバック(比較用)。
+    // espera el lock de señal HDMI «mirándolo de verdad» (2026-07-09: 9d:0x12 bit0x80).
+    // si el arg 3 es negativo, fallback a la espera fija de siempre (para comparar).
     int lock_wait = argc > 3 ? atoi(argv[3]) : 4;
     if (lock_wait < 0) {
         int fixed = -lock_wait;
@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, locked ? "[main] ロック検出！\n" : "[main] タイムアウト(未ロックのまま続行)\n");
     }
 
-    // 診断(rank2): 入力タイミングレジスタを読み解像度確認(9d bank)。期待=1920x1080@60。
+    // diagnóstico (rank2): lee registros de timing de entrada y comprueba resolución (bank 9d). Esperado=1920x1080@60.
     {
         struct { const char* name; unsigned char hi, lo; } regs[] = {
             {"HActive", 0x29, 0x28}, {"HTotal", 0x6b, 0x6a}, {"VTotal", 0x5c, 0x5b},
@@ -259,10 +259,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // パススルー専用モード: iso は張らず、poststream-full の全書込を pcap タイミング通りに撃つ。
-    // 6番目引数が "release" なら poststream-full 撃った後に「IT66121解放シーケンス」10コマンド追加。
-    // 解放シーケンス = pcap末尾に無い「AV_MUTE解除+SW_RST全解除+AFE fire+HDCP無効」の必須尾追い。
-    // (2026-07-09 深夜 IT66121公開ドライバ(mainline it66121.c / HDZero / fl2000_drm)調査で判明)
+    // modo solo passthrough: no abre iso; dispara todas las escrituras de poststream-full al timing del pcap.
+    // si el 6º arg es "release", tras poststream-full añade la «secuencia de liberación IT66121» (10 comandos).
+    // secuencia de liberación = cola obligatoria que no está al final del pcap: AV_MUTE off + SW_RST all-clear + AFE fire + HDCP off.
+    // (2026-07-09 de madrugada, hallado al mirar drivers públicos de IT66121: mainline it66121.c / HDZero / fl2000_drm)
     int do_release = (argc > 6 && strcmp(argv[6], "release") == 0);
     if (passthrough_only) {
         const char* pt_tsv = "analysis/poststream-full.tsv";
@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
         hd60s_load_burst(pt_tsv);
         hd60s_fire_burst(h);
 
-        // 診断: IT66121 の 0x0E SYS_STATUS を読む (HPD/VID_STABLE 確認)
+        // diagnóstico: lee 0x0E SYS_STATUS de IT66121 (HPD/VID_STABLE)
         {
             unsigned char setup[3] = {0x9b, 0x01, 0x0e};
             unsigned char val = 0;
@@ -284,19 +284,19 @@ int main(int argc, char** argv) {
                     val, !!(val & 0x40), !!(val & 0x10));
         }
 
-        // IT66121 解放シーケンス (2026-07-09 深夜, ITE公開ドライバ調査で判明)
-        // pcap末尾は AV_MUTE ON+SW_RST 残置で終わってた=Windowsは追加コマンドで解放してた
+        // secuencia de liberación IT66121 (2026-07-09 de madrugada, drivers públicos ITE)
+        // el pcap acaba con AV_MUTE ON+SW_RST aún puestos = Windows liberaba con comandos extra
         if (do_release) {
             fprintf(stderr, "[pt-only] IT66121 解放シーケンス発火 (AV_MUTE OFF, SW_RST 全解除, AFE fire, HDCP無効)\n");
             static const unsigned char release_seq[][3] = {
-                {0x9a, 0x0f, 0x00},  // bank 0 選択(保険)
-                {0x9a, 0x04, 0x00},  // SW_RST 全部解除 (VID/REF/AUD/AREF/HDCP)
+                {0x9a, 0x0f, 0x00},  // selecciona bank 0 (por si acaso)
+                {0x9a, 0x04, 0x00},  // SW_RST todo a 0 (VID/REF/AUD/AREF/HDCP)
                 {0x9a, 0x62, 0x18},  // AFE_XP: RESETB=1, ENO=1
                 {0x9a, 0x64, 0x94},  // AFE_IP: RESETB=1, GAINBIT=1, CKSEL_1 (>80MHz)
                 {0x9a, 0x68, 0x00},  // LOWCLK clear
-                {0x9a, 0x61, 0x00},  // AFE FIRE: RST=0 PWD=0 = TMDS 出力開始
-                {0x9a, 0x20, 0x00},  // HDCP CPDESIRED=0 = 認証不要
-                {0x9a, 0xc0, 0x01},  // HDMI モード (bit0=1)
+                {0x9a, 0x61, 0x00},  // AFE FIRE: RST=0 PWD=0 = arranca salida TMDS
+                {0x9a, 0x20, 0x00},  // HDCP CPDESIRED=0 = no hace falta autenticar
+                {0x9a, 0xc0, 0x01},  // modo HDMI (bit0=1)
                 {0x9a, 0xc1, 0x00},  // AV MUTE OFF
                 {0x9a, 0xc6, 0x03},  // Packet Gen ON + RPT
             };
@@ -308,7 +308,7 @@ int main(int argc, char** argv) {
                         release_seq[i][1], release_seq[i][2], r);
                 usleep(2000);
             }
-            // 再診断
+            // re-diagnóstico
             unsigned char setup2[3] = {0x9b, 0x01, 0x0e};
             unsigned char val2 = 0;
             libusb_control_transfer(h, 0x40, 192, 0x5066, 0, setup2, 3, 500);
@@ -325,8 +325,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // 点火バーストをロード(iso開始後に相対タイミングで発行)
-    // HD60S_SKIP_BURST=1 で poststream burst 丸ごとスキップ (passthrough 保護)
+    // carga el burst de ignición (se emite con timing relativo tras arrancar iso)
+    // HD60S_SKIP_BURST=1 omite todo el burst poststream (protege passthrough)
     const char* env_skip_burst = getenv("HD60S_SKIP_BURST");
     int skip_burst = skip_init || (env_skip_burst && env_skip_burst[0] && env_skip_burst[0] != '0' && env_skip_burst[0] != 'n' && env_skip_burst[0] != 'N');
     if (!skip_burst) {
@@ -337,9 +337,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[main] burst load 省略\n");
     }
 
-    // 🔥 PASSTHROUGH PRE-ISO ENABLE (2026-07-11 Fable + kusq webcam 実験)
-    // Windows pcap の enable trio 1 回目は **iso 開始 384ms 前** に発射される。
-    // つまり init TSV 完了後、alt=2 の前 = ここで発射する必要ある。常に有効。
+    // 🔥 PASSTHROUGH PRE-ISO ENABLE (2026-07-11 experimento Fable + kusq webcam)
+    // El 1er enable trio del pcap de Windows se dispara **384ms antes de arrancar iso**.
+    // O sea: tras el TSV de init, antes de alt=2 = hay que dispararlo aquí. Siempre activo.
     {
         fprintf(stderr, "[pt-pre-iso] enable trio 1st fire (pre-alt=2)...\n");
         // (0) aa 12 34 90 05 00
@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
         // (2) d4 00 04 03 (CPLD routing enable)
         unsigned char t2[4] = {0xd4, 0x00, 0x04, 0x03};
         libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, t2, 4, 1000);
-        // (3) 5098 data=[0x20, 0x05] LE (Windows でも観測)
+        // (3) 5098 data=[0x20, 0x05] LE (también visto en Windows)
         unsigned char t3[2] = {0x20, 0x05};
         libusb_control_transfer(h, 0x40, 0xC0, 0x5098, 0, t3, 2, 1000);
         usleep(50000);  // 50ms sleep before alt=2 (Windows-observed)
@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
         libusb_exit(NULL);
         return nonempty ? 0 : 4;
     }
-    // パススルー対策(H1): SET_INTERFACE → 初burstまで pcap実測 103ms 空ける (FX3 GPIF 再初期化とI2C競合回避)
+    // mitigación passthrough (H1): 103ms medidos en pcap entre SET_INTERFACE y el 1er burst (evita choque GPIF/I2C al reiniciar FX3)
     { struct timeval td={0, 120000}; libusb_handle_events_timeout(NULL, &td); }
     fprintf(stderr, "[main] iso開始 %d秒\n", read_sec);
 
@@ -423,19 +423,19 @@ int main(int argc, char** argv) {
         hd60s_apply_it6802_audio94(h);
     }
 
-    // v4l2loopback (/dev/video42) をオープン。失敗しても続行(生ストリームだけ保存)。
+    // abre v4l2loopback (/dev/video42). Si falla, sigue (solo guarda el stream crudo).
     hd60s_v4l2_open("/dev/video42");
-    // ALSA snd-aloop hw:10,0 をオープン。環境変数 HD60S_ALSA_DEV でデバイス指定可能。
+    // abre ALSA snd-aloop hw:10,0. Env HD60S_ALSA_DEV para elegir el dispositivo.
     const char* alsa_dev = getenv("HD60S_ALSA_DEV");
     if (!alsa_dev) alsa_dev = "hw:10,0";
     hd60s_audio_open(alsa_dev);
 
     hd60s_usb_open_dump();
 
-    // firmware解析結果に基づき 0x509c (MCU bridge) audio init sequence を replay
-    // pcap init-timed t=6.5-7.2s から抽出した 236個の 2byte writes
-    // 環境変数 HD60S_509C=1 で有効化
-    // 環境変数は "1"/"yes"/"on" で有効化 (getenv() != NULL だと "0" でも ON になり直感反するため)
+    // replay de la audio init sequence 0x509c (MCU bridge) según el análisis del firmware
+    // 236 writes de 2 bytes extraídos del pcap init-timed t=6.5-7.2s
+    // se activa con env HD60S_509C=1
+    // env = "1"/"yes"/"on" para activar (si solo se mira getenv()!=NULL, "0" también queda ON)
     const char* env_509c = getenv("HD60S_509C");
     if (env_509c && env_509c[0] && env_509c[0] != '0' && env_509c[0] != 'n' && env_509c[0] != 'N') {
         fprintf(stderr, "[509c-init] MCU audio init sequence (236 writes)...\n");
@@ -468,25 +468,25 @@ int main(int argc, char** argv) {
             unsigned char d[2] = { audio_init_seq[u] & 0xff, (audio_init_seq[u] >> 8) & 0xff };
             int r = libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, d, 2, 100);
             if (r == 2) ok++;
-            usleep(500);  // pcap 実測 500us 間隔
+            usleep(500);  // intervalo 500us medido en pcap
         }
         fprintf(stderr, "[509c-init] %d/%d ok\n", ok, seq_len);
     }
 
-    // IT6802E 0x94 bank audio unmute (Fable 発見 + IT6604 register spec 参考)
-    // reg 0x87 (HWMUTE_CTRL) と reg 0x89 (TRISTATE_CTRL) を叩いて I2S 出力 untri-state
-    // 環境変数 HD60S_AUDIO=1 で有効化
+    // IT6802E 0x94 bank audio unmute (hallazgo de Fable + spec de registros IT6604)
+    // golpea reg 0x87 (HWMUTE_CTRL) y reg 0x89 (TRISTATE_CTRL) para untri-state de I2S
+    // se activa con env HD60S_AUDIO=1
     const char* env_audio = getenv("HD60S_AUDIO");
     if (env_audio && env_audio[0] && env_audio[0] != '0' && env_audio[0] != 'n' && env_audio[0] != 'N') {
         fprintf(stderr, "[audio-unmute] IT6802E (0x94 bank) audio path unmute...\n");
-        // IT6802E に一連のコマンドを送る (bank select → HWMUTE_CTRL clear → TRISTATE_CTRL clear)
+        // envía una racha de comandos a IT6802E (bank select → HWMUTE_CTRL clear → TRISTATE_CTRL clear)
         struct { unsigned char slave, reg, val; const char* name; } audio_unmute[] = {
             {0x94, 0x0f, 0x8b, "reg 0x0f audio clock enable"},
             // reg 0x87 (REG_RX_HWMUTE_CTRL): bit3=HW_MUTE_EN, bit4=MUTE_CLR
-            //   = 0x10 → クリア (bit4 立てて bit3 クリア)
+            //   = 0x10 → clear (bit4 a 1, bit3 a 0)
             {0x94, 0x87, 0x10, "reg 0x87 HWMUTE clear + disable"},
-            // reg 0x89 (REG_RX_TRISTATE_CTRL): 全 I2S/SPDIF を untri-state
-            //   = 0x00 → 全 clear
+            // reg 0x89 (REG_RX_TRISTATE_CTRL): untri-state de todo I2S/SPDIF
+            //   = 0x00 → todo clear
             {0x94, 0x89, 0x00, "reg 0x89 TRISTATE untri all"},
         };
         for (int u = 0; u < (int)(sizeof(audio_unmute)/sizeof(audio_unmute[0])); u++) {
@@ -497,10 +497,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // IT6802E audio unmute V2 — 正しい register (DB_C10 SDK it680x_regs.h 参照)
-    // 環境変数 HD60S_AUDIO_V2=1 で有効化
-    // Fable が参考にした IT6604 spec は reg 0x87 だが、IT6802 (実際の HD60S 用チップ) の
-    // REG_RX_HWMuteCtrl は 0x7D。それ以外の関連 reg も一緒に叩く。
+    // IT6802E audio unmute V2 — registros correctos (ver DB_C10 SDK it680x_regs.h)
+    // se activa con env HD60S_AUDIO_V2=1
+    // Fable se basó en spec IT6604 (reg 0x87), pero en IT6802 (el chip real del HD60S)
+    // REG_RX_HWMuteCtrl es 0x7D. También se golpean los otros reg relacionados.
     const char* env_audio_v2 = getenv("HD60S_AUDIO_V2");
     if (env_audio_v2 && env_audio_v2[0] && env_audio_v2[0] != '0' && env_audio_v2[0] != 'n' && env_audio_v2[0] != 'N') {
         fprintf(stderr, "[audio-unmute-v2] IT6802E (正しい reg) audio path unmute...\n");
@@ -511,11 +511,11 @@ int main(int argc, char** argv) {
             //   0x10 = bit4 set, bit3 clear
             {0x94, 0x7d, 0x10, "reg 0x7D REG_RX_HWMuteCtrl clear"},
             // REG_RX_074 (reg 0x74): bit2=Force_AVMute (0=clear), bit3=AVMute_Value (0)
-            //   全部 0 でクリア
+            //   todo a 0 (clear)
             {0x94, 0x74, 0x00, "reg 0x74 Force_AVMute clear"},
-            // REG_RX_0A8 (reg 0xA8): bit0=P0_AVMUTE, bit4=P1_AVMUTE → 全部 clear
+            // REG_RX_0A8 (reg 0xA8): bit0=P0_AVMUTE, bit4=P1_AVMUTE → todo clear
             {0x94, 0xa8, 0x00, "reg 0xA8 AVMute (P0/P1) clear"},
-            // REG_RX_07E (reg 0x7E): bit4=Force_I2SOut (=1 で強制 I2S 出力 ON)
+            // REG_RX_07E (reg 0x7E): bit4=Force_I2SOut (=1 fuerza salida I2S ON)
             {0x94, 0x7e, 0x10, "reg 0x7E Force I2SOut ON"},
         };
         for (int u = 0; u < (int)(sizeof(audio_unmute_v2)/sizeof(audio_unmute_v2[0])); u++) {
@@ -526,14 +526,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 最小 unmute: 0x509c で bank2 select → reg 0x20 = 0x00
-    // 環境変数 HD60S_MIN=1 で有効化
+    // unmute mínimo: en 0x509c, bank2 select → reg 0x20 = 0x00
+    // se activa con env HD60S_MIN=1
     const char* env_min = getenv("HD60S_MIN");
     if (env_min && env_min[0] && env_min[0] != '0' && env_min[0] != 'n' && env_min[0] != 'N') {
         fprintf(stderr, "[min-unmute] 0x509c 最小シーケンス (bank2 select + reg 0x20=0x00)...\n");
-        // firmware解析より: dev=2 page reg 0x20 = 0x00 が unmute
-        // protocol: `00 BB` = bank切替 (BB=bank), `RR VV` = reg RR = VV
-        // 発行 6回 (状態安定のため)
+        // según firmware: unmute = dev=2 page reg 0x20 = 0x00
+        // protocol: `00 BB` = cambio de bank (BB=bank), `RR VV` = reg RR = VV
+        // se emite 6 veces (para estabilizar el estado)
         for (int cycle = 0; cycle < 6; cycle++) {
             unsigned char sel[2] = {0x00, 0x02};
             libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, sel, 2, 100);
@@ -545,8 +545,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "  min-unmute done\n");
     }
 
-    // firmware解析結果に基づき IT6802E (0x9c bank) audio unmute 直接I2C書き込み
-    // 環境変数 HD60S_UNMUTE=1 で有効化 (legacy)
+    // según el firmware: writes I2C directos de audio unmute a IT6802E (bank 0x9c)
+    // se activa con env HD60S_UNMUTE=1 (legacy)
     const char* env_unmute = getenv("HD60S_UNMUTE");
     if (env_unmute && env_unmute[0] && env_unmute[0] != '0' && env_unmute[0] != 'n' && env_unmute[0] != 'N') {
         fprintf(stderr, "[unmute] IT6802E audio unmute シーケンス投入...\n");
@@ -563,7 +563,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "  %s = %d\n", audio_unmute[u].name, r);
             usleep(2000);
         }
-        // IT66121 (0x9a) 側 audio ctrl も unmute
+        // también unmute del audio ctrl del lado IT66121 (0x9a)
         struct { unsigned char reg, val; const char* name; } tx_audio[] = {
             {0xC1, 0x00, "reg 0xC1 AVMUTE clear"},
             {0xB9, 0x03, "reg 0xB9 audio InfoFrame enable"},
@@ -582,8 +582,8 @@ int main(int argc, char** argv) {
         goto capture_cleanup;
     }
 
-    // 🔍 IT66121 状態 dump (パススルー sequence 前後の切り分け用)
-    // マクロは file 後半で定義されてるので inline で書く
+    // 🔍 dump de estado IT66121 (para separar antes/después de la sequence de passthrough)
+    // la macro está definida más abajo en el file, así que se escribe inline
     {
         unsigned char regs[16] = {0};
         for (int r = 0; r < 16; r++) {
@@ -599,13 +599,13 @@ int main(int argc, char** argv) {
         fprintf(stderr, "  (0x04=%02x → SW_RST)\n", regs[4]);
     }
 
-    // 🔥 HDMI PASSTHROUGH ENABLE (2026-07-11 Fable 3rd 分析)
-    // 真の犯人発見: IT66121 TX (slave 0x9a) は最初から完璧。真のパススルー enable は
-    // MCU (slave 0xaa magic 12 34) と CPLD (slave 0xd4) 経由の "秘密コマンド 6 発"。
-    // Windows はこれを 3 回発射する。「reg 0x27 = video gate」を開いて RX→TX ルート
-    // を CPLD で有効化する。
-    // 前バージョン (15 writes to 0x9a) は TX しか触ってなかったので RX→TX の物理路
-    // が CPLD で切れたまま = TV 無信号だった。
+    // 🔥 HDMI PASSTHROUGH ENABLE (2026-07-11 análisis Fable 3rd)
+    // culpable real: el TX IT66121 (slave 0x9a) ya estaba perfecto. El verdadero enable de passthrough
+    // son «6 comandos secretos» vía MCU (slave 0xaa magic 12 34) y CPLD (slave 0xd4).
+    // Windows los dispara 3 veces. Abren «reg 0x27 = video gate» y habilitan la ruta RX→TX
+    // en el CPLD.
+    // la versión anterior (15 writes to 0x9a) solo tocaba el TX, así que el camino físico RX→TX
+    // seguía cortado en el CPLD = TV sin señal.
     {
         int pt_ok = 0, pt_fail = 0;
         #define TX_WRITE(reg, val) do { \
@@ -614,8 +614,8 @@ int main(int argc, char** argv) {
             if (_r == 3) pt_ok++; else pt_fail++; \
         } while (0)
 
-        // 🎯 真のパススルー enable シーケンス (Fable 3rd 分析)
-        // Windows は 3 回発射するのでここでも 3 回発射
+        // 🎯 secuencia real de enable de passthrough (análisis Fable 3rd)
+        // Windows dispara 3 veces, aquí también 3
         fprintf(stderr, "[passthrough] TRUE enable sequence (MCU+CPLD, 6 cmds × 3 rounds)...\n");
         for (int round = 0; round < 3; round++) {
             // 1. MCU reg 0x27 "video gate" open
@@ -636,7 +636,7 @@ int main(int argc, char** argv) {
                 int r = libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w, 6, 500);
                 if (r == 6) pt_ok++; else pt_fail++;
             }
-            // 4. CPLD routing reg 0x04 = 0x03 (bit0=RX→TX, bit1=RX→FX3 両方 enable)
+            // 4. CPLD routing reg 0x04 = 0x03 (bit0=RX→TX, bit1=RX→FX3, ambos enable)
             {
                 unsigned char w[4] = {0xd4, 0x00, 0x04, 0x03};
                 int r = libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w, 4, 500);
@@ -654,20 +654,20 @@ int main(int argc, char** argv) {
                 int r = libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w, 4, 500);
                 if (r == 4) pt_ok++; else pt_fail++;
             }
-            usleep(500 * 1000);  // 500ms 間隔で 3 回
+            usleep(500 * 1000);  // 3 veces, cada 500ms
         }
         fprintf(stderr, "[passthrough] MCU/CPLD enable 統計: ok=%d fail=%d\n", pt_ok, pt_fail);
         pt_ok = 0; pt_fail = 0;
 
-        // 🔥 0x9a TX writes 全部削除 (2026-07-11 Fable 4th 分析)
-        // HD60S は既定でパススルー ON、MCU が自律で IT66121 を制御する。
-        // ホストから 0x9a に書き込むと MCU 設定を壊す (friendly fire) → TMDS 不安定 →
-        // TV が「省電力モーダル」に落ちる。MCU/CPLD 制御 (aa/d4) だけ残し、
-        // 0x9a への書き込みは一切しない。
+        // 🔥 se eliminan todos los TX writes a 0x9a (2026-07-11 análisis Fable 4th)
+        // HD60S trae passthrough ON por defecto; el MCU controla IT66121 solo.
+        // escribir 0x9a desde el host rompe la config del MCU (friendly fire) → TMDS inestable →
+        // la TV cae a «modo ahorro de energía». Solo queda el control MCU/CPLD (aa/d4);
+        // no se escribe nada a 0x9a.
         (void)pt_ok; (void)pt_fail;
         #undef TX_WRITE
     }
-    // 🔍 IT66121 状態 dump (パススルー sequence 直後)
+    // 🔍 dump de estado IT66121 (justo después de la sequence de passthrough)
     {
         unsigned char regs[16] = {0};
         for (int r = 0; r < 16; r++) {
@@ -686,7 +686,7 @@ int main(int argc, char** argv) {
     // 🔥 POST-ISO AUDIO CONFIG (2026-07-11 pcap RE breakthrough)
     // Windows sends 188 I2C writes to slave 0x9a (IT66121 TX) & 0x94 (audio bank)
     // in first 400ms after iso start. We never sent these — that's why audio dies at 100ms.
-    // 環境変数 HD60S_POST_ISO_AUDIO=1 で有効化 (default off で回帰リスク低減)
+    // se activa con env HD60S_POST_ISO_AUDIO=1 (default off para bajar riesgo de regresión)
     {
         const char* env_pia = getenv("HD60S_POST_ISO_AUDIO");
         int do_pia = (env_pia && env_pia[0] && env_pia[0] != '0' && env_pia[0] != 'n' && env_pia[0] != 'N');
@@ -701,8 +701,8 @@ int main(int argc, char** argv) {
         hd60s_apply_it6802_audio94(h);
     }
 
-    // iso をポンプしながら、点火バーストを相対タイムスタンプ準拠で発行する。
-    // 単一スレッド: libusb_control_transfer は内部で iso 転送もポンプするので iso は止まらない。
+    // mientras se bombea iso, se emite el burst de ignición según timestamps relativos.
+    // un solo hilo: libusb_control_transfer también bombea iso por dentro, así que iso no se para.
     double burst_t0 = g_nburst ? g_burst[0].t : 0;
     double start = now_s();
     int bi = 0, bok = 0, bfail = 0;
@@ -723,17 +723,17 @@ int main(int argc, char** argv) {
             if (r < 0) bfail++; else bok++;
             bi++;
         }
-        // AUDIO KEEPALIVE V2: 2026-07-11 Opus 4.8 サブエージェント発見。
-        // Windows steady-state は 227コマンドの keepalive cycle を 163ms 周期で firing.
-        // 環境変数 HD60S_AUDIO_KA=1 で有効化。keepalive TSV を別バッファに読み込んで再送。
+        // AUDIO KEEPALIVE V2: 2026-07-11 hallazgo del subagente Opus 4.8.
+        // El steady-state de Windows dispara un keepalive cycle de 227 comandos cada 163ms.
+        // se activa con env HD60S_AUDIO_KA=1. Carga el TSV de keepalive en otro buffer y reenvía.
         static double last_ka_fire = 0.0;
         static int ka_fires = 0;
         static BurstCmd g_ka[512];
-        static int g_nka = -1;  // -1 = 未ロード
+        static int g_nka = -1;  // -1 = aún no cargado
         const char* env_ka = getenv("HD60S_AUDIO_KA");
         int ka_loop = (env_ka && env_ka[0] && env_ka[0] != '0');
         if (ka_loop && g_nka < 0) {
-            // 初回: TSV load (別関数使いたいが load_burst は g_burst を潰すので inline)
+            // primera vez: TSV load (querría otra función, pero load_burst pisa g_burst → inline)
             FILE* fka = fopen("analysis/keepalive-cycle-v2.tsv", "r");
             if (!fka) { fprintf(stderr, "[ka] keepalive-cycle-v2.tsv 開けず、KA無効化\n"); g_nka = 0; ka_loop = 0; }
             else {
@@ -779,9 +779,9 @@ int main(int argc, char** argv) {
         }
 
         // 🔥 IT6802 AUDIO RECOVERY LOOP (2026-07-11 Fable + FIX_ID_023 breakthrough)
-        // ITE公式ドライバ it680x.c の AudioFsCal() + aud_fiforst() + Force FS を再現。
-        // 100ms周期で HW mute解除 + 48kHz強制 + I2S untri-state を再送。
-        // HD60S_IT6802_RECOVER=1 で有効化。IT6802 access = I2C slave 0x94 (write) bank 0
+        // reproduce AudioFsCal() + aud_fiforst() + Force FS del driver oficial ITE it680x.c.
+        // cada 100ms reenvía HW unmute + forzar 48kHz + I2S untri-state.
+        // se activa con HD60S_IT6802_RECOVER=1. Acceso IT6802 = I2C slave 0x94 (write) bank 0
         static double last_it6802_rec = 0.0;
         static int it6802_rec_fires = 0;
         const char* env_rec = getenv("HD60S_IT6802_RECOVER");
@@ -791,7 +791,7 @@ int main(int argc, char** argv) {
             const char* env_int = getenv("HD60S_RECOVER_MS");
             rec_interval = (env_int && atoi(env_int) > 0) ? atoi(env_int) / 1000.0 : 0.100;
         }
-        // t=0 でも即発火 (last_it6802_rec == 0.0 で初回、初期無音を潰す)
+        // también dispara en t=0 (primera vez last_it6802_rec == 0.0; mata el silencio inicial)
         if (do_rec && (last_it6802_rec == 0.0 || (el - last_it6802_rec) >= rec_interval)) {
             #define IT6802W(reg, val) do { \
                 unsigned char _w[3] = {0x94, (reg), (val)}; \
@@ -819,10 +819,10 @@ int main(int argc, char** argv) {
             if (it6802_rec_fires <= 3) fprintf(stderr, "[it6802-rec] fire #%d at t=%.0fms\n", it6802_rec_fires, el*1000);
         }
 
-        // 🔥 PASSTHROUGH KEEPALIVE (2026-07-11 Fable + kusq webcam 検証)
-        // MCU/CPLD の d4 slave keepalive を 100ms 周期で発射しないと LG モニターが
-        // 「省電力モーダル」に落ちる (パススルー ON→OFF の切れ目を検知される)。
-        // Windows pcap では 40-300ms 周期で連続発射している。
+        // 🔥 PASSTHROUGH KEEPALIVE (2026-07-11 verificado Fable + kusq webcam)
+        // si no se dispara el keepalive del slave d4 MCU/CPLD cada 100ms, el monitor LG
+        // cae a «modo ahorro de energía» (detecta el corte passthrough ON→OFF).
+        // En el pcap de Windows se dispara en continuo cada 40-300ms.
         static double last_pt_ka = 0.0;
         static int pt_ka_fires = 0;
         // In paced capture this synchronous five-transfer maintenance cycle
@@ -830,7 +830,7 @@ int main(int argc, char** argv) {
         // passthrough keepalive is retained for unpaced/pass-through runs,
         // but must not stall the capture presentation clock.
         if (!g_pace_output && (el - last_pt_ka) >= 0.100) {
-            // enable trio + keepalive pair を毎回発射
+            // dispara enable trio + keepalive pair cada vez
             // aa 12 34 90 05 00
             unsigned char w0a[6] = {0xaa, 0x12, 0x34, 0x90, 0x05, 0x00};
             libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w0a, 6, 100);
@@ -851,8 +851,8 @@ int main(int argc, char** argv) {
             if (pt_ka_fires <= 3) fprintf(stderr, "[pt-keepalive] fire #%d at t=%.0fms (full trio+keepalive)\n", pt_ka_fires, el*1000);
         }
 
-        // 60B MCU BATCH RETRY: iso 中に arm batch を反復発火して audio DMA restart 試行
-        // 環境変数 HD60S_BATCH_LOOP=1 で有効化、80ms 周期
+        // 60B MCU BATCH RETRY: durante iso, re-dispara el arm batch para intentar restart del DMA de audio
+        // se activa con env HD60S_BATCH_LOOP=1, periodo 80ms
         static double last_batch_fire = 0.0;
         static int batch_fires = 0;
         const char* env_batch_loop = getenv("HD60S_BATCH_LOOP");
@@ -872,9 +872,9 @@ int main(int argc, char** argv) {
             if (batch_fires <= 3) fprintf(stderr, "[batch] fired #%d at t=%.0fms\n", batch_fires, el*1000);
         }
 
-        // PLL LOCK MONITOR: 2026-07-11 Fable ヒント。IT6802 の IPLL_LOCK が
-        // 音声死亡時に drop してるかを 20ms 周期で monitor。
-        // 環境変数 HD60S_PLL_MON=1 で有効化
+        // PLL LOCK MONITOR: 2026-07-11 pista de Fable. Monitoriza cada 20ms si IPLL_LOCK
+        // de IT6802 cae cuando muere el audio.
+        // se activa con env HD60S_PLL_MON=1
         static double last_pll_mon = 0.0;
         static int pll_mon_fires = 0;
         const char* env_pll_mon = getenv("HD60S_PLL_MON");
@@ -912,9 +912,9 @@ int main(int argc, char** argv) {
             pll_mon_fires++;
         }
 
-        // AUDIO ARM RETRY: 2026-07-11 iso 中に arm sequence を反復投入。
-        // 100ms で音声死ぬ→ もしかしたら arm 効果が 100ms しかもたない?
-        // 環境変数 HD60S_ARM_LOOP=1 で有効化、30ms 周期
+        // AUDIO ARM RETRY: 2026-07-11 reinyecta la arm sequence durante iso.
+        // el audio muere a los 100ms → ¿el efecto del arm solo dura 100ms?
+        // se activa con env HD60S_ARM_LOOP=1, periodo 30ms
         static double last_arm_loop = 0.0;
         static int arm_loop_fires = 0;
         const char* env_arm_loop = getenv("HD60S_ARM_LOOP");
@@ -928,9 +928,9 @@ int main(int argc, char** argv) {
             arm_loop_fires++;
         }
 
-        // AUDIO UNMUTE-RETRY: 2026-07-11 Fable ヒント。IT6802E は ACR unlock で
-        // hard-mute 発動→ read-then-clear 必要。50ms 周期で mute clear を強制書き込み。
-        // 環境変数 HD60S_UNMUTE_RETRY=1 で有効化
+        // AUDIO UNMUTE-RETRY: 2026-07-11 pista de Fable. IT6802E hace hard-mute al ACR unlock
+        // → hace falta read-then-clear. Cada 50ms, write forzado de mute clear.
+        // se activa con env HD60S_UNMUTE_RETRY=1
         static double last_unmute_fire = 0.0;
         static int unmute_fires = 0;
         const char* env_unmute_retry = getenv("HD60S_UNMUTE_RETRY");
@@ -956,8 +956,8 @@ int main(int argc, char** argv) {
             if (unmute_fires <= 3) fprintf(stderr, "[unmute-retry] fired #%d\n", unmute_fires);
         }
 
-        // min-unmute-loop: burst 完了後、100ms 周期で bank2 select + reg 0x20=0x00 を再送
-        // 環境変数 HD60S_MIN_LOOP=1 で有効化 (P5 で peak +71% 確認済み)
+        // min-unmute-loop: tras el burst, reenvía bank2 select + reg 0x20=0x00 cada 100ms
+        // se activa con env HD60S_MIN_LOOP=1 (en P5 se confirmó peak +71%)
         static double last_min_fire = 0.0;
         static int min_fires = 0;
         const char* env_min_loop = getenv("HD60S_MIN_LOOP");
@@ -971,9 +971,9 @@ int main(int argc, char** argv) {
             min_fires++;
         }
 
-        // pt-loop: burst 完了後、120ms 周期で **完全な** passthrough keep-alive cycle を発火
-        // pcap 解析: 30 commands (9a 書き, 9b/9d 読み, 0x509c MCU) を 120ms 周期で全部やる
-        // 詳細は analysis/keepalive-cycle.tsv 参照
+        // pt-loop: tras el burst, dispara el keep-alive cycle **completo** de passthrough cada 120ms
+        // análisis pcap: 30 commands (writes 9a, reads 9b/9d, MCU 0x509c) todos cada 120ms
+        // detalle en analysis/keepalive-cycle.tsv
         if (pt_loop && bi >= g_nburst && (el - last_pt_fire) >= 0.12) {
             // IT66121 writes: 9a0f00, 9ac101, 9ac603 (start of cycle)
             unsigned char w1[3] = {0x9a, 0x0f, 0x00}; libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w1, 3, 100);
@@ -1027,10 +1027,10 @@ int main(int argc, char** argv) {
     hd60s_parser_reset_video_phase();
     fprintf(stderr, "[parser] video-phase synchronization reset after burst\n");
 
-    // (pt-loop は main iso loop 内でinline 実行、ここでの再ループは削除)
+    // (pt-loop corre inline en el main iso loop; se quitó el re-loop de aquí)
 
-    // IT66121 SYS_STATUS 読み関数 (arm 前後比較用)
-    // reg 0x0E は SYS_STATUS。ITE ドキュメント上 bit4=VID_STABLE
+    // función de lectura de SYS_STATUS de IT66121 (para comparar antes/después del arm)
+    // reg 0x0E es SYS_STATUS. En docs ITE, bit4=VID_STABLE
     #define IT66121_READ(reg) ({ \
         unsigned char _setup[3] = {0x9b, 0x01, (unsigned char)(reg)}; \
         libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _setup, 3, 1000); \
@@ -1039,7 +1039,7 @@ int main(int argc, char** argv) {
         (_rr > 0) ? _resp[0] : 0xff; \
     })
 
-    // arm 前の状態記録 (複数 register を i2c read - 各読みの間 5ms 空ける)
+    // snapshot de estado pre-arm (i2c read de varios register; 5ms entre lecturas)
     #define IT66121_SNAP(tag) do { \
         unsigned char _r[16]; \
         for (int _i = 0; _i < 16; _i++) { \
@@ -1053,7 +1053,7 @@ int main(int argc, char** argv) {
 
     IT66121_SNAP("pre-arm");
 
-    // Workflow synth 提案: MCU arm 60B バッチ を明示的に再送 (frame 13573 のペイロード)
+    // propuesta Workflow synth: reenviar explícitamente el batch MCU arm 60B (payload del frame 13573)
     {
         static const unsigned char arm_payload[60] = {
             0x55, 0x80, 0x3c, 0x00, 0x6a, 0x80, 0x0f, 0x00, 0x6b, 0x80, 0xfe, 0x00,
@@ -1070,9 +1070,9 @@ int main(int argc, char** argv) {
     usleep(50 * 1000);
     IT66121_SNAP("post-arm");
 
-    // 追加試行: IT66121 ドライバ(Linux mainline) の "FireAFE + HDMI mode + unmute" 手順を明示送信
-    // ite-it66121.c より:
-    //   0x61 = 0x00 (FireAFE: AFE 起動)
+    // intento extra: enviar explícitamente el procedimiento "FireAFE + HDMI mode + unmute" del driver IT66121 (Linux mainline)
+    // de ite-it66121.c:
+    //   0x61 = 0x00 (FireAFE: arranca AFE)
     //   0xC0 = 0x01 (HDMI mode enable)
     //   0xC1 = 0x00 (AV unmute)
     //   0xC6 = 0x03 (packet generation)
@@ -1087,7 +1087,7 @@ int main(int argc, char** argv) {
     IT66121_WRITE(0xC0, 0x01); usleep(1000);   // HDMI mode
     IT66121_WRITE(0xC1, 0x00); usleep(1000);   // AV unmute
     IT66121_WRITE(0xC6, 0x03); usleep(1000);   // packet gen
-    // 0x0F: 現状 0x00 なので bit4 は既に clear = TX clock 有効
+    // 0x0F: ahora es 0x00, así que bit4 ya está clear = TX clock activo
 
     usleep(200 * 1000);
     IT66121_SNAP("post-fire");
@@ -1095,7 +1095,7 @@ int main(int argc, char** argv) {
     usleep(500 * 1000);
     IT66121_SNAP("+500ms   ");
     hd60s_usb_request_stop();
-    // 残りを回収
+    // recoger el resto
     struct timeval tv2 = {1, 0};
     for (int k = 0; k < 10 && hd60s_usb_inflight() > 0; k++) libusb_handle_events_timeout(NULL, &tv2);
 

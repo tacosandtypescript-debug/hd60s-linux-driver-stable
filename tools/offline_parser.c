@@ -1,6 +1,6 @@
-// stream-iso.bin(生キャプチャ)を読み込み、ラインマーカーパースで
-// 4147200Bのフレームを取り出して先頭Nフレームを PNG に(実際はraw YUYV に出力)する
-// 検証用ミニツール。iso_capture.c のパーサと同一ロジック。
+// lee stream-iso.bin (captura cruda) y, parseando marcadores de línea,
+// saca frames de 4147200B y los primeros N frames a PNG (en realidad sale raw YUYV)
+// mini-herramienta de verificación. Misma lógica que el parser de iso_capture.c.
 //   build: gcc -O2 offline_parser.c -o offline_parser
 //   run  : ./offline_parser captures/stream-iso.bin captures/proof/frame_%d.yuv
 #include <stdio.h>
@@ -61,11 +61,11 @@ int main(int argc, char** argv) {
     int lpos = 0;
     size_t i = 0;
     while (i + LINE_BYTES + 16 < sz) {
-        // 3840B詰める
+        // llenar 3840B
         size_t need = LINE_BYTES - lpos;
         memcpy(linebuf + lpos, d + i, need);
         i += need; lpos = LINE_BYTES;
-        // マーカー4B(SEP なら 16B)
+        // marcador 4B (16B si SEP)
         uint32_t tag; memcpy(&tag, d + i, 4);
         if (tag == MK_SEP) { i += 12; memcpy(&tag, d + i, 4); }
         i += 4;
