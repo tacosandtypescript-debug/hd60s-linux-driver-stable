@@ -153,15 +153,6 @@ case "$CMD" in
     say "完了"
     ;;
 
-  color-test)
-    # 深緑色化の修正テスト: init-p2-color.tsv (InfoFrame command 復活版) 使用
-    SEC="${SEC:-30}"
-    prep
-    [ -r analysis/init-p2-color.tsv ] || die "analysis/init-p2-color.tsv がありません。色空間用のローカル参照 TSV を配置してください"
-    say "色空間修正テスト ${SEC}秒: init-p2-color.tsv (InfoFrame 復活版)"
-    exec sudo -E HD60S_INIT_TSV=analysis/init-p2-color.tsv ./iso_capture "$SEC" 2 5
-    ;;
-
   audio-v2)
     # IT6802 正しい reg (0x7D 系) で音声 unmute リトライ
     SEC="${SEC:-30}"
@@ -244,10 +235,9 @@ HD60S ドライバ実験ラッパー
 ── 実験 / デバッグ ────────────────────────
   test [秒]      短時間テスト (既定20s, stats確認用)
   minimal [秒]   最小モード (init/burst省略、passthrough保護, 既定30s)
-  pt   [秒]      パススルー実験 (poststream発火, 既定60s)
-  ptx  [秒]      パススルー実験 + 解放シーケンス (既定60s)
+  pt   [秒]      (roto) passthrough / poststream — no usar
+  ptx  [秒]      (roto) passthrough + liberación — no usar
   audio-test [秒] 音声抽出だけ (sep.wav 出力, 既定6s)
-  color-test [秒] 色空間修正テスト: init-p2-color.tsv (InfoFrame復活版, 既定30s)
   audio-v2 [秒]  IT6802 正しいreg (0x7D 系) で音声unmute試行 (既定30s)
 
 ── メンテ ─────────────────────────────
