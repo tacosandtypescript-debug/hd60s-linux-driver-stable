@@ -12,12 +12,12 @@
 #include <errno.h>
 
 // ======================================================================
-// SECTION 1: フレーム同期パーサ (映像 + 埋込音声 SEP)
+// SECTION 1: parser de sincronía de frame (vídeo + SEP de audio embebido)
 // ======================================================================
-// フレーム同期パーサ (2026-07-09 workflow解析で構造判明)
-// 実データ形式: 各ライン=3840B + 末尾4Bマーカー、時々SEP(0xff00ff02+12B)挿入。
-// 1フレーム=1080ACT+45BLK=1125ライン。マーカー0xff000080=EOL_ACT(実映像行), 0xff0000ab=EOL_BLK(ブランキング行), 0xff00ff02+12=SEP。
-// マーカーを剥がした1920x1080 YUYV(4147200B)を v4l2loopback へ出す。
+// parser de sincronía de frame (estructura hallada en workflow 2026-07-09)
+// formato real: cada línea=3840B + marcador 4B al final; a veces se inserta SEP(0xff00ff02+12B).
+// 1 frame=1080ACT+45BLK=1125 líneas. Marcadores 0xff000080=EOL_ACT (fila de vídeo), 0xff0000ab=EOL_BLK (fila de blanking), 0xff00ff02+12=SEP.
+// Se pelan los marcadores y se manda 1920x1080 YUYV (4147200B) a v4l2loopback.
 // ==================================================================
 #define FRAME_W 1920
 #define FRAME_H 1080
@@ -25,29 +25,29 @@
 #define FRAME_BYTES (LINE_BYTES * FRAME_H)         // 4,147,200
 #define EXPECTED_FRAME_BLK 45                      // measured 005e vertical-blanking markers/frame
 
-// マーカー (little-endian 32bit で読む)
+// marcadores (se leen como little-endian 32bit)
 #define MK_EOL_ACT 0x800000ffu   // bytes: ff 00 00 80
 #define MK_EOL_BLK 0xab0000ffu   // bytes: ff 00 00 ab
-#define MK_SEP     0x02ff00ffu   // bytes: ff 00 ff 02, その後12バイトスキップ
+#define MK_SEP     0x02ff00ffu   // bytes: ff 00 ff 02, luego saltar 12 bytes
 #define MK_SEP_BULK 0x04ff00ffu  // bulk/USB3 stream uses the same SEP payload with type 04
 
 typedef enum { HUNT = 0, LOCKED = 1 } pstate_t;
 static pstate_t g_state = HUNT;
-static uint8_t g_linebuf[LINE_BYTES];              // 現行ライン組み立て
-static int g_lpos = 0;                             // linebufの充填位置
-static uint8_t g_framebuf[FRAME_BYTES];            // 完成フレーム
-static int g_fline = 0;                            // フレーム内のACT行番号
-static int g_blk_run = 0;                          // 連続BLKカウンタ
+static uint8_t g_linebuf[LINE_BYTES];              // ensamblado de la línea actual
+static int g_lpos = 0;                             // posición de llenado de linebuf
+static uint8_t g_framebuf[FRAME_BYTES];            // frame terminado
+static int g_fline = 0;                            // número de fila ACT dentro del frame
+static int g_blk_run = 0;                          // contador de BLK seguidos
 
-// 32bitマーカーが行またぎで壊れないように、直前の3バイト+SEP繰越を保持する pending バッファ
+// pending: guarda los últimos 3 bytes + resto SEP para que el marcador 32bit no se rompa al cruzar líneas
 static uint8_t g_pend[16];
 static int g_pend_n = 0;
 
 unsigned long long g_frames_out = 0;
 unsigned long long g_resyncs = 0;
-unsigned long long g_resync_empty = 0;   // iso empty 起因
-unsigned long long g_resync_marker = 0;  // 未知マーカー起因
-unsigned long long g_resync_overflow = 0;// work overflow 起因
+unsigned long long g_resync_empty = 0;   // por iso empty
+unsigned long long g_resync_marker = 0;  // por marcador desconocido
+unsigned long long g_resync_overflow = 0;// por work overflow
 static int g_parser_synced = 0;
 static uint8_t g_sync_buf[524288];
 static size_t g_sync_n = 0;
@@ -307,7 +307,7 @@ static void parser_trace_dump_loss(size_t bytes_lost, int partial_lines,
 static void parser_notify_loss(size_t bytes_lost);
 
 static void parser_reset(const char* why) {
-    // 分類は state 問わずカウント（HUNT中の resync も見たい）
+    // se cuenta igual en cualquier state (también queremos ver resync en HUNT)
     if (strstr(why, "empty")) g_resync_empty++;
     else if (strstr(why, "marker")) g_resync_marker++;
     else if (strstr(why, "overflow")) g_resync_overflow++;
@@ -367,7 +367,7 @@ static void emit_frame(void) {
         }
     }
     g_frames_out++;
-    // 2026-07-18 debug dump は HD60S_DEBUG_DUMP=1 の時のみ (常時 4MB × 3 個の write は無駄)
+    // 2026-07-18 debug dump solo si HD60S_DEBUG_DUMP=1 (escribir 4MB × 3 todo el rato es desperdicio)
     if (hd60s_env_present("HD60S_DEBUG_DUMP") &&
         (g_frames_out == 1 || g_frames_out == 60 || g_frames_out == 300 || g_frames_out == 600)) {
         char path[256];
@@ -376,9 +376,9 @@ static void emit_frame(void) {
         if (fp) { fwrite(g_framebuf, 1, FRAME_BYTES, fp); fclose(fp);
                   fprintf(stderr, "[dump] %s\n", path); }
     }
-    // 2026-07-18 [emit] を毎秒 → 5秒 (300 frames = 60fps × 5s) に。
-    // stall 検知には十分早く、journal 汚染も 1/5 に抑えつつバランス取り。
-    // HD60S_VERBOSE=1 で毎秒 (60 frames)、以前と同じ verbose に。
+    // 2026-07-18 [emit] de cada segundo → cada 5s (300 frames = 60fps × 5s).
+    // bastante pronto para pillar stall, y el journal se ensucia 1/5. Equilibrio.
+    // HD60S_VERBOSE=1 vuelve a cada segundo (60 frames), el verbose de antes.
     static int verbose_checked = 0, verbose = 0;
     if (!verbose_checked) { verbose = getenv("HD60S_VERBOSE") ? 1 : 0; verbose_checked = 1; }
     unsigned long long interval = verbose ? 60 : 300;
@@ -655,8 +655,8 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
     }
 }
 
-// data/len を消費してパーサに突っ込む。iso packet 最大32768B、pending 最大16Bなので
-// work は余裕を持って十分大きく取る。
+// consume data/len y se lo mete al parser. iso packet máx 32768B, pending máx 16B, así que
+// work se dimensiona con holgura de sobra.
 static void parser_feed(const uint8_t* data, size_t len) {
     if (!g_parser_synced) {
         size_t take = len;
@@ -753,7 +753,7 @@ static void parser_feed(const uint8_t* data, size_t len) {
     return;
     static uint8_t work[65536 + 64];
     if (g_pend_n + len > sizeof(work)) {
-        // 想定外の巨大パケット。切り捨てて resync
+        // paquete enorme inesperado. recortar y resync
         parser_reset("work overflow");
         return;
     }
@@ -764,20 +764,20 @@ static void parser_feed(const uint8_t* data, size_t len) {
     size_t i = 0;
 
     while (i < total) {
-        // linebuf に 3840B 詰める（g_lposは前回途中の位置）
+        // llenar linebuf con 3840B (g_lpos puede venir a medias de la vez anterior)
         size_t need = LINE_BYTES - g_lpos;
         if (need > 0) {
             size_t avail = total - i;
             size_t take = (avail < need) ? avail : need;
             memcpy(g_linebuf + g_lpos, work + i, take);
             g_lpos += take; i += take;
-            if (g_lpos < LINE_BYTES) break;  // ラインが埋まってない=残りは次回に持ち越し
+            if (g_lpos < LINE_BYTES) break;  // la línea no está llena = el resto se lleva a la próxima
         }
 
-        // マーカーを読むため 4B (SEP なら 16B) 必要。足りなければ pending に退避。
-        // ★★★重要★★★ ここで pending に残す時、g_lpos は LINE_BYTES のまま維持する。
-        // (次回 parser_feed で g_lpos==LINE_BYTES なので need==0 で埋め直しをスキップ、
-        //  そのままマーカー判定に進める)
+        // para leer el marcador hacen falta 4B (16B si SEP). Si no alcanzan, a pending.
+        // ★★★IMPORTANTE★★★ al dejar resto en pending, g_lpos se queda en LINE_BYTES.
+        // (en el siguiente parser_feed g_lpos==LINE_BYTES, need==0, se salta el relleno
+        //  y se pasa directo a juzgar el marcador)
         if (total - i < 4) {
             size_t r = total - i;
             memcpy(g_pend, work + i, r); g_pend_n = r;
@@ -801,20 +801,20 @@ static void parser_feed(const uint8_t* data, size_t len) {
         }
         i = marker_i;
 
-        // SEP: 4B magic + 8B payload + 4B マーカー (EOL_ACT等) = 全16B。
-        // 実測: SEP+12 位置に必ず EOL_ACT (ff 00 00 80) が続く（201/201=100%）。
-        // → 実装は「SEP magic を見たら +12 進んで直後のマーカー4Bを読み直す」。
-        //   SEP payload の 8B は音声データの可能性 (parser では読み飛ばす、音声パーサで別処理)。
+        // SEP: 4B magic + 8B payload + 4B marcador (EOL_ACT etc.) = 16B en total.
+        // medido: en SEP+12 siempre sigue EOL_ACT (ff 00 00 80) (201/201=100%).
+        // → la impl: «si ves SEP magic, avanza +12 y relee el marcador 4B de justo después».
+        //   los 8B del SEP payload pueden ser audio (el parser los salta; otro parser de audio los trata).
         if (tag == MK_SEP || tag == MK_SEP_BULK) {
             if (total - i < 16) {
                 size_t r = total - i;
                 memcpy(g_pend, work + i, r); g_pend_n = r;
                 return;
             }
-            // payload = 8バイト、位置 i+4 .. i+11 (音声: 48kHz s16le stereo, 2フレーム/SEP)
+            // payload = 8 bytes, posiciones i+4 .. i+11 (audio: 48kHz s16le stereo, 2 frames/SEP)
             hd60s_audio_feed_sep(work + i + 4);
-            i += 12;                          // payload 8B までジャンプ (magic 4B + 8B payload)
-            memcpy(&tag, work + i, 4);        // マーカー4Bを読み直し
+            i += 12;                          // saltar hasta el payload 8B (magic 4B + 8B payload)
+            memcpy(&tag, work + i, 4);        // releer el marcador 4B
         }
         i += 4;
 
@@ -835,12 +835,12 @@ static void parser_feed(const uint8_t* data, size_t len) {
             g_blk_run++;
             g_lpos = 0;
         } else {
-            // 未知マーカー: リセットせず、4B戻して1Bだけ進めて再検索。真のマーカーは3844B以内にあるはず。
-            // これで映像バイトが偶発的にマーカーに一致した場合の誤同期を回避。
+            // marcador desconocido: no reset; retrocede 4B y avanza 1B para rebuscar. El marcador de verdad debería estar en 3844B.
+            // así se evita falso sync si un byte de vídeo coincide por casualidad con un marcador.
             i -= 3;
-            // linebufのこの位置バイトをずらして「1B早く始まるライン」扱いにするのは複雑なので、
-            // LOCKED時はライン破棄扱い(g_lpos=0)して次の真マーカーを探す。
-            // 頻度制御: 過度なリセットを避けるためカウントだけ増やす
+            // desplazar ese byte de linebuf y tratarlo como «línea que empieza 1B antes» es complicado, así que
+            // en LOCKED se tira la línea (g_lpos=0) y se busca el siguiente marcador de verdad.
+            // control de frecuencia: para no resetear de más, solo se incrementa el contador
             g_resync_marker++;
             g_lpos = 0;
         }
