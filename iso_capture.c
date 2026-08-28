@@ -501,52 +501,42 @@ static void audio_feed_sep(const uint8_t* payload) {
     if (g_use_pw) { audio_feed_sep_pw(payload); return; }
     g_sep_count++;
 
-    // 測定期間: 初 SEP 到着してから 2 秒経過 かつ 500 SEP 以上集まるまで待つ
-    // (時間ベースだと iso 初期化で SEP が来てない時期に測定して壊れる)
+    // 測定期間: 安定動作確認後に 2 秒間の SEP レートを測定
     if (!g_measure_done) {
         if (!g_measure_started) {
             g_measure_start_s = now_monotonic_s();
             g_measure_started = 1;
+            g_sep_count = 0;
+            if (g_upsample_ratio <= 0.0) g_upsample_ratio = 2.0; // 48kHz HDMI -> 96kHz ALSA
         }
         double el = now_monotonic_s() - g_measure_start_s;
-        if (el < 2.0 || g_sep_count < 500) return;
-        double sep_rate = g_sep_count / el;
-        double audio_rate = sep_rate * 2.0;
-        double effective_sample_rate = audio_rate;
-        // 2026-07-18 3-way snap: 48/96/192 kHz の HDMI 音源に対応。
-        // 起動直後の SEP 取りこぼしで実効レートが誤検出されても、最近傍の "常識的"
-        // レートに snap することで upsample 比率暴走で波形歪む問題を防ぐ。
-        // The classification uses audio frames/s, not SEP records/s:
-        // - 21-26 kHz: 24 kHz
-        // - 43-51 kHz: 48 kHz (一般的な HDMI PCM)
-        // - 95-97 kHz: 96 kHz
-        // - 190-194 kHz: 192 kHz
-        // - どれにも該当しない = 判別不能 → 24 kHz デフォルト
-        if (effective_sample_rate >= 21000.0 && effective_sample_rate <= 26000.0) {
-            effective_sample_rate = 24000.0;
-        } else if (effective_sample_rate >= 43000.0 && effective_sample_rate <= 51000.0) {
-            effective_sample_rate = 48000.0;
-        } else if (effective_sample_rate >= 95000.0 && effective_sample_rate <= 97000.0) {
-            effective_sample_rate = 96000.0;
-        } else if (effective_sample_rate >= 190000.0 && effective_sample_rate <= 194000.0) {
-            effective_sample_rate = 192000.0;
-        } else {
-            effective_sample_rate = 24000.0;
+        if (el >= 2.0 && g_sep_count >= 500) {
+            double sep_rate = g_sep_count / el;
+            double audio_rate = sep_rate * 2.0;
+            double effective_sample_rate = audio_rate;
+            // HDMI PCM 音声の標準レート分類 (各 SEP は 2 audio frames を格納):
+            // - 40-60 kHz: 48 kHz (一般的な HDMI PCM)
+            // - 88-105 kHz: 96 kHz
+            // - 176-200 kHz: 192 kHz
+            // - 不明時は標準の 48 kHz にフォールバック
+            if (effective_sample_rate >= 40000.0 && effective_sample_rate <= 60000.0) {
+                effective_sample_rate = 48000.0;
+            } else if (effective_sample_rate >= 88000.0 && effective_sample_rate <= 105000.0) {
+                effective_sample_rate = 96000.0;
+            } else if (effective_sample_rate >= 176000.0 && effective_sample_rate <= 200000.0) {
+                effective_sample_rate = 192000.0;
+            } else {
+                effective_sample_rate = 48000.0;
+            }
+            g_upsample_ratio = 96000.0 / effective_sample_rate;
+            if (g_upsample_ratio < 0.5) g_upsample_ratio = 0.5;
+            if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
+            fprintf(stderr, "[audio] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to 96kHz mono bridge\n",
+                    sep_rate, audio_rate, effective_sample_rate, g_upsample_ratio);
+            g_measure_done = 1;
+            g_last_sample = 0;
+            g_frac_pos = 0.0;
         }
-        // Each SEP contains two input audio frames.  This ALSA bridge is fixed
-        // at 96 kHz, while the observed SEP cadence represents 24 kHz audio
-        // frames (two frames per marker). Use the nominal detected rate rather
-        // than a transient half-rate marker count, which otherwise changes the
-        // pitch and creates the demon/slow-voice effect.
-        g_upsample_ratio = 96000.0 / effective_sample_rate;
-        if (g_upsample_ratio < 0.5) g_upsample_ratio = 0.5;
-        if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
-        fprintf(stderr, "[audio] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to 96kHz mono bridge\n",
-                sep_rate, audio_rate, effective_sample_rate, g_upsample_ratio);
-        g_measure_done = 1;
-        g_last_sample = 0;
-        g_frac_pos = 0.0;
-        return;
     }
 
     if (!g_pcm || g_upsample_ratio <= 0) return;
@@ -844,46 +834,34 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         if (!g_measure_started) {
             g_measure_start_s = now_monotonic_s();
             g_measure_started = 1;
+            g_sep_count = 0;
+            if (g_upsample_ratio <= 0.0) g_upsample_ratio = 1.0; // 48kHz HDMI -> 48kHz PW stream
         }
         double el = now_monotonic_s() - g_measure_start_s;
-        if (el < 2.0 || g_sep_count < 500) return;
-        double sep_rate = g_sep_count / el;
-        double audio_rate = sep_rate * 2.0;
-        double effective_sample_rate = audio_rate;
-        // 2026-07-18 3-way snap: 48/96/192 kHz の HDMI 音源に対応。
-        // 起動直後の SEP 取りこぼしで実効レートが誤検出されても、最近傍の "常識的"
-        // レートに snap することで upsample 比率暴走で波形歪む問題を防ぐ。
-        // - 21-26 kHz: 24 kHz (この SEP stream の実測値)
-        // - 43-51 kHz: 48 kHz (一般的な HDMI PCM)
-        // - 95-97 kHz: 96 kHz
-        // - 190-194 kHz: 192 kHz
-        // - どれにも該当しない = 判別不能 → 24 kHz デフォルト
-        if (effective_sample_rate >= 21000.0 && effective_sample_rate <= 26000.0) {
-            effective_sample_rate = 24000.0;
-        } else if (effective_sample_rate >= 43000.0 && effective_sample_rate <= 51000.0) {
-            effective_sample_rate = 48000.0;
-        } else if (effective_sample_rate >= 95000.0 && effective_sample_rate <= 97000.0) {
-            effective_sample_rate = 96000.0;
-        } else if (effective_sample_rate >= 190000.0 && effective_sample_rate <= 194000.0) {
-            effective_sample_rate = 192000.0;
-        } else {
-            effective_sample_rate = 24000.0;
+        if (el >= 2.0 && g_sep_count >= 500) {
+            double sep_rate = g_sep_count / el;
+            double audio_rate = sep_rate * 2.0;
+            double effective_sample_rate = audio_rate;
+            if (effective_sample_rate >= 40000.0 && effective_sample_rate <= 60000.0) {
+                effective_sample_rate = 48000.0;
+            } else if (effective_sample_rate >= 88000.0 && effective_sample_rate <= 105000.0) {
+                effective_sample_rate = 96000.0;
+            } else if (effective_sample_rate >= 176000.0 && effective_sample_rate <= 200000.0) {
+                effective_sample_rate = 192000.0;
+            } else {
+                effective_sample_rate = 48000.0;
+            }
+            g_upsample_ratio = 48000.0 / effective_sample_rate;
+            if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
+            if (g_upsample_ratio > 4.0) g_upsample_ratio = 4.0;
+            g_pll_base_ratio = g_upsample_ratio;   // PLL の基準値として保存
+            g_pll_last_update = now_monotonic_s();
+            fprintf(stderr, "[audio-pw] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to 48kHz stream\n",
+                    sep_rate, audio_rate, effective_sample_rate, g_upsample_ratio);
+            g_measure_done = 1;
+            g_last_sample = 0;
+            g_frac_pos = 0.0;
         }
-        // 2026-07-21 P3-1: 48kHz stream 統合。Switch 96kHz なら ratio=0.5 (2:1 decimation)
-        // libsamplerate SINC が anti-alias LPF 込みで Nyquist 超え成分を除去する。
-        // Follow the observed parser cadence so the native 48kHz stream does
-        // not slowly starve when the marker rate is below its nominal value.
-        g_upsample_ratio = 48000.0 / audio_rate;
-        if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
-        if (g_upsample_ratio > 4.0) g_upsample_ratio = 4.0;
-        g_pll_base_ratio = g_upsample_ratio;   // PLL の基準値として保存
-        g_pll_last_update = now_monotonic_s();
-        fprintf(stderr, "[audio-pw] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to 48kHz stream\n",
-                sep_rate, audio_rate, effective_sample_rate, g_upsample_ratio);
-        g_measure_done = 1;
-        g_last_sample = 0;
-        g_frac_pos = 0.0;
-        return;
     }
     if (!g_pw_stream || g_upsample_ratio <= 0) return;
 
@@ -3093,35 +3071,13 @@ int main(int argc, char** argv) {
             // 2) HW mute clear: REG_RX_HWMuteCtrl(0x7D):  bit4=HWMuteClr, bit5=HWAudMuteClrMode
             IT6802W(0x7d, 0x30);   // set both
             IT6802W(0x7d, 0x00);   // clear both
-            // 3) aud_fiforst: REG_RX_074(0x74) mute I2S/WS/SPDIF (bits 0x0c) then clear
-            //    base 0xA0 (i2s+SPDIF enable) + 0x0c (mute) = 0xac; then 0xA0 (clear mute)
-            IT6802W(0x74, 0xac);
-            usleep(2000);
+            // 3) Keep I2S/SPDIF enabled and auto-detect sampling frequency (0xA0 = I2S+SPDIF ON, Auto FS)
             IT6802W(0x74, 0xa0);
-            // 4) audio logic reset: REG_RX_010(0x10) bit1 = pulse
-            //    default 0x00 → 0x02 → 0x00
-            IT6802W(0x10, 0x02);
-            IT6802W(0x10, 0x00);
-            // 5) Force FS = 96kHz (FIX_ID_023 の Switch 96kHz 整合版, 2026-07-19)
-            // 元は B_48K (0x02) だったが Switch の 96kHz 入力と衝突して I2S FIFO が
-            // 周期的に reset → 高音ジリジリの副作用 (Opus 4.8 review 6-4 指摘)。
-            // ITE SDK it680x_regs.h: #define B_96K 0x0A / B_FS_96000 (10<<0)
-            IT6802W(0x74, 0xe0);   // 0xA0 base + 0x40 (B_Force_FS)
-            IT6802W(0x7b, 0x0A);   // B_96K (Switch 音源と整合)
-            IT6802W(0x7b, 0x0A);
-            IT6802W(0x7b, 0x0A);
-            IT6802W(0x7b, 0x0A);
-            // 5b) REG_RX_075 = 0x40: Audio 24bit → 16bit conversion (ITE init default)
+            // 4) REG_RX_075 = 0x40: Audio 24bit → 16bit conversion (ITE init default)
             IT6802W(0x75, 0x40);
-            // 5c) Fable's MCLK 256fs hint: reg 0x54 bits[5:4] = 01 (HBR mode = 128fs)
-            //     Trying reg 0x54 value 0x10 to set 256fs mode for correct PCM bit clock
-            IT6802W(0x54, 0x10);
-            // 6) REG_RX_07E: clear B_HBRSel (bit6) — this WORKS for sustained audio.
-            //    (Setting bit6 breaks audio entirely — the 0x40 semantics is opposite
-            //     of the ITE macro name suggests)
+            // 5) REG_RX_07E: clear B_HBRSel (bit6) for standard audio
             IT6802W(0x7e, 0x00);
-            // 7) un-tristate I2S+SPDIF: REG_RX_052 clear only B_TriI2SIO(0x0F)+B_TriSPDIF(0x10)=0x1F
-            //    B_DisVAutoMute (0x20) should stay set per init. So value 0x20.
+            // 6) un-tristate I2S+SPDIF: REG_RX_052
             IT6802W(0x52, 0x20);
             #undef IT6802W
             last_it6802_rec = el;
