@@ -1,7 +1,7 @@
 // HD60 S: 呪文再生 + iso(alt2) キャプチャ (libusb-1.0, C)
 // node-usb が iso 非対応なので C で実装。Windows と同じ iso 経路で EP0x83 から映像(生YUYV想定)を吸う。
 //
-// build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
+// build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
 // run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (映像は captures/stream-iso.bin へ)
 //
 // ======================================================================
@@ -45,6 +45,7 @@
 #include <math.h>
 #include <signal.h>
 #include "hd60s_util.h"
+#include "hd60s_v4l2.h"
 
 #define MAX_WRITE_BYTES (64LL << 20)  // 出力ファイルは先頭64MBまで(2Gbpsで肥大化防止)
 
@@ -166,7 +167,6 @@ static int g_blk_run = 0;                          // 連続BLKカウンタ
 static uint8_t g_pend[16];
 static int g_pend_n = 0;
 
-static int g_v4l_fd = -1;
 static int g_pace_output = 0;
 static uint8_t g_pace_frame[FRAME_BYTES];
 #define PACE_QUEUE_DEPTH 4
@@ -1320,7 +1320,7 @@ static void emit_frame(void) {
                 g_frames_out + 1, g_framebuf[0], g_framebuf[FRAME_BYTES - 1],
                 (double)sum / (FRAME_BYTES / 4096));
     }
-    if (g_v4l_fd >= 0 && g_pace_output) {
+    if (hd60s_v4l2_is_open() && g_pace_output) {
         // Presentation is paced by the main loop at 60 Hz.  Queue complete
         // frames in order so normal USB/parser jitter does not repeat the
         // previous frame at a pacing tick.  If the queue is full, discard
@@ -1335,9 +1335,9 @@ static void emit_frame(void) {
         g_pace_queue_seq[g_pace_queue_head] = g_frames_out + 1;
         g_pace_queue_head = (g_pace_queue_head + 1) % PACE_QUEUE_DEPTH;
         g_pace_queue_count++;
-    } else if (g_v4l_fd >= 0) {
+    } else if (hd60s_v4l2_is_open()) {
         uint64_t write_start_ns = now_mono_ns();
-        ssize_t w = write(g_v4l_fd, g_framebuf, FRAME_BYTES);
+        ssize_t w = hd60s_v4l2_write_frame(g_framebuf, FRAME_BYTES);
         uint64_t write_done_ns = now_mono_ns();
         fprintf(stderr, "[v4l-write] seq=%llu mode=direct bytes=%zd expected=%zu %s\n",
                 ++g_v4l_write_seq, w, (size_t)FRAME_BYTES,
@@ -1385,7 +1385,7 @@ static void emit_frame(void) {
 }
 
 static void pace_output_if_due(void) {
-    if (!g_pace_output || g_v4l_fd < 0) return;
+    if (!g_pace_output || !hd60s_v4l2_is_open()) return;
     if (g_pace_queue_count == 0) {
         // Never publish the previous frame a second time.  A small source /
         // pacing-clock drift can temporarily empty the queue even though the
@@ -1401,7 +1401,7 @@ static void pace_output_if_due(void) {
     const uint8_t* frame = g_pace_queue[g_pace_queue_tail];
     unsigned long long frame_seq = g_pace_queue_seq[g_pace_queue_tail];
     uint64_t write_start_ns = now;
-    ssize_t w = write(g_v4l_fd, frame, FRAME_BYTES);
+    ssize_t w = hd60s_v4l2_write_frame(frame, FRAME_BYTES);
     uint64_t write_done_ns = now_mono_ns();
     fprintf(stderr, "[v4l-write] seq=%llu mode=paced bytes=%zd expected=%zu %s\n",
             ++g_v4l_write_seq, w, (size_t)FRAME_BYTES,
@@ -1932,75 +1932,6 @@ static void parser_notify_loss(size_t bytes_lost) {
     g_have_prev_line = 0;
     g_diag_frame_start_ns = 0;
     g_resyncs++;
-}
-
-// v4l2loopback (/dev/video42) をオープン。フォーマット設定は
-// 事前に `v4l2loopback-ctl set-caps /dev/video42 YUYV:1920x1080@60/1` で済ませておく想定。
-// (S_FMT を driver から叩くと apt 版0.15.3の挙動でCapture側フォーマットが壊れることがある)
-// fps ヒントだけ VIDIOC_S_PARM で 60fps に固定 (OBSがフレームレート一覧に60を出すために必要)
-static int v4l2_open(const char* devpath) {
-    // Nonblocking prevents the userspace capture loop from deadlocking when
-    // OBS has not opened the consumer side yet.
-    int fd = open(devpath, O_WRONLY | O_NONBLOCK);
-    if (fd < 0) { perror("open v4l2loopback"); return -1; }
-    // 🔥 2026-07-11 Opus 4.8 診断: write() only では v4l2loopback の timestamp state
-    // machine が初期化されず、consumer側でフレーム表示が止まる (VLC "Timestamp conversion
-    // failed", ffplay fd=0, mpv hang などの症状)。VIDIOC_S_FMT + STREAMON を明示して
-    // OUTPUT ストリームを"公式に開始"する。
-    struct v4l2_format vf; memset(&vf, 0, sizeof(vf));
-    vf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    vf.fmt.pix.width = 1920;
-    vf.fmt.pix.height = 1080;
-    vf.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-    vf.fmt.pix.field = V4L2_FIELD_NONE;
-    vf.fmt.pix.bytesperline = 3840;
-    vf.fmt.pix.sizeimage = 4147200;
-    vf.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
-    if (ioctl(fd, VIDIOC_S_FMT, &vf) < 0) {
-        fprintf(stderr, "[v4l2] S_FMT 失敗: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    // S_FMT is a negotiation: the driver is allowed to change every field.
-    // Verify the negotiated format before any frame is written.  Accepting a
-    // different stride or size here would make a valid YUYV frame appear as a
-    // vertical roll or horizontal bands in the consumer.
-    struct v4l2_format actual;
-    memset(&actual, 0, sizeof(actual));
-    actual.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    if (ioctl(fd, VIDIOC_G_FMT, &actual) < 0) {
-        fprintf(stderr, "[v4l2] G_FMT 失敗: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-    fprintf(stderr,
-            "[v4l2] negotiated %ux%u pixfmt=0x%08x field=%u bytesperline=%u sizeimage=%u\n",
-            actual.fmt.pix.width, actual.fmt.pix.height,
-            actual.fmt.pix.pixelformat, actual.fmt.pix.field,
-            actual.fmt.pix.bytesperline, actual.fmt.pix.sizeimage);
-    if (actual.fmt.pix.width != FRAME_W || actual.fmt.pix.height != FRAME_H ||
-        actual.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV ||
-        actual.fmt.pix.bytesperline != LINE_BYTES ||
-        actual.fmt.pix.sizeimage != FRAME_BYTES) {
-        fprintf(stderr,
-                "[v4l2] incompatible negotiated format; refusing frame writes\n");
-        close(fd);
-        return -1;
-    }
-
-    struct v4l2_streamparm sp; memset(&sp, 0, sizeof(sp));
-    sp.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    sp.parm.output.timeperframe.numerator = 1;
-    sp.parm.output.timeperframe.denominator = 60;
-    if (ioctl(fd, VIDIOC_S_PARM, &sp) < 0) fprintf(stderr, "[v4l2] S_PARM fps60 失敗(続行)\n");
-
-    // v4l2loopback's write() interface owns the OUTPUT queue.  Calling
-    // VIDIOC_STREAMON here can block waiting for a queue state that is
-    // established by the consumer (OBS), so leave the queue in write mode.
-    // A complete frame is submitted by each write(FRAME_BYTES) below.
-    fprintf(stderr, "[v4l2] %s opened (YUYV 1920x1080 @60fps, S_FMT/write mode)\n", devpath);
-    return fd;
 }
 
 // ======================================================================
@@ -2618,7 +2549,7 @@ int main(int argc, char** argv) {
         unsigned char bulk_buf[1024 * 32];
         int nonempty = 0;
         FILE *bulk_dump = fopen("/tmp/hd60s-bulk-stream.bin", "wb");
-        g_v4l_fd = v4l2_open("/dev/video42");
+        hd60s_v4l2_open("/dev/video42");
         int bulk_count = 200;
         const char *bulk_env = getenv("HD60S_BULK_COUNT");
         if (bulk_env && *bulk_env) bulk_count = atoi(bulk_env);
@@ -2646,12 +2577,7 @@ int main(int argc, char** argv) {
         }
         if (bulk_dump) fclose(bulk_dump);
         fprintf(stderr, "[bulk] nonempty_transfers=%d\n", nonempty);
-        if (g_v4l_fd >= 0) {
-            enum v4l2_buf_type bulk_type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-            ioctl(g_v4l_fd, VIDIOC_STREAMOFF, &bulk_type);
-            close(g_v4l_fd);
-            g_v4l_fd = -1;
-        }
+        hd60s_v4l2_close();
         fprintf(stderr, "[bulk] bytes=%lld frames=%llu resyncs=%llu\n",
                 total_bytes, g_frames_out, g_resyncs);
         libusb_release_interface(h, 0);
@@ -2673,7 +2599,7 @@ int main(int argc, char** argv) {
     }
 
     // v4l2loopback (/dev/video42) をオープン。失敗しても続行(生ストリームだけ保存)。
-    g_v4l_fd = v4l2_open("/dev/video42");
+    hd60s_v4l2_open("/dev/video42");
     // ALSA snd-aloop hw:10,0 をオープン。環境変数 HD60S_ALSA_DEV でデバイス指定可能。
     const char* alsa_dev = getenv("HD60S_ALSA_DEV");
     if (!alsa_dev) alsa_dev = "hw:10,0";
@@ -3427,11 +3353,7 @@ int main(int argc, char** argv) {
 capture_cleanup:
     cleanup_iso_transfers(h, xfrs, bufs, devmem, NUM_TRANSFERS, transfer_bytes);
     if (outf) fclose(outf);
-    if (g_v4l_fd >= 0) {
-        enum v4l2_buf_type btype = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-        ioctl(g_v4l_fd, VIDIOC_STREAMOFF, &btype);
-        close(g_v4l_fd);
-    }
+    hd60s_v4l2_close();
     audio_close();
     fprintf(stderr, "\n=== HD60S Linux driver stats ===\n");
     fprintf(stderr, "iso pkts:  ok=%ld empty=%ld err=%ld (empty=%.2f%%)\n",
