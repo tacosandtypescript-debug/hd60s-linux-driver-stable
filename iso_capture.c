@@ -2286,6 +2286,23 @@ static void load_burst(const char* path) {
     fprintf(stderr, "[burst] %d コマンド ロード\n", g_nburst);
 }
 
+static int apply_it6802_audio94_config(libusb_device_handle* h) {
+    #include "post_iso_audio94.inc"
+    int ok94 = 0;
+    fprintf(stderr, "[audio-init] applying IT6802E bank 0x94 audio configuration (%d writes)...\n",
+            post_iso_audio94_n);
+    for (int u = 0; u < post_iso_audio94_n; u++) {
+        unsigned char w[3] = {post_iso_audio94[u].b0,
+                              post_iso_audio94[u].b1,
+                              post_iso_audio94[u].b2};
+        int r = libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w, 3, 200);
+        if (r == 3) ok94++;
+        usleep(600);
+    }
+    fprintf(stderr, "[audio-init] IT6802E bank 0x94 audio config: %d/%d OK\n", ok94, post_iso_audio94_n);
+    return ok94;
+}
+
 // ======================================================================
 // SECTION 4: main (デバイス open → 呪文再生 → iso キャプチャ → 統計出力)
 // ======================================================================
@@ -2453,7 +2470,7 @@ int main(int argc, char** argv) {
     if (!skip_init) {
         // 環境変数 HD60S_INIT_TSV で init TSV path を切り替え可能
         const char* init_tsv = getenv("HD60S_INIT_TSV");
-        if (!init_tsv || !*init_tsv) init_tsv = "analysis/init-timed.tsv";
+        if (!init_tsv || !*init_tsv) init_tsv = "analysis/init-p2-audio-fast.tsv";
         fprintf(stderr, "[main] init: %s\n", init_tsv);
         replay_spell(h, init_tsv);
         if (g_rdlog) { fclose(g_rdlog); g_rdlog = NULL; }
@@ -2577,7 +2594,7 @@ int main(int argc, char** argv) {
     int skip_burst = skip_init || (env_skip_burst && env_skip_burst[0] && env_skip_burst[0] != '0' && env_skip_burst[0] != 'n' && env_skip_burst[0] != 'N');
     if (!skip_burst) {
         const char* burst_tsv = getenv("HD60S_BURST_TSV");
-        if (!burst_tsv || !*burst_tsv) burst_tsv = "analysis/poststream-full.tsv";
+        if (!burst_tsv || !*burst_tsv) burst_tsv = "analysis/poststream-no9a.tsv";
         load_burst(burst_tsv);
     } else {
         fprintf(stderr, "[main] burst load 省略\n");
@@ -2666,6 +2683,15 @@ int main(int argc, char** argv) {
     { struct timeval td={0, 120000}; libusb_handle_events_timeout(NULL, &td); }
     fprintf(stderr, "[main] iso開始 %d秒\n", read_sec);
 
+    // IT6802E bank 0x94 audio setup: 0x0e=0x8b, 0x0f=0x8b, 0x10=0x05, 0x11=0x05, etc.
+    // Must be applied before audio_open() and before submitting ISO transfers.
+    // Active by default on the stable path (opt-out with HD60S_POST_ISO_AUDIO94=0).
+    const char* env_pia94 = getenv("HD60S_POST_ISO_AUDIO94");
+    int do_pia94 = !(env_pia94 && (env_pia94[0] == '0' || env_pia94[0] == 'n' || env_pia94[0] == 'N'));
+    if (do_pia94) {
+        apply_it6802_audio94_config(h);
+    }
+
     // v4l2loopback (/dev/video42) をオープン。失敗しても続行(生ストリームだけ保存)。
     g_v4l_fd = v4l2_open("/dev/video42");
     // ALSA snd-aloop hw:10,0 をオープン。環境変数 HD60S_ALSA_DEV でデバイス指定可能。
@@ -2725,8 +2751,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[audio-unmute] IT6802E (0x94 bank) audio path unmute...\n");
         // IT6802E に一連のコマンドを送る (bank select → HWMUTE_CTRL clear → TRISTATE_CTRL clear)
         struct { unsigned char slave, reg, val; const char* name; } audio_unmute[] = {
-            // reg 0x0f はページ選択 register (Fable 発見)
-            {0x94, 0x0f, 0x02, "bank2 (audio) select"},
+            {0x94, 0x0f, 0x8b, "reg 0x0f audio clock enable"},
             // reg 0x87 (REG_RX_HWMUTE_CTRL): bit3=HW_MUTE_EN, bit4=MUTE_CLR
             //   = 0x10 → クリア (bit4 立てて bit3 クリア)
             {0x94, 0x87, 0x10, "reg 0x87 HWMUTE clear + disable"},
@@ -2750,8 +2775,7 @@ int main(int argc, char** argv) {
     if (env_audio_v2 && env_audio_v2[0] && env_audio_v2[0] != '0' && env_audio_v2[0] != 'n' && env_audio_v2[0] != 'N') {
         fprintf(stderr, "[audio-unmute-v2] IT6802E (正しい reg) audio path unmute...\n");
         struct { unsigned char slave, reg, val; const char* name; } audio_unmute_v2[] = {
-            // page select — ページ2/audio bank へ
-            {0x94, 0x0f, 0x02, "bank2 (audio) select"},
+            {0x94, 0x0f, 0x8b, "reg 0x0f audio clock enable"},
             // REG_RX_HWMuteCtrl = 0x7D
             //   bit3=HWMuteEn (0=disable HW mute), bit4=HWMuteClr (1=clear mute)
             //   0x10 = bit4 set, bit3 clear
@@ -3003,28 +3027,9 @@ int main(int argc, char** argv) {
 
     }
 
-    // The Windows post-ISO audio-bank setup must be applied before the first
-    // audio SEP is measured.  Otherwise the IT6802E can initially emit a
-    // half-rate/muted SEP cadence and the bridge would lock to the wrong pitch.
-    {
-        const char* env_pia94 = getenv("HD60S_POST_ISO_AUDIO94");
-        int do_pia94 = env_pia94 && env_pia94[0] && env_pia94[0] != '0' &&
-                       env_pia94[0] != 'n' && env_pia94[0] != 'N';
-        if (do_pia94) {
-            #include "post_iso_audio94.inc"
-            int ok94 = 0;
-            fprintf(stderr, "[post-iso-audio94] applying %d writes before SEP measurement\n",
-                    post_iso_audio94_n);
-            for (int u = 0; u < post_iso_audio94_n; u++) {
-                unsigned char w[3] = {post_iso_audio94[u].b0,
-                                      post_iso_audio94[u].b1,
-                                      post_iso_audio94[u].b2};
-                int r = libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w, 3, 200);
-                if (r == 3) ok94++;
-                usleep(600);
-            }
-            fprintf(stderr, "[post-iso-audio94] applied %d/%d OK\n", ok94, post_iso_audio94_n);
-        }
+    // IT6802E bank 0x94 audio setup (also applied before audio stream open).
+    if (do_pia94) {
+        apply_it6802_audio94_config(h);
     }
 
     // iso をポンプしながら、点火バーストを相対タイムスタンプ準拠で発行する。
@@ -3123,8 +3128,11 @@ int main(int argc, char** argv) {
                 unsigned char _w[3] = {0x94, (reg), (val)}; \
                 libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _w, 3, 100); \
             } while (0)
-            // 1) select bank 0 (audio channel status is bank 2 but recovery regs are bank 0)
-            IT6802W(0x0f, 0x00);
+            // 1) Maintain verified bank 0x94 audio config (0x0e=0x8b, 0x0f=0x8b, 0x10=0x05, 0x11=0x05)
+            IT6802W(0x0e, 0x8b);
+            IT6802W(0x0f, 0x8b);
+            IT6802W(0x10, 0x05);
+            IT6802W(0x11, 0x05);
             // 2) HW mute clear: REG_RX_HWMuteCtrl(0x7D):  bit4=HWMuteClr, bit5=HWAudMuteClrMode
             IT6802W(0x7d, 0x30);   // set both
             IT6802W(0x7d, 0x00);   // clear both
