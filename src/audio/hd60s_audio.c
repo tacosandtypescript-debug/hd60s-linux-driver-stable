@@ -20,10 +20,10 @@
 static int g_use_pw = 0;
 
 // ======================================================================
-// SECTION 2: ALSA 音声出力 (snd-aloop 経由)
+// SECTION 2: salida de audio ALSA (vía snd-aloop)
 // ======================================================================
-// ALSA snd-aloop 出力
-// SEP payload の実測構造: 8B = 2 stereo S16_LE frames, interleaved as
+// salida ALSA snd-aloop
+// estructura medida del SEP payload: 8B = 2 stereo S16_LE frames, interleaved as
 // L0,R0,L1,R1. The observed SEP cadence is about 24,000 records/s, so each
 // record contains two audio frames at the normal 48kHz HDMI rate. Downmix
 // both frames to mono before resampling to the OBS bridge rate.
@@ -35,7 +35,7 @@ static _Atomic unsigned long long g_audio_bytes = 0;
 static _Atomic unsigned long long g_audio_samples_in = 0;
 static _Atomic unsigned long long g_audio_samples_out = 0;
 static _Atomic unsigned long long g_audio_pw_underflow = 0;
-#define AUDIO_BATCH_FRAMES 960  // 10ms 相当 (96kHz mono OBS bridge)
+#define AUDIO_BATCH_FRAMES 960  // ~10ms (96kHz mono OBS bridge)
 static int16_t g_audio_buf[AUDIO_BATCH_FRAMES];  // mono
 static int g_audio_buf_pos = 0;
 
@@ -69,15 +69,15 @@ typedef struct {
 
 static AudioCadenceState g_audio_cadence = {0};
 static int g_sep_count = 0;
-// 96kHz bridge へ補間する比率 (0=固定計算前)
+// ratio de interpolación hacia el bridge 96kHz (0=antes del cálculo fijo)
 static double g_upsample_ratio = 0.0;
 static double g_pll_base_ratio = 0.0;
 static double g_pll_last_update = 0.0;
 static double g_pll_integral = 0.0;
 static unsigned long long g_pll_updates = 0;
-// 補間状態: 前回の終点サンプル (次の補間の起点)
+// estado de interpolación: último sample de fin (origen de la siguiente interp)
 static int16_t g_last_sample = 0;
-// 分数遅延累積 (次に何 samples 出すかの端数管理)
+// acumulado de delay fraccionario (gestión del resto de samples a emitir)
 static double g_frac_pos = 0.0;
 
 static void audio_track_cadence_and_recalibrate(int is_active) {
@@ -204,7 +204,7 @@ static void decode_sep_mono(const uint8_t* payload, int16_t mono[2]) {
     mono[1] = (int16_t)((l1 + r1) / 2);
 }
 
-// PipeWire 版の前方宣言 (定義は後段)
+// forward declaration de la versión PipeWire (definición más abajo)
 static int audio_pw_open(void);
 static void audio_pw_close(void);
 static void audio_feed_sep_pw(const uint8_t* payload);
@@ -212,7 +212,7 @@ static int audio_writer_start(void);
 static void audio_writer_stop(void);
 
 static void audio_open(const char* pcm_name) {
-    // HD60S_AUDIO_PW=1 で PipeWire ネイティブ実装に分岐
+    // HD60S_AUDIO_PW=1 ramifica a la implementación nativa PipeWire
     const char* env_pw = getenv("HD60S_AUDIO_PW");
     if (env_pw && env_pw[0] && env_pw[0] != '0' && env_pw[0] != 'n') {
         if (audio_pw_open() == 0) {
@@ -234,7 +234,7 @@ static void audio_open(const char* pcm_name) {
         1,          // mono
         96000,      // OBS-facing snd-aloop bridge rate
         1,          // soft resample
-        200000);    // 200ms latency (余裕を持たせる)
+        200000);    // 200ms latency (dejar holgura)
     if (err < 0) {
         fprintf(stderr, "[audio] snd_pcm_set_params failed: %s\n", snd_strerror(err));
         snd_pcm_close(g_pcm); g_pcm = NULL;
@@ -351,7 +351,7 @@ static void audio_flush(void) {
     g_audio_buf_pos = 0;
 }
 
-// SEP の L/R ペアを mono に downmix し、欠落分を 96kHz bridge へ線形補間して出力する。
+// downmix L/R del SEP a mono y sale al bridge 96kHz con interpolación lineal de huecos.
 static void audio_feed_sep(const uint8_t* payload) {
     g_audio_packets++;
     g_audio_bytes += 8;
@@ -378,7 +378,7 @@ static void audio_feed_sep(const uint8_t* payload) {
 
     for (int sample_index = 0; sample_index < 2; sample_index++) {
         int16_t cur = mono[sample_index];
-        // 各入力 sample を upsample_ratio 個の出力 sample に展開
+        // expande cada sample de entrada a upsample_ratio samples de salida
         // linear interpolation: prev (g_last_sample) → cur
         double count = g_upsample_ratio + g_frac_pos;
         int n = (int)count;
@@ -397,33 +397,33 @@ static void audio_feed_sep(const uint8_t* payload) {
 }
 
 // ======================================================================
-// 🔥 libpipewire ネイティブ実装 (Opus 4.8 提案、2026-07-11)
-// 前実装: iso_capture → snd_aloop → arecord|aplay → PipeWire = 4段バッファ
-// 新実装: iso_capture → pw_stream (直接) = 1段のみ、~2.6ms/quantum に到達
-// 環境変数 HD60S_AUDIO_PW=1 で有効化。ALSA 実装との A/B 比較用にフラグ化。
+// 🔥 implementación nativa libpipewire (propuesta Opus 4.8, 2026-07-11)
+// antes: iso_capture → snd_aloop → arecord|aplay → PipeWire = 4 etapas de buffer
+// ahora: iso_capture → pw_stream (directo) = 1 etapa, ~2.6ms/quantum
+// se activa con env HD60S_AUDIO_PW=1. Flag para A/B frente a la impl ALSA.
 // ======================================================================
 static struct pw_thread_loop* g_pw_loop = NULL;
 static struct pw_stream* g_pw_stream = NULL;
 static int g_pw_initialized = 0;
 static int g_pw_started = 0;
-// ring buffer (mono int16 samples). Producer: iso_capture (audio_feed_sep 経由).
-// Consumer: pipewire process コールバック (別スレッド)。
-// 🔥 kusq テストで判明: 683ms は大きすぎて古い音蓄積 → 遅延。
-// 4096 samples @ 96kHz = 43ms に削減、さらに満杯で古いのから破棄 (最新優先)。
+// ring buffer (mono int16 samples). Producer: iso_capture (vía audio_feed_sep).
+// Consumer: callback process de pipewire (otro hilo).
+// 🔥 test de kusq: 683ms es demasiado; se acumula audio viejo → latencia.
+// recortado a 4096 samples @ 96kHz = 43ms; si está lleno, tira lo viejo (prioriza lo nuevo).
 #define PW_RING_SIZE 16384
-// PW スレッドが「読み残し」しないように、目標水位 = 1 quantum 分 (128 samples ~1.3ms).
+// para que el hilo PW no deje «sin leer», nivel objetivo = 1 quantum (128 samples ~1.3ms).
 #define PW_TARGET_FILL 1024
-// 2026-07-18 lock-free SPSC ring: producer は head のみ更新、consumer は tail のみ更新。
-// pthread_mutex 撤廃で priority inversion (RT thread が producer の mutex を待つ) を根絶。
-// release/acquire ordering で書いた samples が cross-thread に可視化されることを保証。
-// alignas(64): false sharing 回避 (producer/consumer が別 CPU で走る時、head と tail が
-// 同じキャッシュラインだと片方書くたびに逆側 invalidate = SPSC のコアメリット消える)。
-alignas(64) static _Atomic uint32_t g_pw_ring_head = 0;  // producer 専用 (iso スレッド)
-alignas(64) static _Atomic uint32_t g_pw_ring_tail = 0;  // consumer 専用 (pw スレッド)
+// 2026-07-18 lock-free SPSC ring: el producer solo toca head, el consumer solo tail.
+// sin pthread_mutex se elimina la priority inversion (el hilo RT esperando el mutex del producer).
+// ordering release/acquire garantiza que los samples escritos se ven cross-thread.
+// alignas(64): evita false sharing (si producer/consumer van en CPU distintas, head y tail
+// en la misma cache line invalidan al otro en cada write = se pierde el mérito SPSC).
+alignas(64) static _Atomic uint32_t g_pw_ring_head = 0;  // solo producer (hilo iso)
+alignas(64) static _Atomic uint32_t g_pw_ring_tail = 0;  // solo consumer (hilo pw)
 alignas(64) static int16_t g_pw_ring[PW_RING_SIZE];
-// drop counters (障害調査用、毎秒 24k SEP でも atomic incr のオーバーヘッド無視可)
-static _Atomic uint64_t g_pw_drops_old = 0;   // consumer 側 fast-forward した sample 数
-static _Atomic uint64_t g_pw_drops_new = 0;   // producer 側で full により書けなかった数
+// drop counters (para diagnóstico; a 24k SEP/s el coste de atomic incr es irrelevante)
+static _Atomic uint64_t g_pw_drops_old = 0;   // samples que el consumer hizo fast-forward
+static _Atomic uint64_t g_pw_drops_new = 0;   // samples que el producer no pudo escribir (full)
 static _Atomic uint64_t g_pw_process_calls = 0;
 static _Atomic uint64_t g_pw_output_writes = 0;
 static _Atomic uint64_t g_pw_output_frames = 0;
@@ -431,14 +431,14 @@ static _Atomic uint64_t g_pw_output_errors = 0;
 static _Atomic uint32_t g_pw_fill_min = UINT32_MAX;
 static _Atomic uint32_t g_pw_fill_max = 0;
 
-// PW process コールバック用の状態
-static int16_t g_pw_last_sample = 0;  // underflow 時の連続性維持用
+// estado para el callback process de PW
+static int16_t g_pw_last_sample = 0;  // continuidad en underflow
 
-// pw_stream process コールバック: PipeWire RT スレッドから呼ばれる。ring から
-// dequeue して PW バッファに書き込む。
-// 🔥 音割れ対策: underflow 時は 0 埋めでなく last_sample を decay させる
-// 🔥 2026-07-18 lock-free SPSC: producer と mutex 争わない。溜まりすぎ時の drop-old
-//    責任を consumer 側に集約 (SPSC の tail 単一書き込み者ルールを守るため)。
+// callback process de pw_stream: lo llama el hilo RT de PipeWire. Dequeue del ring
+// y escribe en el buffer PW.
+// 🔥 anti-clipping: en underflow no rellenar con 0; decay de last_sample
+// 🔥 2026-07-18 lock-free SPSC: no pelea el mutex con el producer. El drop-old
+//    queda en el consumer (para respetar la regla SPSC de un solo escritor de tail).
 static void pw_on_process(void* userdata) {
     (void)userdata;
     atomic_fetch_add_explicit(&g_pw_process_calls, 1, memory_order_relaxed);
@@ -457,12 +457,12 @@ static void pw_on_process(void* userdata) {
     int16_t* dst = (int16_t*)buf->datas[0].data;
     uint32_t max_frames = buf->datas[0].maxsize / sizeof(int16_t);
     uint32_t want = b->requested;
-    // requested==0 は「PW 側で決めて」の合図。max_frames まで消費すると ring 空 →
-    // 次コールで無音 40ms、なので 1 quantum 目安の TARGET_FILL に抑える
+    // requested==0 = «que lo decida PW». Si se consume hasta max_frames el ring queda vacío →
+    // 40ms de silencio en la siguiente llamada, así que se limita a TARGET_FILL (~1 quantum)
     if (want == 0) want = PW_TARGET_FILL;
     if (want > max_frames) want = max_frames;
 
-    // acquire: producer が書いた samples が可視化されることを保証
+    // acquire: garantiza que se ven los samples que escribió el producer
     uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_acquire);
     uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
     uint32_t avail = (head - tail) & (PW_RING_SIZE - 1);
@@ -473,9 +473,9 @@ static void pw_on_process(void* userdata) {
     while (avail > old_max && !atomic_compare_exchange_weak_explicit(
         &g_pw_fill_max, &old_max, avail, memory_order_relaxed, memory_order_relaxed)) {}
 
-    // 2026-07-18 soft-drop: 一度に大量捨てると可聴クリックが出るので、TARGET*3 (~8ms)
-    // 超えを検出したら 128 samples (1.3ms, 1 quantum) だけ捨てる。発動頻度は上がるが
-    // 1 回のジャンプが小さくなりクリック体感 << ハード drop。
+    // 2026-07-18 soft-drop: tirar mucho de golpe produce un click audible, así que si se pasa
+    // de TARGET*3 (~8ms) solo tira 128 samples (1.3ms, 1 quantum). Dispara más a menudo, pero
+    // el salto es más chico y el click se siente << que un drop duro.
     if (avail > PW_TARGET_FILL * 3) {
         uint32_t drop = 128;
         tail = (tail + drop) & (PW_RING_SIZE - 1);
@@ -491,18 +491,18 @@ static void pw_on_process(void* userdata) {
     if (n > 0) g_pw_last_sample = dst[n-1];
     g_audio_samples_out += n;
 
-    // 🔥 underflow 埋め: 0 でなく last_sample を高速に減衰 (連続性維持でクリック回避)
+    // 🔥 relleno de underflow: no 0; atenúa last_sample rápido (continuidad, evita click)
     int32_t decay = g_pw_last_sample;
     for (uint32_t i = n; i < want; i++) {
-        // 指数減衰: 25 samples ごとに 3/4 (~1ms で急速に silence)
+        // decay exponencial: ×3/4 cada 25 samples (~1ms hasta silence)
         decay = decay * 245 / 256;  // 0.957x per sample
         dst[i] = (int16_t)decay;
     }
     g_pw_last_sample = decay;
 
-    // release: 次の pop_process 呼び出し時に、samples 読み込みより先に tail 更新が
-    // 見えても副作用ないよう (自分自身しか tail 書かないので単純だが、producer 側の
-    // fill 判定に影響するので明示的に release)
+    // release: en el siguiente pop_process, si se ve el update de tail antes de leer samples
+    // no hay efecto (solo este hilo escribe tail, así que es simple, pero influye en el
+    // fill del producer, por eso release explícito)
     atomic_store_explicit(&g_pw_ring_tail, (tail + n) & (PW_RING_SIZE - 1),
                           memory_order_release);
 
@@ -519,22 +519,22 @@ static const struct pw_stream_events g_pw_events = {
     .process = pw_on_process,
 };
 
-// 2026-07-19 libsamplerate 導入: linear interp の高音色付け (Opus 4.8 A1 指摘) 対策。
-// SRC_SINC_MEDIUM_QUALITY = 位相・振幅ともに ~-100 dB THD、i7-12700 で <1% CPU 予想。
+// 2026-07-19 se mete libsamplerate: contra el coloreado de agudos del linear interp (Opus 4.8 A1).
+// SRC_SINC_MEDIUM_QUALITY = ~-100 dB THD en fase y amplitud; <1% CPU estimado en i7-12700.
 static SRC_STATE* g_src = NULL;
 static int g_src_ok = 0;
 
-// ring バッファに samples を batch で書き込む (iso スレッドから)
-// 🔥 2026-07-18 lock-free SPSC + batch: 従来 per-sample の mutex を排除。
-//    full なら drop-new (書かない)。drop-old ロジックは consumer (pw_on_process) 側で。
+// escribe samples al ring en batch (desde el hilo iso)
+// 🔥 2026-07-18 lock-free SPSC + batch: se quita el mutex per-sample de antes.
+//    si full, drop-new (no escribe). El drop-old vive en el consumer (pw_on_process).
 static void pw_ring_push_batch(const int16_t* samples, int n) {
     if (n <= 0) return;
-    // relaxed: head は自分専用書き込み、ここでは最新値だけ拾えれば OK
+    // relaxed: head es write solo mío; aquí basta con el valor más reciente
     uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_relaxed);
-    // acquire: consumer が tail を進めた分の空き space が自分に見えるように
+    // acquire: para ver el space que el consumer liberó al avanzar tail
     uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_acquire);
     uint32_t fill = (head - tail) & (PW_RING_SIZE - 1);
-    uint32_t space = PW_RING_SIZE - 1 - fill;   // -1 は full/empty 区別のため
+    uint32_t space = PW_RING_SIZE - 1 - fill;   // -1 para distinguir full/empty
     int to_write = (n < (int)space) ? n : (int)space;
     int dropped = n - to_write;
     g_audio_samples_in += (unsigned long long)n;
@@ -544,7 +544,7 @@ static void pw_ring_push_batch(const int16_t* samples, int n) {
     for (int i = 0; i < to_write; i++) {
         g_pw_ring[(head + i) & (PW_RING_SIZE - 1)] = samples[i];
     }
-    // release: consumer が新しい head を見た時に samples 書き込みも見えることを保証
+    // release: cuando el consumer ve el head nuevo, también ve los samples escritos
     atomic_store_explicit(&g_pw_ring_head, (head + to_write) & (PW_RING_SIZE - 1),
                           memory_order_release);
 }
@@ -590,10 +590,10 @@ static int audio_pw_open(void) {
         return -1;
     }
 
-    // 2026-07-21 P3-1: PW stream rate を 48kHz に統合。graph rate と一致するので
-    // PipeWire の内部 96→48 リサンプラー段が消滅、高音の色付け・ジッター (「ポポポ」
-    // 音の一因) の主犯を潰す。iso_capture 側で libsamplerate SINC が Switch 96kHz →
-    // 48kHz の anti-alias 込みダウンサンプルを担う。
+    // 2026-07-21 P3-1: rate del stream PW unificado a 48kHz. Coincide con el graph rate,
+    // así que desaparece el resample interno 96→48 de PipeWire. Se mata al culpable del
+    // coloreado de agudos y jitter («popopó»). En iso_capture, libsamplerate SINC hace el
+    // downsample Switch 96kHz → 48kHz con anti-alias.
     uint8_t buffer[1024];
     struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     struct spa_audio_info_raw info = SPA_AUDIO_INFO_RAW_INIT(
@@ -639,8 +639,8 @@ static int audio_pw_open(void) {
     g_pw_started = 1;
     fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE mono)\n");
 
-    // 2026-07-19 libsamplerate 初期化 (SINC MEDIUM QUALITY): linear interp より
-    // 位相・振幅の色付けが激減。SEP レート測定完了後に src_ratio を set する。
+    // 2026-07-19 init de libsamplerate (SINC MEDIUM QUALITY): mucho menos coloreado
+    // de fase/amplitud que linear interp. src_ratio se setea tras medir el rate SEP.
     int src_err = 0;
     g_src = src_new(SRC_SINC_MEDIUM_QUALITY, 1, &src_err);
     if (!g_src) {
@@ -674,7 +674,7 @@ static void audio_pw_close(void) {
     }
 }
 
-// audio_feed_sep の PipeWire 版: upsample した samples を ring に push
+// versión PipeWire de audio_feed_sep: push al ring de los samples upsampleados
 static void audio_feed_sep_pw(const uint8_t* payload) {
     int16_t mono[2];
     decode_sep_mono(payload, mono);
@@ -683,11 +683,11 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
     audio_track_cadence_and_recalibrate(is_active);
     if (!g_pw_stream || g_upsample_ratio <= 0) return;
 
-    // 2026-07-19 PLL update: 1 秒周期で ring fill error から upsample_ratio を微調整。
-    // drift 起因の時間経過ジリジリ悪化を吸収する adaptive rate follow。
-    // ゲイン: 100ppm drift = 9.6 samples/s のズレ、Kp=1e-6, Ki=1e-7 で 30-60秒で追従。
-    // ⚠️ 2026-07-19 kusq 実聴: PLL が動的に ratio を変えることで "不協和音気味" の副作用
-    //    (音程がゆらぐ) 発生。default 無効化、HD60S_PLL_ENABLE=1 で opt-in に変更。
+    // 2026-07-19 PLL update: cada 1s ajusta upsample_ratio a partir del error de fill del ring.
+    // adaptive rate follow que absorbe el empeoramiento lento por drift.
+    // ganancia: 100ppm drift = 9.6 samples/s de desvío; con Kp=1e-6, Ki=1e-7 sigue en 30-60s.
+    // ⚠️ 2026-07-19 escucha kusq: al cambiar el ratio al vuelo el PLL produce un efecto «algo disonante»
+    //    (el tono se mueve). Default off; opt-in con HD60S_PLL_ENABLE=1.
     static int pll_checked = 0, pll_enabled = 0;
     if (!pll_checked) {
         pll_enabled = getenv("HD60S_PLL_ENABLE") ? 1 : 0;
@@ -701,19 +701,19 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
             uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_relaxed);
             uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
             int32_t fill = (int32_t)((head - tail) & (PW_RING_SIZE - 1));
-            int32_t err = fill - (int32_t)PW_TARGET_FILL;  // +=溜まりすぎ、-=足りない
+            int32_t err = fill - (int32_t)PW_TARGET_FILL;  // +=demasiado lleno, -=falta
             g_pll_integral += (double)err * dt;
-            // 積分暴走防止クランプ
+            // clamp anti-runaway del integrador
             if (g_pll_integral > 100000.0) g_pll_integral = 100000.0;
             if (g_pll_integral < -100000.0) g_pll_integral = -100000.0;
             double kp = 1e-6, ki = 1e-7;
             double adjust = kp * (double)err + ki * g_pll_integral;
-            // 1 回の補正量にクランプ (暴走発振防止)
+            // clamp de la corrección por paso (anti-oscilación)
             if (adjust > 5e-4) adjust = 5e-4;
             if (adjust < -5e-4) adjust = -5e-4;
-            // ratio 減らす = 出力サンプル減る = 溜まってる時 (err>0) は減らす
+            // bajar ratio = menos samples de salida = si está lleno (err>0) se baja
             double new_ratio = g_upsample_ratio - adjust;
-            // 基準値から ±5% を絶対上限 (95kHz snap 時 base=1.000, 範囲 [0.95, 1.05])
+            // tope absoluto ±5% respecto a la base (snap 95kHz base=1.000, rango [0.95, 1.05])
             double lo = g_pll_base_ratio * 0.95;
             double hi = g_pll_base_ratio * 1.05;
             if (new_ratio < lo) new_ratio = lo;
@@ -728,7 +728,7 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         }
     }
 
-    // 2026-07-19 libsamplerate (SINC 補間) 経路。使えない時は旧 linear interp に fallback。
+    // 2026-07-19 ruta libsamplerate (interp SINC). Si no se puede, fallback al linear interp viejo.
     if (g_src_ok) {
         // int16 → float [-1,1)
         float input[2] = {
@@ -757,10 +757,10 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
             pw_ring_push_batch(batch, bi);
             return;
         }
-        // src_process 失敗時は fallback へ落ちる (稀)
+        // si src_process falla, cae al fallback (raro)
     }
 
-    // Fallback: 旧 linear interp (libsamplerate init 失敗時のみ)
+    // Fallback: linear interp viejo (solo si falla el init de libsamplerate)
     int16_t batch[32];
     int bi = 0;
     for (int k = 0; k < 2; k++) {
