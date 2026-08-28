@@ -20,23 +20,22 @@
 `./hd60s live` 一発で:
 
 - ✅ **1080p60 YUYV 映像キャプチャ** → `/dev/video42` (v4l2loopback) → OBS Studio / mpv / ffmpeg などから利用
-- ✅ **96kHz mono 音声出力** (SEP の 2 stereo `S16_LE` frames `L0,R0,L1,R1` → L/R downmix + bridge resample) → `snd-aloop` playback `hw:10,0` / capture `hw:10,1` → PipeWire source `hd60s_capture` → OBS
-- ✅ **音声ソース自動公開** → supervisor が `module-alsa-source` を重複なくロードし、OBS から選択可能
+- ✅ **96kHz mono 音声** (SEP payload → downmix + libsamplerate) → `snd-aloop` playback `hw:10,0` / capture `hw:10,1` → PipeWire-Pulse source `hd60s_capture` → OBS
 - ✅ **HDMI パススルー** (HD60 S HDMI OUT → TV) を並行して 低遅延で維持 (ゲームプレイに使える)
 - ✅ **iso capture と パススルー 同時動作** (Windows Elgato Game Capture ソフトと同じ運用パターンが可能)
+- ✅ **USB 切断後の自動再試行** (`run-hd60s-obs.sh` がデバイス再列挙を待って `iso_capture` を再起動)
 
-Nintendo Switch を接続した過去の実機 run では動作を確認済み (iso packet loss ~5-7%)。
-この checkout では parser/build/install の offline 検証を済ませているが、HD60 S が未接続のため、現在のホストでの OBS と再接続の実機検証は未完了。
+Nintendo Switch を接続して 動作確認済み。長時間プレイでも安定 (iso packet loss ~5-7%)。
 
 ## Windows Elgato Game Capture ソフトとの比較
 
 | 機能 | Windows 純正 | Linux (このドライバ) |
 |-----|------------|-----------------|
 | 1080p60 映像キャプチャ | ✅ | ✅ |
-| 音声キャプチャ | ✅ 48kHz | ✅ 96kHz mono bridge (SEP stereo downmix) |
+| 音声キャプチャ | ✅ 48kHz | ✅ 96kHz mono (`hd60s_capture`) |
 | HDMI パススルー (TV 出力) | ✅ | ✅ |
 | iso capture と パススルー同時 | ✅ | ✅ |
-| OBS Studio 連携 | ✅ | ✅ (V4L2 + PipeWire ネイティブ) |
+| OBS Studio 連携 | ✅ | ✅ (V4L2 + PipeWire-Pulse `hd60s_capture`) |
 | モニタリング遅延 | ~15-20ms | ~20-30ms |
 
 ---
@@ -53,54 +52,82 @@ Nintendo Switch を接続した過去の実機 run では動作を確認済み (
 
 - **OS**: Ubuntu 25.04 以降 (kernel 7.0系, PipeWire 1.6+ 想定)
 - **USB**: **USB 3.0 (SuperSpeed) 必須**。1080p60 は 2Gbps 出るので USB 2.0 だと帯域が足りない
-- **音声**: **PipeWire** (PulseAudio only 環境では動作しない、PulseAudio → PipeWire 移行済み想定)
+- **音声**: **PipeWire** (PulseAudio only 環境では動作しない)。既定経路は ALSA loopback + `pactl load-module module-alsa-source`。`HD60S_AUDIO_PW=1` で iso_capture の PipeWire ネイティブ出力に切替 (その場合 ALSA source は公開しない)
 - **v4l2loopback**: 0.15.3 以降 推奨 (`exclusive_caps=0` で運用)
-- **対象デバイス**: Elgato Game Capture HD60 S (VID `0fd9` / PID `005e`) — **HD60 S+ は別チップ構成なので動かない**
+- **対象デバイス**: Elgato Game Capture HD60 S (VID `0fd9` / PID `005e`) — **HD60 S+ は別チップ構成なので動かない**。旧 PID `0074` のストリームとは別物
 
 ### 既知の制約 / TODO
 
 - Ubuntu 25.04 以外は未検証 (他ディストロ / 他バージョンでは要調整の可能性)
-- Wayland + NVIDIA GPU 環境で mpv `--vo=gpu-next` が MESA ZINK エラーで動かない場合あり → `--vo=wlshm` を強制 (wrapper で対応済)
+- Wayland + NVIDIA GPU 環境で mpv `--vo=gpu-next` が MESA ZINK エラーで動かない場合あり → `--vo=wlshm` を強制 (`hd60s live` で対応済)
 - 30fps / 720p60 モードは未実装 (1080p60 のみ動作確認)
 - HD60 S+ / HD60 X などの後継モデルは非対応
-- ホットプラグは supervisor 経由で自動再試行するが、物理的な USB 再列挙そのものは OS/デバイス側に依存する
+- ホットプラグ API は未使用。`run-hd60s-obs.sh` が USB 再列挙をポーリングして再起動する
+
+---
+
+## リポジトリ構成
+
+```
+src/                 キャプチャ本体 (iso_capture.c と audio include)
+tools/               実験用ユーティリティ (audio_extract, offline_parser, spi_dump, probe_iso)
+analysis/            init / burst 用 TSV (live 既定: init-p2-audio-fast.tsv, poststream-no9a.tsv)
+docs/                screenshot.png
+wireplumber/         51-hd60s-alsa.lua (snd-aloop の逆方向ノードを隠す)
+hd60s                ランチャー
+run-hd60s-obs.sh     USB 再接続ループ (supervisor)
+70-elgato-hd60s.rules
+hd60s.service.in
+Makefile
+```
+
+ビルド成果物 (`iso_capture` など) はリポジトリ直下に出力される。
 
 ---
 
 ## Build
 
+依存パッケージをまとめて入れる (推奨):
+
 ```bash
-# 依存パッケージ
+./hd60s install-deps
+./hd60s doctor
+```
+
+手動で入れる場合:
+
+```bash
 sudo apt install \
-  build-essential \
-  libusb-1.0-0-dev \
-  libasound2-dev \
-  libpipewire-0.3-dev \
-  libsamplerate0-dev \
-  v4l2loopback-dkms \
-  alsa-utils \
-  tmux mpv ffmpeg
+  build-essential pkg-config \
+  libusb-1.0-0-dev libasound2-dev libpipewire-0.3-dev libsamplerate0-dev \
+  v4l2loopback-dkms v4l2loopback-utils linux-headers-$(uname -r) \
+  alsa-utils ffmpeg vlc mpv guvcview tmux obs-studio
 
-# ビルド
 make all
+```
 
-# 任意: /usr/local にインストール (udev ルールも配置)
+`make iso_capture` だけでもキャプチャ本体はビルドできる (`src/iso_capture.c` → `./iso_capture`)。`libsamplerate` は音声リサンプルに必須。
+
+任意: `/usr/local` にインストール (udev ルール・WirePlumber 設定・ユーザー systemd unit も配置):
+
+```bash
 sudo make install
 ```
 
-`make install` は実行ファイル、必要な解析用 TSV、`hd60s` ランチャー、
-自動再試行用 `run-hd60s-obs.sh` を `/usr/local/libexec/hd60s` に配置し、
-`/usr/local/bin/hd60s`、ユーザー用 systemd unit、udev ルールを作成します。削除は `sudo make uninstall` です。
+`make install` は実行ファイル、解析用 TSV、`hd60s` ランチャー、`run-hd60s-obs.sh` を `/usr/local/libexec/hd60s` に置き、`/usr/local/bin/hd60s`、ユーザー用 systemd unit、udev ルール (`0fd9:005e` → `uaccess`) を作成する。削除は `sudo make uninstall`。
 
 端末や tmux に依存せず自動再試行を常駐させる場合:
 
 ```bash
+# v4l2loopback と snd-aloop は unit ではロードしない
+sudo modprobe v4l2loopback video_nr=42 card_label=HD60S exclusive_caps=0
+sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1
+sudo v4l2loopback-ctl set-caps /dev/video42 "YUYV:1920x1080@60/1"
 systemctl --user daemon-reload
 systemctl --user enable --now hd60s.service
 ```
 
-この unit は v4l2loopback や snd-aloop のカーネルモジュールをロードしません。
-先に `./hd60s prep` を実行するか、各モジュールをログイン時にロードする設定にしてください。
+(`./hd60s prep` というコマンドは無い。モジュール込みの起動は `./hd60s live`。)
 
 ---
 
@@ -112,27 +139,43 @@ systemctl --user enable --now hd60s.service
 ./hd60s live
 ```
 
-これで tmux セッションが立ち上がる:
+tmux セッション `hd60s`:
 
-- **上ペイン**: 自動再試行 supervisor — USB 制御、映像/音声抽出、PipeWire ノード公開
-- **下ペイン**: `mpv` — 13 秒後に自動で `/dev/video42` を再生
+- **上ペイン**: `run-hd60s-obs.sh` — USB 制御、映像/音声抽出、切断時の再試行。`HD60S_AUDIO_PW=0` なので音声は ALSA loopback → `hd60s_capture`
+- **下ペイン**: `mpv --vo=wlshm` — 13 秒後に `/dev/video42` を再生 (`HD60S_NO_MPV=1` で抑制)
 
 **同時に TV には HDMI パススルー経由でゲーム映像が低遅延で出る** (プレイに使う経路)。
 
 操作:
+
 - `Ctrl+B → 矢印` : ペイン切替
 - `Ctrl+B → d` : デタッチ (バックグラウンド継続)
 - `Ctrl+B → q` : 全終了
+- `./hd60s stop` : iso_capture / tmux を止める
 
 ### OBS Studio で使う
 
-1. 上記 `./hd60s live` で iso_capture を起動しておく (mpv は不要なら閉じてよい)
-2. OBS ソース追加:
-   - **映像キャプチャデバイス (V4L2)** → デバイス: `/dev/video42`
-   - **音声入力キャプチャ (PulseAudio/PipeWire)** → source: `hd60s_capture`
-3. Windows OBS と同じ感覚で録画/配信できる
+1. `./hd60s live` でキャプチャを起動 (mpv 不要なら `HD60S_NO_MPV=1 ./hd60s live`、またはプレビューを閉じる)
+2. あるいは `./hd60s obs` (iso_capture を tmux で起動してから OBS を立ち上げる)
+3. OBS ソース追加:
+   - **映像キャプチャデバイス (V4L2)** → `/dev/video42` / 1920x1080 / 60fps / YUYV
+   - **音声**: PipeWire-Pulse source `hd60s_capture` (live 既定)。直接 ALSA なら `hw:10,1` (hd60s Loopback)
 
 「音声モニタリング: モニターのみ (出力はミュート)」設定にすれば、プレイ音は PC スピーカーで即時モニタ、録画音は同期して録画される (Windows OBS と同じ挙動)。
+
+### よく使うコマンド
+
+```text
+./hd60s live            # tmux: supervisor + mpv
+./hd60s obs             # supervisor のあと OBS 起動
+./hd60s start [秒]      # フォアグラウンドで iso_capture (既定 600s)
+./hd60s view            # VLC で映像+音声
+./hd60s view-mpv        # mpv (映像のみ)
+./hd60s stop            # 停止
+./hd60s doctor          # 依存・モジュール・デバイス診断
+./hd60s install-deps    # apt 依存を一括インストール
+./hd60s help            # 実験用コマンド含む一覧
+```
 
 ---
 
@@ -161,14 +204,15 @@ systemctl --user enable --now hd60s.service
               ▼ USB 3.0
    ┌──────────────────────┐
    │  iso_capture (libusb)│
+   │  src/iso_capture.c   │
    │  - Init + MCU/CPLD   │
    │  - Frame parser      │
    │  - ALSA audio feed   │
    └───┬──────────────┬───┘
        │              │
-      ▼              ▼
-  /dev/video42    snd-aloop → PipeWire source
-  (v4l2loopback)   "hd60s_capture"
+       ▼              ▼
+  /dev/video42    snd-aloop hw:10,0 → hw:10,1
+  (v4l2loopback)   pactl source "hd60s_capture"
        │              │
        ▼              ▼
     OBS / mpv     OBS / speakers
@@ -214,8 +258,9 @@ HD60 S は 5 チップ構成: **Cypress FX3** (USB3 SuperSpeed) + **Nuvoton M031
 
 ### 音声フォーマット
 - SEP marker (`ff 00 ff 02`) + 8 バイト payload
-- 8B payload = **2 stereo int16 LE frames** interleaved as `L0,R0,L1,R1`
-- Payload = **four signed 16-bit little-endian samples** (`L0,R0,L1,R1`); the bridge downmixes both frames and exposes mono at 96 kHz
+- 8B payload = **4 個の signed 16-bit little-endian samples** (`L0,R0,L1,R1`)
+- ブリッジ側で downmix し、96 kHz mono として `hd60s_capture` に出す
+- 既定の live 経路は ALSA loopback。PipeWire ネイティブは `HD60S_AUDIO_PW=1`
 
 ### 音声 100ms cutoff の解決 (FIX_ID_023)
 IT6802 の audio state machine が HDMI audio channel status を誤検出 → 100ms 前後で HW mute。ITE 公式 SDK の `AudioFsCal()` + `aud_fiforst()` + Force FS 48kHz recovery loop を 100ms 周期で発射することで解消。
@@ -288,10 +333,10 @@ Windows Elgato Game Capture ソフトの USB pcap を提供いただけると、
 One-shot launch (`./hd60s live`) delivers:
 
 - ✅ 1080p60 YUYV video via `/dev/video42` (v4l2loopback) — OBS Studio / mpv / ffmpeg compatible
-- ✅ 96kHz mono audio via the stable PipeWire/Pulse source `hd60s_capture` — for OBS / speaker monitoring
-- ✅ Automatic ALSA loopback publication (`hw:10,0` playback → `hw:10,1` capture) without manual `pactl` commands
+- ✅ 96kHz mono audio via ALSA loopback (`hw:10,0` → `hw:10,1`) published as PipeWire-Pulse source `hd60s_capture`
 - ✅ HDMI passthrough (HD60 S HDMI OUT → TV) simultaneously with low latency for gameplay
 - ✅ Simultaneous iso capture and passthrough (matches Windows Elgato app usage pattern)
+- ✅ Automatic retry after USB disconnect (`run-hd60s-obs.sh`)
 
 ## Requirements
 
@@ -300,14 +345,23 @@ One-shot launch (`./hd60s live`) delivers:
 - v4l2loopback 0.15.3+ with `exclusive_caps=0`
 - Elgato HD60 S (VID `0fd9` / PID `005e`) — **HD60 S+ is a different chipset and not supported**
 
+## Layout
+
+- `src/` — capture binary (`iso_capture.c`)
+- `tools/` — lab utilities
+- `analysis/` — init/burst TSV sequences
+- `hd60s` / `run-hd60s-obs.sh` — launcher and USB retry supervisor
+
 ## Build & Run
 
 ```bash
-sudo apt install build-essential pkg-config libusb-1.0-0-dev libasound2-dev libpipewire-0.3-dev libsamplerate0-dev v4l2loopback-dkms v4l2loopback-utils alsa-utils tmux mpv ffmpeg
+./hd60s install-deps
 make all
-sudo make install
+./hd60s doctor
 ./hd60s live
 ```
+
+`make install` is optional (udev rule, WirePlumber snippet, user systemd unit under `/usr/local`). There is no `./hd60s prep` command; `./hd60s live` loads `v4l2loopback` and `snd-aloop`. Native PipeWire audio is opt-in with `HD60S_AUDIO_PW=1`.
 
 ## About Development
 
