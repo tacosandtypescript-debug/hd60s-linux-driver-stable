@@ -4,38 +4,38 @@ err()  { echo "[hd60s ERR] $*" >&2; }
 die()  { err "$*"; exit 1; }
 
 need_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "$1 が入ってないっぽい。'hd60s install-deps' で入れる or 'sudo apt install -y $2'"
+    command -v "$1" >/dev/null 2>&1 || die "no encuentro $1. Prueba 'hd60s install-deps' o 'sudo apt install -y $2'"
 }
 
 need_sudo() {
     # sudo が使えて、パスワードキャッシュされてるか / 通せるか一応確認
-    command -v sudo >/dev/null 2>&1 || die "sudo が要る"
+    command -v sudo >/dev/null 2>&1 || die "hace falta sudo"
     sudo -n true 2>/dev/null || {
-        say "sudo パスワード要求される(先に済ませとくと快適):"
-        sudo -v || die "sudo 認証失敗"
+        say "sudo va a pedir contraseña (mejor adelantarlo):"
+        sudo -v || die "falló la autenticación de sudo"
     }
 }
 
 ensure_iso_capture() {
-    [ -x ./iso_capture ] || die "./iso_capture がビルドされてない。'make' 走らせて"
+    [ -x ./iso_capture ] || die "./iso_capture no está compilado. Ejecuta 'make'"
 }
 
 ensure_snd_aloop() {
     if ! lsmod | grep -q snd_aloop; then
-        say "snd-aloop ロード..."
-        sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1 || die "snd-aloop ロード失敗"
+        say "cargando snd-aloop..."
+        sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1 || die "falló al cargar snd-aloop"
         sleep 1
     fi
 }
 
 ensure_v4l2loopback() {
     if ! lsmod | grep -q v4l2loopback; then
-        say "v4l2loopback ロード..."
+        say "cargando v4l2loopback..."
         sudo modprobe v4l2loopback video_nr=42 card_label="HD60S" exclusive_caps=0 || \
-            die "v4l2loopback ロード失敗。'hd60s install-deps' で v4l2loopback-dkms 入れて"
+            die "falló al cargar v4l2loopback. Instala v4l2loopback-dkms con 'hd60s install-deps'"
         sleep 1
     fi
-    [ -e "$VDEV" ] || die "$VDEV が無い。v4l2loopback の video_nr=42 で作られる想定"
+    [ -e "$VDEV" ] || die "no existe $VDEV. v4l2loopback debería crearlo con video_nr=42"
 }
 
 usb_device_present() {
@@ -51,12 +51,12 @@ usb_device_present() {
 ensure_hd60s_device() {
     # HD60 S: VID 0fd9, PID 005e (the device supported by iso_capture).
     usb_device_present && return 0
-    die "HD60 S (0fd9:005e) が USB に見つからない。ケーブル刺さってる? 電源入ってる?"
+    die "no encuentro el HD60 S (0fd9:005e) en USB. ¿Cable enchufado? ¿Tiene alimentación?"
 }
 
 set_caps() {
     sudo v4l2loopback-ctl set-caps "$VDEV" "YUYV:1920x1080@60/1" >/dev/null 2>&1 || \
-        die "v4l2loopback-ctl set-caps 失敗 ($VDEV)"
+        die "falló v4l2loopback-ctl set-caps ($VDEV)"
 }
 
 kill_capture() {
