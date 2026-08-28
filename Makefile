@@ -18,13 +18,13 @@ BINS = iso_capture audio_extract offline_parser spi_dump probe_iso
 
 all: $(BINS)
 
-iso_capture: iso_capture.c
-	$(CC) $(CFLAGS) $(LIBUSB_CFLAGS) $(PIPEWIRE_CFLAGS) $< -o $@ $(LIBUSB_LIBS) $(ALSA_LIBS) $(PIPEWIRE_LIBS) -lpthread -lsamplerate
+iso_capture: src/iso_capture.c
+	$(CC) $(CFLAGS) -Isrc $(LIBUSB_CFLAGS) $(PIPEWIRE_CFLAGS) $< -o $@ $(LIBUSB_LIBS) $(ALSA_LIBS) $(PIPEWIRE_LIBS) -lpthread -lsamplerate
 
-audio_extract: audio_extract.c
+audio_extract: tools/audio_extract.c
 	$(CC) $(CFLAGS) $< -o $@
 
-offline_parser: offline_parser.c
+offline_parser: tools/offline_parser.c
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:
@@ -55,8 +55,8 @@ uninstall:
 	rm -f "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/$(notdir $(WIREPLUMBER_RULE))"
 	rm -rf "$(DESTDIR)$(LIBEXECDIR)"
 
-spi_dump: spi_dump.c
+spi_dump: tools/spi_dump.c
 	$(CC) $(CFLAGS) $(LIBUSB_CFLAGS) $< -o $@ $(LIBUSB_LIBS)
 
-probe_iso: probe_iso.c
+probe_iso: tools/probe_iso.c
 	$(CC) $(CFLAGS) $(LIBUSB_CFLAGS) $< -o $@ $(LIBUSB_LIBS)
