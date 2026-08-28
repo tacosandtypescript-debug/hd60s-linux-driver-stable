@@ -30,12 +30,12 @@ Nintendo Switch を接続して 動作確認済み。長時間プレイでも安
 ## Windows Elgato Game Capture ソフトとの比較
 
 | 機能 | Windows 純正 | Linux (このドライバ) |
-|-----|------------|-----------------|
+| --- | --- | --- |
 | 1080p60 映像キャプチャ | ✅ | ✅ |
-| 音声キャプチャ | ✅ 48kHz | ✅ 96kHz mono (`hd60s_capture`) |
+| 音声キャプチャ | ✅ 48kHz | ✅ 96kHz mono (hd60s_capture) |
 | HDMI パススルー (TV 出力) | ✅ | ✅ |
 | iso capture と パススルー同時 | ✅ | ✅ |
-| OBS Studio 連携 | ✅ | ✅ (V4L2 + PipeWire-Pulse `hd60s_capture`) |
+| OBS Studio 連携 | ✅ | ✅ (V4L2 + PipeWire-Pulse hd60s_capture) |
 | モニタリング遅延 | ~15-20ms | ~20-30ms |
 
 ---
