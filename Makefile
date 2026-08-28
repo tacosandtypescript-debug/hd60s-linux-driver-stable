@@ -18,8 +18,8 @@ BINS = iso_capture audio_extract offline_parser spi_dump probe_iso
 
 all: $(BINS)
 
-ISO_SRC := src/iso_capture.c src/util/hd60s_util.c src/v4l2/hd60s_v4l2.c src/audio/hd60s_audio.c src/replay/hd60s_replay.c src/pace/hd60s_pace.c src/parser/hd60s_parser.c src/usb/hd60s_usb.c
-ISO_INC := -Isrc -Isrc/util -Isrc/v4l2 -Isrc/audio -Isrc/replay -Isrc/pace -Isrc/parser -Isrc/usb
+ISO_SRC := src/iso_capture.c src/util/hd60s_util.c src/v4l2/hd60s_v4l2.c src/audio/hd60s_audio.c src/replay/hd60s_replay.c src/pace/hd60s_pace.c src/parser/hd60s_parser.c src/usb/hd60s_usb.c src/pt/hd60s_passthrough.c
+ISO_INC := -Isrc -Isrc/util -Isrc/v4l2 -Isrc/audio -Isrc/replay -Isrc/pace -Isrc/parser -Isrc/usb -Isrc/pt
 
 iso_capture: $(ISO_SRC)
 	$(CC) $(CFLAGS) $(ISO_INC) $(LIBUSB_CFLAGS) $(PIPEWIRE_CFLAGS) $(ISO_SRC) -o $@ $(LIBUSB_LIBS) $(ALSA_LIBS) $(PIPEWIRE_LIBS) -lpthread -lsamplerate
