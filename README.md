@@ -12,12 +12,12 @@ Dispositivo soportado: **VID `0fd9` / PID `005e`**. No es el HD60 S+ ni el HD60 
 
 ## Qué hace
 
-Un `./hd60s live` deja listo:
+Un `./scripts/hd60s live` deja listo:
 
 - Vídeo **1080p60 YUYV** en `/dev/video42` (v4l2loopback), usable desde OBS, mpv o ffmpeg.
 - Audio **96 kHz mono** por loopback ALSA (`hw:10,0` → `hw:10,1`), publicado como fuente PipeWire-Pulse `hd60s_capture`.
 - **Passthrough HDMI** (HDMI OUT del HD60 S → TV) a la vez que la captura USB.
-- Reintento automático si se desconecta el USB (`run-hd60s-obs.sh`).
+- Reintento automático si se desconecta el USB (`scripts/run-hd60s-obs.sh`).
 
 Comprobado con Nintendo Switch.
 
@@ -25,7 +25,7 @@ Comprobado con Nintendo Switch.
 
 - **HD60 S+** y **HD60 X**: otro chipset. No arrancan con este código.
 - Un módulo del kernel. Todo corre en userspace con libusb.
-- Un comando `hd60s prep`. `prep` es una función interna de `hd60s-lib.sh`; los módulos se cargan al usar `live`, `obs` o `start`.
+- Un comando `hd60s prep`. `prep` es una función interna de `scripts/hd60s-lib.sh`; los módulos se cargan al usar `live`, `obs` o `start`.
 - `color-test`: se está retirando y no forma parte del flujo actual.
 
 ## Requisitos
@@ -40,82 +40,87 @@ Comprobado con Nintendo Switch.
 ## Estructura
 
 ```
-src/                 captura: iso_capture.c y módulos
-                     hd60s_util, hd60s_v4l2, hd60s_audio,
-                     hd60s_replay, hd60s_pace, hd60s_parser, hd60s_usb
-tools/               utilidades de laboratorio (audio_extract, offline_parser, spi_dump, probe_iso)
-analysis/            secuencias TSV de init/burst
-                     (live usa init-p2-audio-fast.tsv y poststream-no9a.tsv)
-hd60s                lanzador
-hd60s-lib.sh         helpers compartidos (carga de módulos, detección USB, doctor)
-run-hd60s-obs.sh     supervisor: espera el USB y relanza iso_capture
-wireplumber/         oculta el nodo ALSA invertido de snd-aloop
-docs/                screenshot.png
-70-elgato-hd60s.rules
-hd60s.service.in
+src/iso_capture.c          captura (orquesta los módulos)
+src/util/                  hd60s_util
+src/v4l2/                  hd60s_v4l2
+src/audio/                 hd60s_audio
+src/replay/                hd60s_replay + includes de audio ISO
+src/pace/                  hd60s_pace
+src/parser/                hd60s_parser
+src/usb/                   hd60s_usb
+tools/                     audio_extract, offline_parser, spi_dump, probe_iso
+analysis/                  TSV de init/burst
+                           (live usa init-p2-audio-fast.tsv y poststream-no9a.tsv)
+scripts/hd60s              lanzador
+scripts/hd60s-lib.sh       helpers (módulos, USB, doctor)
+scripts/run-hd60s-obs.sh   supervisor: espera el USB y relanza iso_capture
+packaging/                 udev, unit systemd, regla WirePlumber
+docs/                      screenshot.png
 Makefile
 ```
 
-Los binarios (`iso_capture` y las tools) se generan en la raíz del repo.
+Los binarios (`iso_capture` y las tools) se generan en la raíz del repo. El lanzador vive en `scripts/`; resuelve la raíz del checkout solo.
 
 ## Compilar
 
+Desde la raíz del repo:
+
 ```bash
-./hd60s install-deps
+./scripts/hd60s install-deps
 make all
-./hd60s doctor
+./scripts/hd60s doctor
 ```
 
 `install-deps` instala compilador, libusb, ALSA, PipeWire, libsamplerate, v4l2loopback, headers del kernel, tmux, mpv, VLC, ffmpeg y OBS.
 
-`make all` construye `iso_capture` (enlace de los `.c` de `src/`) y las tools. Hace falta `libsamplerate`. `live` también usa `alsa-utils` (`arecord` / `aplay`).
+`make all` construye `iso_capture` (enlace de `src/iso_capture.c` y los módulos bajo `src/*/`) y las tools. Hace falta `libsamplerate`. `live` también usa `alsa-utils` (`arecord` / `aplay`).
 
-Instalación opcional a `/usr/local` (regla udev `0fd9:005e`, fragmento WirePlumber, unit de systemd de usuario, `hd60s` en `PATH`):
+Instalación opcional a `/usr/local` (regla udev `packaging/70-elgato-hd60s.rules`, WirePlumber en `packaging/wireplumber/`, unit `packaging/hd60s.service.in`, `hd60s` en `PATH`):
 
 ```bash
 sudo make install
 ```
 
-Esa unit no carga `v4l2loopback` ni `snd-aloop`. Para el servicio hay que tener los módulos ya listos (`./hd60s live` los carga; o `modprobe` a mano). Quitar: `sudo make uninstall`.
+Tras instalar, el comando es `hd60s` (ya no hace falta el prefijo `scripts/`). La unit no carga `v4l2loopback` ni `snd-aloop`: hay que tenerlos listos (`./scripts/hd60s live` los carga, o `modprobe` a mano). Quitar: `sudo make uninstall`.
 
 ## Uso
 
-Desde la raíz del repo, con el binario `iso_capture` ya compilado:
+Desde la raíz del repo, con `iso_capture` ya compilado en esa raíz:
 
 ```text
-./hd60s live           tmux: supervisor arriba, mpv en /dev/video42 a los 13 s
-./hd60s obs            arranca la captura y abre OBS
-./hd60s start [seg]    iso_capture en primer plano (600 s por defecto)
-./hd60s view           VLC con vídeo y audio
-./hd60s stop           mata iso_capture y la sesión tmux
-./hd60s doctor         comprueba dependencias, módulos y el USB
+./scripts/hd60s live           tmux: supervisor arriba, mpv en /dev/video42 a los 13 s
+./scripts/hd60s obs            arranca la captura y abre OBS
+./scripts/hd60s start [seg]    iso_capture en primer plano (600 s por defecto)
+./scripts/hd60s view           VLC con vídeo y audio
+./scripts/hd60s stop           mata iso_capture y la sesión tmux
+./scripts/hd60s doctor         comprueba dependencias, módulos y el USB
 ```
 
 ```bash
-./hd60s live
+./scripts/hd60s live
 ```
 
-En tmux, panel de arriba: `run-hd60s-obs.sh` (init `analysis/init-p2-audio-fast.tsv`, burst `analysis/poststream-no9a.tsv`, `HD60S_AUDIO_PW=0`). Panel de abajo: mpv con `--vo=wlshm`. Sin preview: `HD60S_NO_MPV=1 ./hd60s live`.
+En tmux, panel de arriba: `scripts/run-hd60s-obs.sh` (init `analysis/init-p2-audio-fast.tsv`, burst `analysis/poststream-no9a.tsv`, `HD60S_AUDIO_PW=0`). Panel de abajo: mpv con `--vo=wlshm`. Sin preview: `HD60S_NO_MPV=1 ./scripts/hd60s live`.
 
 - Cambiar de panel: `Ctrl+B` y flechas
 - Detach: `Ctrl+B`, `d`
-- Salir del todo: `Ctrl+B`, `q`, o `./hd60s stop`
+- Salir del todo: `Ctrl+B`, `q`, o `./scripts/hd60s stop`
 
 ### OBS
 
-1. `./hd60s live` (o `HD60S_NO_MPV=1 ./hd60s live` si no quieres mpv).
-2. Alternativa: `./hd60s obs`.
+1. `./scripts/hd60s live` (o `HD60S_NO_MPV=1 ./scripts/hd60s live` si no quieres mpv).
+2. Alternativa: `./scripts/hd60s obs`.
 3. Fuentes:
    - vídeo V4L2: `/dev/video42`, 1920×1080, 60 fps, YUYV
    - audio: fuente PipeWire-Pulse `hd60s_capture` (ruta por defecto). También vale ALSA `hw:10,1` (hd60s Loopback), que es lo que imprime `hd60s obs`.
 
 ### Audio
 
-Por defecto el audio no sale por PipeWire nativo de `iso_capture`. Escribe en snd-aloop y `run-hd60s-obs.sh` publica `hd60s_capture` con `pactl` (`HD60S_AUDIO_PW=0` en `live`).
+Por defecto el audio no sale por PipeWire nativo de `iso_capture`. Escribe en snd-aloop y `scripts/run-hd60s-obs.sh` publica `hd60s_capture` con `pactl` (`HD60S_AUDIO_PW=0` en `live`).
 
 PipeWire nativo: `HD60S_AUDIO_PW=1`. En ese modo no se publica la fuente ALSA.
 
-`./hd60s help` lista comandos de laboratorio (`test`, `minimal`, `view-mpv`, etc.). `pt` / `ptx` están marcados como rotos: no usarlos.
+`./scripts/hd60s help` lista comandos de laboratorio (`test`, `minimal`, `view-mpv`, etc.). `pt` / `ptx` están marcados como rotos: no usarlos.
 
 ## Limitaciones
 
