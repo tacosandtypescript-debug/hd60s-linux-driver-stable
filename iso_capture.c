@@ -42,6 +42,7 @@
 #include <spa/pod/builder.h>
 #include <pthread.h>
 #include <limits.h>
+#include <math.h>
 #include <signal.h>
 
 static double now_s(void) {
@@ -310,21 +311,140 @@ static int g_audio_writer_started = 0;
 static pthread_mutex_t g_audio_writer_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_audio_writer_wake_cond = PTHREAD_COND_INITIALIZER;
 
+typedef struct {
+    double measure_start_s;
+    int measure_started;
+    int measure_done;
+    int sep_count;
+    int active_sep_count;
+    double last_recal_check_s;
+    int rolling_sep_count;
+    double measured_sep_rate;
+} AudioCadenceState;
+
+static AudioCadenceState g_audio_cadence = {0};
 static int g_sep_count = 0;
-static double g_measure_start_s = 0.0;
-static int g_measure_done = 0;
-static int g_measure_started = 0;   // 初 SEP 到着で開始
 // 96kHz bridge へ補間する比率 (0=固定計算前)
 static double g_upsample_ratio = 0.0;
+static double g_pll_base_ratio = 0.0;
+static double g_pll_last_update = 0.0;
+static double g_pll_integral = 0.0;
+static unsigned long long g_pll_updates = 0;
 // 補間状態: 前回の終点サンプル (次の補間の起点)
 static int16_t g_last_sample = 0;
 // 分数遅延累積 (次に何 samples 出すかの端数管理)
 static double g_frac_pos = 0.0;
+extern int g_use_pw;
 
 static double now_monotonic_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void audio_track_cadence_and_recalibrate(int is_active) {
+    double now = now_monotonic_s();
+    g_sep_count++;
+    g_audio_cadence.sep_count++;
+    g_audio_cadence.rolling_sep_count++;
+    if (is_active) g_audio_cadence.active_sep_count++;
+
+    // 1. Initial measurement (ignoring early silence window)
+    if (!g_audio_cadence.measure_done) {
+        if (!g_audio_cadence.measure_started) {
+            // Do not start measurement window during initial silence/settling
+            if (!is_active || g_audio_cadence.active_sep_count < 100) {
+                if (g_upsample_ratio <= 0.0) {
+                    g_upsample_ratio = g_use_pw ? 1.0 : 2.0;
+                    g_pll_base_ratio = g_upsample_ratio;
+                }
+                return;
+            }
+            g_audio_cadence.measure_start_s = now;
+            g_audio_cadence.measure_started = 1;
+            g_audio_cadence.sep_count = 0;
+            g_audio_cadence.active_sep_count = 0;
+            if (g_upsample_ratio <= 0.0) {
+                g_upsample_ratio = g_use_pw ? 1.0 : 2.0;
+                g_pll_base_ratio = g_upsample_ratio;
+            }
+            return;
+        }
+
+        double el = now - g_audio_cadence.measure_start_s;
+        if (el >= 2.0 && g_audio_cadence.sep_count >= 500) {
+            double sep_rate = (double)g_audio_cadence.sep_count / el;
+            double audio_rate = sep_rate * 2.0;
+
+            // Guard against partial silence / ~12.2k SEP/s artifact:
+            // If sep_rate is < 18000 and the stream is still in its startup phase,
+            // reset window to wait for a clean steady-state measurement window
+            if (sep_rate < 18000.0 && el < 6.0) {
+                g_audio_cadence.measure_start_s = now;
+                g_audio_cadence.sep_count = 0;
+                g_audio_cadence.active_sep_count = 0;
+                return;
+            }
+
+            double effective_sample_rate = 48000.0;
+            if (audio_rate >= 40000.0 && audio_rate <= 60000.0) {
+                effective_sample_rate = 48000.0;
+            } else if (audio_rate >= 88000.0 && audio_rate <= 105000.0) {
+                effective_sample_rate = 96000.0;
+            } else if (audio_rate >= 176000.0 && audio_rate <= 200000.0) {
+                effective_sample_rate = 192000.0;
+            } else {
+                // Default fallback for standard HDMI 48kHz PCM
+                effective_sample_rate = 48000.0;
+            }
+
+            double target_rate = g_use_pw ? 48000.0 : 96000.0;
+            g_upsample_ratio = target_rate / effective_sample_rate;
+            if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
+            if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
+            g_pll_base_ratio = g_upsample_ratio;
+            g_pll_last_update = now;
+            g_audio_cadence.measured_sep_rate = sep_rate;
+            g_audio_cadence.measure_done = 1;
+            g_audio_cadence.last_recal_check_s = now;
+            g_audio_cadence.rolling_sep_count = 0;
+            g_last_sample = 0;
+            g_frac_pos = 0.0;
+
+            fprintf(stderr, "[audio%s] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to %.0fkHz %s\n",
+                    g_use_pw ? "-pw" : "", sep_rate, audio_rate, effective_sample_rate,
+                    g_upsample_ratio, target_rate / 1000.0, g_use_pw ? "stream" : "mono bridge");
+        }
+    } else {
+        // 2. Continuous Monitoring & Automatic Recalibration
+        double dt = now - g_audio_cadence.last_recal_check_s;
+        if (dt >= 1.0) {
+            double rolling_sep_rate = (double)g_audio_cadence.rolling_sep_count / dt;
+            g_audio_cadence.rolling_sep_count = 0;
+            g_audio_cadence.last_recal_check_s = now;
+
+            if (rolling_sep_rate >= 18000.0) {
+                double rolling_audio_rate = rolling_sep_rate * 2.0;
+                double nominal_rate = 48000.0;
+                if (rolling_audio_rate >= 40000.0 && rolling_audio_rate <= 60000.0) {
+                    nominal_rate = 48000.0;
+                } else if (rolling_audio_rate >= 88000.0 && rolling_audio_rate <= 105000.0) {
+                    nominal_rate = 96000.0;
+                } else if (rolling_audio_rate >= 176000.0 && rolling_audio_rate <= 200000.0) {
+                    nominal_rate = 192000.0;
+                }
+                double target_rate = g_use_pw ? 48000.0 : 96000.0;
+                double expected_ratio = target_rate / nominal_rate;
+                if (fabs(g_upsample_ratio - expected_ratio) > 0.02) {
+                    fprintf(stderr, "[audio%s-recalibrate] ratio adjusted from %.4f to expected %.4f (measured %.1f SEP/s, nominal %.0f Hz)\n",
+                            g_use_pw ? "-pw" : "", g_upsample_ratio, expected_ratio,
+                            rolling_sep_rate, nominal_rate);
+                    g_upsample_ratio = expected_ratio;
+                    g_pll_base_ratio = expected_ratio;
+                }
+            }
+        }
+    }
 }
 
 // SEP payload: two signed 16-bit stereo frames, little-endian, L0,R0,L1,R1.
@@ -498,51 +618,27 @@ static void audio_flush(void) {
 static void audio_feed_sep(const uint8_t* payload) {
     g_audio_packets++;
     g_audio_bytes += 8;
-    if (g_use_pw) { audio_feed_sep_pw(payload); return; }
-    g_sep_count++;
-
-    // 測定期間: 安定動作確認後に 2 秒間の SEP レートを測定
-    if (!g_measure_done) {
-        if (!g_measure_started) {
-            g_measure_start_s = now_monotonic_s();
-            g_measure_started = 1;
-            g_sep_count = 0;
-            if (g_upsample_ratio <= 0.0) g_upsample_ratio = 2.0; // 48kHz HDMI -> 96kHz ALSA
-        }
-        double el = now_monotonic_s() - g_measure_start_s;
-        if (el >= 2.0 && g_sep_count >= 500) {
-            double sep_rate = g_sep_count / el;
-            double audio_rate = sep_rate * 2.0;
-            double effective_sample_rate = audio_rate;
-            // HDMI PCM 音声の標準レート分類 (各 SEP は 2 audio frames を格納):
-            // - 40-60 kHz: 48 kHz (一般的な HDMI PCM)
-            // - 88-105 kHz: 96 kHz
-            // - 176-200 kHz: 192 kHz
-            // - 不明時は標準の 48 kHz にフォールバック
-            if (effective_sample_rate >= 40000.0 && effective_sample_rate <= 60000.0) {
-                effective_sample_rate = 48000.0;
-            } else if (effective_sample_rate >= 88000.0 && effective_sample_rate <= 105000.0) {
-                effective_sample_rate = 96000.0;
-            } else if (effective_sample_rate >= 176000.0 && effective_sample_rate <= 200000.0) {
-                effective_sample_rate = 192000.0;
-            } else {
-                effective_sample_rate = 48000.0;
-            }
-            g_upsample_ratio = 96000.0 / effective_sample_rate;
-            if (g_upsample_ratio < 0.5) g_upsample_ratio = 0.5;
-            if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
-            fprintf(stderr, "[audio] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to 96kHz mono bridge\n",
-                    sep_rate, audio_rate, effective_sample_rate, g_upsample_ratio);
-            g_measure_done = 1;
-            g_last_sample = 0;
-            g_frac_pos = 0.0;
-        }
-    }
-
-    if (!g_pcm || g_upsample_ratio <= 0) return;
 
     int16_t mono[2];
     decode_sep_mono(payload, mono);
+    int is_active = (abs(mono[0]) > 32 || abs(mono[1]) > 32);
+
+    static int g_sep_diag_count = 0;
+    if (g_sep_diag_count < 10 || (is_active && g_sep_diag_count < 50)) {
+        fprintf(stderr, "[sep-raw #%d] raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x -> mono0=%d mono1=%d active=%d\n",
+                g_sep_diag_count,
+                payload[0], payload[1], payload[2], payload[3],
+                payload[4], payload[5], payload[6], payload[7],
+                mono[0], mono[1], is_active);
+        g_sep_diag_count++;
+    }
+
+    if (g_use_pw) { audio_feed_sep_pw(payload); return; }
+
+    audio_track_cadence_and_recalibrate(is_active);
+
+    if (!g_pcm || g_upsample_ratio <= 0) return;
+
     for (int sample_index = 0; sample_index < 2; sample_index++) {
         int16_t cur = mono[sample_index];
         // 各入力 sample を upsample_ratio 個の出力 sample に展開
@@ -668,14 +764,6 @@ static const struct pw_stream_events g_pw_events = {
 // SRC_SINC_MEDIUM_QUALITY = 位相・振幅ともに ~-100 dB THD、i7-12700 で <1% CPU 予想。
 static SRC_STATE* g_src = NULL;
 static int g_src_ok = 0;
-
-// 2026-07-19 PLL 化 (Opus 4.8 P1-4): 静的な upsample_ratio が HD60S crystal と
-// PW clock の drift (100ppm 級) で時間経過とともに ring がずれ、ジリジリ蓄積する
-// 問題への対策。1 秒周期で ring fill error を PI 制御で g_upsample_ratio に微反映。
-static double g_pll_last_update = 0.0;
-static double g_pll_integral = 0.0;
-static double g_pll_base_ratio = 0.0;    // 初期測定値、暴走時にリセット可
-static uint64_t g_pll_updates = 0;
 
 // ring バッファに samples を batch で書き込む (iso スレッドから)
 // 🔥 2026-07-18 lock-free SPSC + batch: 従来 per-sample の mutex を排除。
@@ -829,40 +917,11 @@ static void audio_pw_close(void) {
 
 // audio_feed_sep の PipeWire 版: upsample した samples を ring に push
 static void audio_feed_sep_pw(const uint8_t* payload) {
-    g_sep_count++;
-    if (!g_measure_done) {
-        if (!g_measure_started) {
-            g_measure_start_s = now_monotonic_s();
-            g_measure_started = 1;
-            g_sep_count = 0;
-            if (g_upsample_ratio <= 0.0) g_upsample_ratio = 1.0; // 48kHz HDMI -> 48kHz PW stream
-        }
-        double el = now_monotonic_s() - g_measure_start_s;
-        if (el >= 2.0 && g_sep_count >= 500) {
-            double sep_rate = g_sep_count / el;
-            double audio_rate = sep_rate * 2.0;
-            double effective_sample_rate = audio_rate;
-            if (effective_sample_rate >= 40000.0 && effective_sample_rate <= 60000.0) {
-                effective_sample_rate = 48000.0;
-            } else if (effective_sample_rate >= 88000.0 && effective_sample_rate <= 105000.0) {
-                effective_sample_rate = 96000.0;
-            } else if (effective_sample_rate >= 176000.0 && effective_sample_rate <= 200000.0) {
-                effective_sample_rate = 192000.0;
-            } else {
-                effective_sample_rate = 48000.0;
-            }
-            g_upsample_ratio = 48000.0 / effective_sample_rate;
-            if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
-            if (g_upsample_ratio > 4.0) g_upsample_ratio = 4.0;
-            g_pll_base_ratio = g_upsample_ratio;   // PLL の基準値として保存
-            g_pll_last_update = now_monotonic_s();
-            fprintf(stderr, "[audio-pw] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to 48kHz stream\n",
-                    sep_rate, audio_rate, effective_sample_rate, g_upsample_ratio);
-            g_measure_done = 1;
-            g_last_sample = 0;
-            g_frac_pos = 0.0;
-        }
-    }
+    int16_t mono[2];
+    decode_sep_mono(payload, mono);
+    int is_active = (abs(mono[0]) > 32 || abs(mono[1]) > 32);
+
+    audio_track_cadence_and_recalibrate(is_active);
     if (!g_pw_stream || g_upsample_ratio <= 0) return;
 
     // 2026-07-19 PLL update: 1 秒周期で ring fill error から upsample_ratio を微調整。
@@ -911,8 +970,6 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
     }
 
     // 2026-07-19 libsamplerate (SINC 補間) 経路。使えない時は旧 linear interp に fallback。
-    int16_t mono[2];
-    decode_sep_mono(payload, mono);
     if (g_src_ok) {
         // int16 → float [-1,1)
         float input[2] = {
