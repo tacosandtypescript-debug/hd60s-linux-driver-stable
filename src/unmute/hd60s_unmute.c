@@ -52,7 +52,7 @@ void hd60s_unmute_oneshot(libusb_device_handle *h) {
     // REG_RX_HWMuteCtrl es 0x7D. También se golpean los otros reg relacionados.
     const char* env_audio_v2 = getenv("HD60S_AUDIO_V2");
     if (env_audio_v2 && env_audio_v2[0] && env_audio_v2[0] != '0' && env_audio_v2[0] != 'n' && env_audio_v2[0] != 'N') {
-        fprintf(stderr, "[audio-unmute-v2] IT6802E (正しい reg) audio path unmute...\n");
+        fprintf(stderr, "[audio-unmute-v2] IT6802E unmute (reg 0x7D)...\n");
         struct { unsigned char slave, reg, val; const char* name; } audio_unmute_v2[] = {
             {0x94, 0x0f, 0x8b, "reg 0x0f audio clock enable"},
             // REG_RX_HWMuteCtrl = 0x7D
@@ -79,7 +79,7 @@ void hd60s_unmute_oneshot(libusb_device_handle *h) {
     // se activa con env HD60S_MIN=1
     const char* env_min = getenv("HD60S_MIN");
     if (env_min && env_min[0] && env_min[0] != '0' && env_min[0] != 'n' && env_min[0] != 'N') {
-        fprintf(stderr, "[min-unmute] 0x509c 最小シーケンス (bank2 select + reg 0x20=0x00)...\n");
+        fprintf(stderr, "[min-unmute] 0x509c secuencia mínima (bank2 + reg 0x20=0x00)...\n");
         // según firmware: unmute = dev=2 page reg 0x20 = 0x00
         // protocol: `00 BB` = cambio de bank (BB=bank), `RR VV` = reg RR = VV
         // se emite 6 veces (para estabilizar el estado)
@@ -98,7 +98,7 @@ void hd60s_unmute_oneshot(libusb_device_handle *h) {
     // se activa con env HD60S_UNMUTE=1 (legacy)
     const char* env_unmute = getenv("HD60S_UNMUTE");
     if (env_unmute && env_unmute[0] && env_unmute[0] != '0' && env_unmute[0] != 'n' && env_unmute[0] != 'N') {
-        fprintf(stderr, "[unmute] IT6802E audio unmute シーケンス投入...\n");
+        fprintf(stderr, "[unmute] IT6802E secuencia unmute...\n");
         struct { unsigned char reg, val; const char* name; } audio_unmute[] = {
             {0x1B, 0xFF, "reg 0x1B ch enable all"},
             {0x02, 0xF5, "reg 0x02 AUD_EN (bit7 set)"},

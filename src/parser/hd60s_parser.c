@@ -23,7 +23,6 @@
 #define FRAME_H 1080
 #define LINE_BYTES (FRAME_W * 2)                   // 3840
 #define FRAME_BYTES (LINE_BYTES * FRAME_H)         // 4,147,200
-#define EXPECTED_FRAME_BLK 45                      // measured 005e vertical-blanking markers/frame
 
 // marcadores (se leen como little-endian 32bit)
 #define MK_EOL_ACT 0x800000ffu   // bytes: ff 00 00 80
@@ -31,17 +30,10 @@
 #define MK_SEP     0x02ff00ffu   // bytes: ff 00 ff 02, luego saltar 12 bytes
 #define MK_SEP_BULK 0x04ff00ffu  // bulk/USB3 stream uses the same SEP payload with type 04
 
-typedef enum { HUNT = 0, LOCKED = 1 } pstate_t;
-static pstate_t g_state = HUNT;
 static uint8_t g_linebuf[LINE_BYTES];              // ensamblado de la línea actual
-static int g_lpos = 0;                             // posición de llenado de linebuf
 static uint8_t g_framebuf[FRAME_BYTES];            // frame terminado
 static int g_fline = 0;                            // número de fila ACT dentro del frame
 static int g_blk_run = 0;                          // contador de BLK seguidos
-
-// pending: guarda los últimos 3 bytes + resto SEP para que el marcador 32bit no se rompa al cruzar líneas
-static uint8_t g_pend[16];
-static int g_pend_n = 0;
 
 unsigned long long g_frames_out = 0;
 unsigned long long g_resyncs = 0;
@@ -315,7 +307,7 @@ static void parser_reset(const char* why) {
         g_diag_resets++;
         fprintf(stderr, "[cadence-reset] reason=%s ACT=%d BLK=%d\n", why, g_fline, g_blk_run);
     }
-    g_state = HUNT; g_lpos = 0; g_fline = 0; g_blk_run = 0; g_pend_n = 0;
+    g_fline = 0; g_blk_run = 0;
     g_resyncs++;
 }
 
@@ -781,101 +773,6 @@ static void parser_feed(const uint8_t* data, size_t len) {
         if (!g_parser_synced) return;
     }
     dynamic_video_feed(data, len);
-    return;
-    static uint8_t work[65536 + 64];
-    if (g_pend_n + len > sizeof(work)) {
-        // paquete enorme inesperado. recortar y resync
-        parser_reset("work overflow");
-        return;
-    }
-    memcpy(work, g_pend, g_pend_n);
-    memcpy(work + g_pend_n, data, len);
-    size_t total = g_pend_n + len;
-    g_pend_n = 0;
-    size_t i = 0;
-
-    while (i < total) {
-        // llenar linebuf con 3840B (g_lpos puede venir a medias de la vez anterior)
-        size_t need = LINE_BYTES - g_lpos;
-        if (need > 0) {
-            size_t avail = total - i;
-            size_t take = (avail < need) ? avail : need;
-            memcpy(g_linebuf + g_lpos, work + i, take);
-            g_lpos += take; i += take;
-            if (g_lpos < LINE_BYTES) break;  // la línea no está llena = el resto se lleva a la próxima
-        }
-
-        // para leer el marcador hacen falta 4B (16B si SEP). Si no alcanzan, a pending.
-        // ★★★IMPORTANTE★★★ al dejar resto en pending, g_lpos se queda en LINE_BYTES.
-        // (en el siguiente parser_feed g_lpos==LINE_BYTES, need==0, se salta el relleno
-        //  y se pasa directo a juzgar el marcador)
-        if (total - i < 4) {
-            size_t r = total - i;
-            memcpy(g_pend, work + i, r); g_pend_n = r;
-            return;
-        }
-        uint32_t tag; memcpy(&tag, work + i, 4);
-        // This HD60 S revision occasionally inserts four or twelve bytes
-        // around a line boundary.  Locate the next protocol marker instead
-        // of assuming it is exactly at byte 3840.
-        size_t marker_i = i;
-        size_t marker_end = total < i + 64 ? total : i + 64;
-        for (size_t q = i; q + 4 <= marker_end; ++q) {
-            uint32_t candidate;
-            memcpy(&candidate, work + q, 4);
-            if (candidate == MK_EOL_ACT || candidate == MK_EOL_BLK ||
-                candidate == MK_SEP || candidate == MK_SEP_BULK) {
-                marker_i = q;
-                tag = candidate;
-                break;
-            }
-        }
-        i = marker_i;
-
-        // SEP: 4B magic + 8B payload + 4B marcador (EOL_ACT etc.) = 16B en total.
-        // medido: en SEP+12 siempre sigue EOL_ACT (ff 00 00 80) (201/201=100%).
-        // → la impl: «si ves SEP magic, avanza +12 y relee el marcador 4B de justo después».
-        //   los 8B del SEP payload pueden ser audio (el parser los salta; otro parser de audio los trata).
-        if (tag == MK_SEP || tag == MK_SEP_BULK) {
-            if (total - i < 16) {
-                size_t r = total - i;
-                memcpy(g_pend, work + i, r); g_pend_n = r;
-                return;
-            }
-            // payload = 8 bytes, posiciones i+4 .. i+11 (audio: 48kHz s16le stereo, 2 frames/SEP)
-            hd60s_audio_feed_sep(work + i + 4);
-            i += 12;                          // saltar hasta el payload 8B (magic 4B + 8B payload)
-            memcpy(&tag, work + i, 4);        // releer el marcador 4B
-        }
-        i += 4;
-
-        if (tag == MK_EOL_ACT) {
-            if (g_state != LOCKED) {
-                if (g_blk_run >= 30) { g_state = LOCKED; g_fline = 0; }
-                else { g_lpos = 0; continue; }
-            }
-            if (g_blk_run > 0 && g_fline >= FRAME_H) {
-                emit_frame();
-                g_fline = 0;
-            }
-            g_blk_run = 0;
-            if (g_fline < FRAME_H) memcpy(g_framebuf + g_fline * LINE_BYTES, g_linebuf, LINE_BYTES);
-            g_fline++;
-            g_lpos = 0;
-        } else if (tag == MK_EOL_BLK) {
-            g_blk_run++;
-            g_lpos = 0;
-        } else {
-            // marcador desconocido: no reset; retrocede 4B y avanza 1B para rebuscar. El marcador de verdad debería estar en 3844B.
-            // así se evita falso sync si un byte de vídeo coincide por casualidad con un marcador.
-            i -= 3;
-            // desplazar ese byte de linebuf y tratarlo como «línea que empieza 1B antes» es complicado, así que
-            // en LOCKED se tira la línea (g_lpos=0) y se busca el siguiente marcador de verdad.
-            // control de frecuencia: para no resetear de más, solo se incrementa el contador
-            g_resync_marker++;
-            g_lpos = 0;
-        }
-    }
 }
 
 // A packet-level USB error means that bytes in the current line/frame are
@@ -894,11 +791,6 @@ static void parser_notify_loss(size_t bytes_lost) {
         fprintf(stderr, "[parser-loss] discarded partial frame ACT=%d BLK=%d\n",
                 g_fline, g_blk_run);
     }
-    // The dynamic parser owns the active line assembly; resetting only the
-    // legacy g_lpos/g_pend state is insufficient and would leave stale bytes
-    // in g_dyn_buf.
-    g_lpos = 0;
-    g_pend_n = 0;
     g_dyn_n = 0;
     g_sync_n = 0;
     g_parser_synced = 0;
@@ -928,7 +820,6 @@ void hd60s_parser_reset_video_phase(void) {
     g_dyn_n = 0;
     g_fline = 0;
     g_blk_run = 0;
-    g_lpos = 0;
     g_have_prev_line = 0;
 }
 

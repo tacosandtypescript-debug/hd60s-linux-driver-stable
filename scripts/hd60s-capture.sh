@@ -1,4 +1,5 @@
 #!/bin/sh
+# Supervisor: espera el USB 0fd9:005e y relanza iso_capture.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

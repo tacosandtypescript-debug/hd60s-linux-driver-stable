@@ -33,7 +33,7 @@ int hd60s_run_passthrough_only(libusb_device_handle *h, int argc, char **argv, i
     // secuencia de liberación IT66121 (2026-07-09 de madrugada, drivers públicos ITE)
     // el pcap acaba con AV_MUTE ON+SW_RST aún puestos = Windows liberaba con comandos extra
     if (do_release) {
-        fprintf(stderr, "[pt-only] IT66121 解放シーケンス発火 (AV_MUTE OFF, SW_RST 全解除, AFE fire, HDCP無効)\n");
+        fprintf(stderr, "[pt-only] IT66121 secuencia de liberación (AV_MUTE OFF, SW_RST, AFE, HDCP off)\n");
         static const unsigned char release_seq[][3] = {
             {0x9a, 0x0f, 0x00},  // selecciona bank 0 (por si acaso)
             {0x9a, 0x04, 0x00},  // SW_RST todo a 0 (VID/REF/AUD/AREF/HDCP)

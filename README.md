@@ -57,9 +57,9 @@ Si el instalador te acaba de meter en el grupo `video`, cierra sesión y vuelve 
 ## Qué deja instalado
 
 - Vídeo **1080p60 YUYV** en `/dev/video42` (cámara **ElgatoHD60S**).
-- Audio **48 kHz estéreo** en PipeWire como `hd60s_capture`.
+- Audio **48 kHz estéreo** en PipeWire como `hd60s_capture` (sink permanente `hd60s_out`; no se pierde si se reinicia la captura).
 - **Passthrough HDMI** (HDMI OUT → TV) a la vez que la captura.
-- Reintento automático si desconectas el USB.
+- Servicio de usuario `hd60s`: arranca al iniciar sesión y al enchufar el USB.
 
 Comprobado con Nintendo Switch.
 
@@ -85,6 +85,8 @@ sudo make install
 systemctl --user daemon-reload
 systemctl --user enable --now hd60s
 ```
+
+`live` / `obs` / `start` son de laboratorio y pueden chocar con el servicio. Para el día a día basta OBS + `hd60s doctor`.
 
 ## Limitaciones
 

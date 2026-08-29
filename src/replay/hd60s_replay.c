@@ -75,7 +75,7 @@ void hd60s_replay_spell(libusb_device_handle* h, const char* path) {
 
 // espera del bit candidato SCDT (lock de señal): bit0x80 de reg 0x12 del bank `9d`
 // hasta que sea 0 (=hay señal, medido ON=0x11).
-// fijado el 2026-07-09 en el experimento de diffs con/sin señal de kusq (ver FINDINGS.md).
+// Orden de burst medido: con HDMI vs sin HDMI (FINDINGS interno).
 int hd60s_wait_for_lock(libusb_device_handle* h, int timeout_ms, int poll_interval_ms) {
     unsigned char setup[3] = {0x9d, 0x01, 0x12};
     unsigned char resp[4];
@@ -88,7 +88,7 @@ int hd60s_wait_for_lock(libusb_device_handle* h, int timeout_ms, int poll_interv
                     (resp[0] & 0x80) ? "信号なし" : "ロック済み!");
             if (!(resp[0] & 0x80)) return 1;   // bit7 clear = lock
         } else {
-            fprintf(stderr, "[lock] ポーリング失敗 r1=%d r2=%d\n", r1, r2);
+            fprintf(stderr, "[lock] poll falló r1=%d r2=%d\n", r1, r2);
         }
         struct timeval tv = {0, poll_interval_ms * 1000};
         libusb_handle_events_timeout(NULL, &tv);

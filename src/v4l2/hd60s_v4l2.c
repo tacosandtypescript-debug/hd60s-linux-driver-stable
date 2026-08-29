@@ -25,7 +25,7 @@ int hd60s_v4l2_open(const char* devpath) {
     // OBS has not opened the consumer side yet.
     int fd = open(devpath, O_WRONLY | O_NONBLOCK);
     if (fd < 0) { perror("open v4l2loopback"); g_v4l_fd = -1; return -1; }
-    // 🔥 2026-07-11 diagnóstico Opus 4.8: con solo write() la máquina de estado de timestamp
+    // 2026-07-11 diagnóstico Opus 4.8: con solo write() la máquina de estado de timestamp
     // de v4l2loopback no se inicializa y el consumer deja de mostrar frames (síntomas: VLC "Timestamp conversion
     // failed", ffplay fd=0, hang de mpv, etc.). Hay que hacer VIDIOC_S_FMT + STREAMON explícitos para
     // "arrancar oficialmente" el stream OUTPUT.
@@ -39,7 +39,7 @@ int hd60s_v4l2_open(const char* devpath) {
     vf.fmt.pix.sizeimage = 4147200;
     vf.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
     if (ioctl(fd, VIDIOC_S_FMT, &vf) < 0) {
-        fprintf(stderr, "[v4l2] S_FMT 失敗: %s\n", strerror(errno));
+        fprintf(stderr, "[v4l2] S_FMT falló: %s\n", strerror(errno));
         close(fd);
         g_v4l_fd = -1;
         return -1;
@@ -53,7 +53,7 @@ int hd60s_v4l2_open(const char* devpath) {
     memset(&actual, 0, sizeof(actual));
     actual.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     if (ioctl(fd, VIDIOC_G_FMT, &actual) < 0) {
-        fprintf(stderr, "[v4l2] G_FMT 失敗: %s\n", strerror(errno));
+        fprintf(stderr, "[v4l2] G_FMT falló: %s\n", strerror(errno));
         close(fd);
         g_v4l_fd = -1;
         return -1;
@@ -78,7 +78,7 @@ int hd60s_v4l2_open(const char* devpath) {
     sp.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     sp.parm.output.timeperframe.numerator = 1;
     sp.parm.output.timeperframe.denominator = 60;
-    if (ioctl(fd, VIDIOC_S_PARM, &sp) < 0) fprintf(stderr, "[v4l2] S_PARM fps60 失敗(続行)\n");
+    if (ioctl(fd, VIDIOC_S_PARM, &sp) < 0) fprintf(stderr, "[v4l2] S_PARM fps60 falló (sigo)\n");
 
     // OBS usa mmap/CAPTURE: con exclusive_caps=1 hace falta STREAMON en OUTPUT
     // para que el consumidor reciba frames. El fd es O_NONBLOCK.

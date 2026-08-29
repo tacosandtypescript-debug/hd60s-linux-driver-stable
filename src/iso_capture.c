@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
     // este proceso monopoliza la CPU y el trabajo interno de libusb (otro hilo/worker del kernel)
     // no se agenda: replay_spell se cuelga tras "open/claim OK"
     // efecto grave confirmado (reproducido; CPU 0% y parado). Se deja solo mlockall (sin daño).
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0) fprintf(stderr, "[main] mlockall 失敗: %s(続行)\n", strerror(errno));
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0) fprintf(stderr, "[main] mlockall falló: %s (sigo)\n", strerror(errno));
 
     int libusb_rc = libusb_init(NULL);
     if (libusb_rc < 0) {
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
     }
     libusb_device_handle* h = libusb_open_device_with_vid_pid(NULL, VID, PID);
     if (!h) {
-        fprintf(stderr, "デバイスopen失敗 (0fd9:005e)\n");
+        fprintf(stderr, "no pude abrir el HD60 S (0fd9:005e)\n");
         libusb_exit(NULL);
         return 2;
     }
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
             if (h) break;
         }
         if (!h) {
-            fprintf(stderr, "reset後デバイス再open失敗\n");
+            fprintf(stderr, "falló reabrir el dispositivo tras reset\n");
             libusb_exit(NULL);
             return 2;
         }
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[main] burst load 省略\n");
     }
 
-    // 🔥 PASSTHROUGH PRE-ISO ENABLE (2026-07-11 experimento Fable + kusq webcam)
+    // Passthrough HDMI antes de arrancar ISO.
     // El 1er enable trio del pcap de Windows se dispara **384ms antes de arrancar iso**.
     // O sea: tras el TSV de init, antes de alt=2 = hay que dispararlo aquí. Siempre activo.
     {
@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "  (0x04=%02x → SW_RST)\n", regs[4]);
     }
 
-    // 🔥 HDMI PASSTHROUGH ENABLE (2026-07-11 análisis Fable 3rd)
+    // HDMI PASSTHROUGH ENABLE (2026-07-11 análisis Fable 3rd)
     // culpable real: el TX IT66121 (slave 0x9a) ya estaba perfecto. El verdadero enable de passthrough
     // son «6 comandos secretos» vía MCU (slave 0xaa magic 12 34) y CPLD (slave 0xd4).
     // Windows los dispara 3 veces. Abren «reg 0x27 = video gate» y habilitan la ruta RX→TX
@@ -450,7 +450,7 @@ int main(int argc, char** argv) {
             if (_r == 3) pt_ok++; else pt_fail++; \
         } while (0)
 
-        // 🎯 secuencia real de enable de passthrough (análisis Fable 3rd)
+        // secuencia real de enable de passthrough (análisis Fable 3rd)
         // Windows dispara 3 veces, aquí también 3
         fprintf(stderr, "[passthrough] TRUE enable sequence (MCU+CPLD, 6 cmds × 3 rounds)...\n");
         for (int round = 0; round < 3; round++) {
@@ -495,7 +495,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[passthrough] MCU/CPLD enable 統計: ok=%d fail=%d\n", pt_ok, pt_fail);
         pt_ok = 0; pt_fail = 0;
 
-        // 🔥 se eliminan todos los TX writes a 0x9a (2026-07-11 análisis Fable 4th)
+        // se eliminan todos los TX writes a 0x9a (2026-07-11 análisis Fable 4th)
         // HD60S trae passthrough ON por defecto; el MCU controla IT66121 solo.
         // escribir 0x9a desde el host rompe la config del MCU (friendly fire) → TMDS inestable →
         // la TV cae a «modo ahorro de energía». Solo queda el control MCU/CPLD (aa/d4);
@@ -519,7 +519,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "  (0x04=%02x SW_RST, 0x0E=%02x SYS_STAT)\n", regs[4], regs[14]);
     }
 
-    // 🔥 POST-ISO AUDIO CONFIG (2026-07-11 pcap RE breakthrough)
+    // POST-ISO AUDIO CONFIG (2026-07-11 pcap RE breakthrough)
     hd60s_unmute_maybe_post_iso_audio(h);
     // IT6802E bank 0x94 audio setup (also applied before audio stream open).
     hd60s_unmute_maybe_audio94(h);
@@ -601,7 +601,7 @@ int main(int argc, char** argv) {
             if (ka_fires <= 3) fprintf(stderr, "[ka] cycle #%d fired: %d/%d ok\n", ka_fires, ka_ok, g_nka);
         }
 
-        // 🔥 IT6802 AUDIO RECOVERY LOOP (2026-07-11 Fable + FIX_ID_023 breakthrough)
+        // IT6802 AUDIO RECOVERY LOOP (2026-07-11 Fable + FIX_ID_023 breakthrough)
         // reproduce AudioFsCal() + aud_fiforst() + Force FS del driver oficial ITE it680x.c.
         // cada 100ms reenvía HW unmute + forzar 48kHz + I2S untri-state.
         // se activa con HD60S_IT6802_RECOVER=1. Acceso IT6802 = I2C slave 0x94 (write) bank 0
@@ -648,7 +648,7 @@ int main(int argc, char** argv) {
             if (it6802_rec_fires <= 3) fprintf(stderr, "[it6802-rec] fire #%d at t=%.0fms\n", it6802_rec_fires, el*1000);
         }
 
-        // 🔥 PASSTHROUGH KEEPALIVE (2026-07-11 verificado Fable + kusq webcam)
+        // Keepalive del passthrough HDMI (sin esto el TV puede apagar la entrada).
         // si no se dispara el keepalive del slave d4 MCU/CPLD cada 100ms, el monitor LG
         // cae a «modo ahorro de energía» (detecta el corte passthrough ON→OFF).
         // En el pcap de Windows se dispara en continuo cada 40-300ms.

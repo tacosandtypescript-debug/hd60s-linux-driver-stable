@@ -477,7 +477,7 @@ static void audio_feed_sep(const uint8_t* payload) {
 }
 
 // ======================================================================
-// 🔥 implementación nativa libpipewire (propuesta Opus 4.8, 2026-07-11)
+// implementación nativa libpipewire (propuesta Opus 4.8, 2026-07-11)
 // antes: iso_capture → snd_aloop → arecord|aplay → PipeWire = 4 etapas de buffer
 // ahora: iso_capture → pw_stream (directo) = 1 etapa, ~2.6ms/quantum
 // se activa con env HD60S_AUDIO_PW=1. Flag para A/B frente a la impl ALSA.
@@ -488,7 +488,7 @@ static int g_pw_initialized = 0;
 static int g_pw_started = 0;
 // ring buffer (mono int16 samples). Producer: iso_capture (vía audio_feed_sep).
 // Consumer: callback process de pipewire (otro hilo).
-// 🔥 test de kusq: 683ms es demasiado; se acumula audio viejo → latencia.
+// Un quantum grande acumula audio viejo (latencia).
 // recortado a 4096 samples @ 96kHz = 43ms; si está lleno, tira lo viejo (prioriza lo nuevo).
 #define PW_CHANNELS 2
 #define PW_RING_SIZE 16384
@@ -516,8 +516,8 @@ static int16_t g_pw_last_r = 0;
 
 // callback process de pw_stream: lo llama el hilo RT de PipeWire. Dequeue del ring
 // y escribe en el buffer PW.
-// 🔥 anti-clipping: en underflow no rellenar con 0; decay de last_sample
-// 🔥 2026-07-18 lock-free SPSC: no pelea el mutex con el producer. El drop-old
+// anti-clipping: en underflow no rellenar con 0; decay de last_sample
+// 2026-07-18 lock-free SPSC: no pelea el mutex con el producer. El drop-old
 //    queda en el consumer (para respetar la regla SPSC de un solo escritor de tail).
 static void pw_on_process(void* userdata) {
     (void)userdata;
@@ -596,7 +596,7 @@ static const struct pw_stream_events g_pw_events = {
 };
 
 // escribe samples al ring en batch (desde el hilo iso)
-// 🔥 2026-07-18 lock-free SPSC + batch: se quita el mutex per-sample de antes.
+// 2026-07-18 lock-free SPSC + batch: se quita el mutex per-sample de antes.
 //    si full, drop-new (no escribe). El drop-old vive en el consumer (pw_on_process).
 static void pw_ring_push_batch(const int16_t* samples, int n) {
     if (n <= 0) return;
@@ -775,7 +775,7 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
     // 2026-07-19 PLL update: cada 1s ajusta upsample_ratio a partir del error de fill del ring.
     // adaptive rate follow que absorbe el empeoramiento lento por drift.
     // ganancia: 100ppm drift = 9.6 samples/s de desvío; con Kp=1e-6, Ki=1e-7 sigue en 30-60s.
-    // ⚠️ 2026-07-19 escucha kusq: al cambiar el ratio al vuelo el PLL produce un efecto «algo disonante»
+    // El PLL al vuelo mueve el tono; por defecto va desactivado.
     //    (el tono se mueve). Default off; opt-in con HD60S_PLL_ENABLE=1.
     static int pll_checked = 0, pll_enabled = 0;
     if (!pll_checked) {

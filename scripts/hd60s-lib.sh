@@ -60,10 +60,12 @@ set_caps() {
 }
 
 kill_capture() {
-    sudo pkill -TERM -f 'run-hd60s-obs\.sh' 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet hd60s 2>/dev/null; then
+        systemctl --user stop hd60s || true
+        return
+    fi
     sudo pkill -TERM -x iso_capture 2>/dev/null || true
     sleep 1
-    sudo pkill -9 -f 'run-hd60s-obs\.sh' 2>/dev/null || true
     sudo pkill -9 -x iso_capture 2>/dev/null || true
 }
 

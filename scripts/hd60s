@@ -35,7 +35,7 @@ case "$CMD" in
         -e "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" -e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
     # panel 1 (arriba): iso_capture — corre sin límite hasta Ctrl+C (argv[1]=0 ≈ 100 años)
     # el audio sale por snd-aloop hw:10,0 → hw:10,1 hacia hd60s_capture
-    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 \"$SCRIPT_DIR\"/run-hd60s-obs.sh" Enter
+    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 \"$SCRIPT_DIR\"/hd60s-capture.sh" Enter
     # panel 2 (abajo): vista previa mpv — arranca a los 13s (HD60S_NO_MPV=1 lo desactiva)
     # si usas OBS, mpv no hace falta; sin preview: HD60S_NO_MPV=1
     if [ -z "${HD60S_NO_MPV:-}" ]; then
@@ -60,7 +60,7 @@ case "$CMD" in
     kill_capture
     HERE="$PWD"
     tmux new-session -d -s hd60s -x 200 -y 50
-    tmux send-keys -t hd60s "cd $HERE && \"$SCRIPT_DIR\"/run-hd60s-obs.sh" Enter
+    tmux send-keys -t hd60s "cd $HERE && \"$SCRIPT_DIR\"/hd60s-capture.sh" Enter
     say "iso_capture arrancado (tmux 'hd60s'). Esperando lock de vídeo 12s..."
     sleep 12
     say "arrancando OBS..."
@@ -250,37 +250,30 @@ case "$CMD" in
 
   help|--help|-h|"")
     cat <<EOF
-HD60S — envoltorio del driver experimental
+hd60s — driver Elgato HD60 S (0fd9:005e)
 
-Uso: hd60s <command> [argumentos]
+Uso diario (tras ./install.sh):
+  enchufa USB 3.0 y abre OBS → V4L2 ElgatoHD60S + audio hd60s_capture
 
-── Ver / usar ────────────────────────────
-  live           tmux: iso_capture + vista previa a la vez (recomendado)
-  obs            arranca iso_capture en segundo plano y abre OBS
-  start [seg]    iso_capture en primer plano (por defecto 600s)
-  view           VLC en $VDEV + audio ($ADEV)
-  view-mpv       mpv (Wayland nativo, solo vídeo)
-  view-ffplay    ffplay (alternativa)
-  view-guvc      guvcview
-
-── Experimentos / depuración ────────────────────────
-  test [seg]      prueba corta (por defecto 20s, para ver stats)
-  minimal [seg]   modo mínimo (omite init/burst, protege passthrough, por defecto 30s)
-  pt   [seg]      (roto) passthrough / poststream — no usar
-  ptx  [seg]      (roto) passthrough + liberación — no usar
-  audio-test [seg] extrae solo audio (sep.wav, por defecto 6s)
-  audio-v2 [seg]  prueba unmute IT6802 (reg 0x7D, por defecto 30s)
-
-── Mantenimiento ─────────────────────────────
-  stop           para todos los iso_capture en marcha
-  busy           procesos que tienen abierto $VDEV
-  doctor         diagnóstico (driver, módulos, USB, OBS)
-  install        instalador completo (desde el checkout: ./install.sh)
-  uninstall      quita udev, el servicio y /usr/local
-  install-deps   paquetes del sistema + extras (OBS, mpv, tmux)
+  doctor         diagnóstico (módulos, USB, servicio)
+  stop           para el servicio o iso_capture
   help           esta ayuda
 
-Dispositivos: vídeo=$VDEV / audio=$ADEV
+Instalación (desde el checkout):
+  install        ./install.sh
+  uninstall      quita udev, el servicio y /usr/local
+  install-deps   paquetes + extras (OBS, mpv, tmux)
+
+Laboratorio (puede chocar con systemctl --user hd60s):
+  live           tmux: captura + mpv
+  obs            captura y abre OBS
+  start [seg]    iso_capture en primer plano (600s)
+  view           VLC en $VDEV
+  view-mpv / view-ffplay / view-guvc
+  test / minimal / audio-test / audio-v2
+  busy           quién tiene abierto $VDEV
+
+Vídeo=$VDEV  audio=hd60s_capture
 EOF
     ;;
 

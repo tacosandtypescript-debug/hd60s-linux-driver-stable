@@ -6,7 +6,7 @@ Wants=pipewire.service pipewire-pulse.service
 [Service]
 Type=simple
 ExecStartPre=@LIBEXECDIR@/hd60s-audio-bridge.sh
-ExecStart=@LIBEXECDIR@/run-hd60s-obs.sh
+ExecStart=@LIBEXECDIR@/hd60s-capture.sh
 WorkingDirectory=@LIBEXECDIR@
 Restart=always
 RestartSec=2s
