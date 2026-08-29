@@ -6,9 +6,9 @@ No hay driver oficial fuera de Windows y macOS. Este proyecto habla el USB del a
 
 Solo el modelo **VID `0fd9` / PID `005e`**. No vale para HD60 S+ ni HD60 X.
 
-![OBS mostrando la captura del HD60 S (Fortnite, 1080p60)](docs/screenshot.png)
+![Fortnite en OBS con el HD60 S (1080p60)](docs/screenshot.png)
 
-*OBS con **Dispositivo de captura de video (V4L2)** y audio **Elgato HD60 S** a 60 fps.*
+*Captura actual en OBS: Fortnite por **Dispositivo de captura de video (V4L2)** y audio **Elgato HD60 S**, 60 fps.*
 
 ## Instalación
 
