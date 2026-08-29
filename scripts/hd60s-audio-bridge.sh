@@ -63,7 +63,7 @@ if pactl load-module module-remap-source \
     "master=$mon" \
     "channels=2" \
     "channel_map=front-left,front-right" \
-    "source_properties=device.description=Elgato-HD60S-Audio,session.suspend-timeout-seconds=0" \
+    "source_properties=device.description=Elgato-HD60S-Audio" \
     >/dev/null; then
   say "fuente permanente $audio_source_name → $mon"
 else
