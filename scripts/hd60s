@@ -66,8 +66,8 @@ case "$CMD" in
     say "arrancando OBS..."
     obs &
     say "configuración de OBS:"
-    echo "  · vídeo: fuente de medios (FFmpeg), no V4L2 — $VDEV / video4linux2 / 1920x1080 / 60fps / yuyv422"
-    echo "  · audio: PipeWire hd60s_capture (48 kHz estéreo), o ALSA $ADEV"
+    echo "  · vídeo V4L2: $VDEV (ElgatoHD60S) / 1920x1080 / 60fps / YUYV"
+    echo "  · audio: PipeWire hd60s_capture (48 kHz estéreo)"
     ;;
 
   start)

@@ -31,7 +31,7 @@ ensure_snd_aloop() {
 ensure_v4l2loopback() {
     if ! lsmod | grep -q v4l2loopback; then
         say "cargando v4l2loopback..."
-        sudo modprobe v4l2loopback video_nr=42 card_label="HD60S" exclusive_caps=0 || \
+        sudo modprobe v4l2loopback video_nr=42 card_label=ElgatoHD60S exclusive_caps=1 || \
             die "falló al cargar v4l2loopback. Instala v4l2loopback-dkms con 'hd60s install-deps'"
         sleep 1
     fi
@@ -55,8 +55,8 @@ ensure_hd60s_device() {
 }
 
 set_caps() {
-    sudo v4l2loopback-ctl set-caps "$VDEV" "YUYV:1920x1080@60/1" >/dev/null 2>&1 || \
-        die "falló v4l2loopback-ctl set-caps ($VDEV)"
+    # iso_capture hace VIDIOC_S_FMT; esto solo adelanta el formato si el ctl lo acepta.
+    v4l2loopback-ctl set-caps "video/x-raw,format=YUY2,width=1920,height=1080,framerate=60/1" "$VDEV" >/dev/null 2>&1 || true
 }
 
 kill_capture() {

@@ -79,9 +79,11 @@ Instalación opcional a `/usr/local` (regla udev `packaging/70-elgato-hd60s.rule
 
 ```bash
 sudo make install
+systemctl --user daemon-reload
+systemctl --user enable --now hd60s
 ```
 
-Tras instalar, el comando es `hd60s` (ya no hace falta el prefijo `scripts/`). La unit no carga `v4l2loopback` ni `snd-aloop`: hay que tenerlos listos (`./scripts/hd60s live` los carga, o `modprobe` a mano). Quitar: `sudo make uninstall`.
+Tras instalar, el comando es `hd60s`. El loopback queda en `/dev/video42` como **ElgatoHD60S** (`exclusive_caps=1`) para que OBS lo vea como cámara. El servicio de usuario arranca `iso_capture` al iniciar sesión y al enchufar el USB. Quitar: `systemctl --user disable --now hd60s` y `sudo make uninstall`.
 
 ## Uso
 
@@ -110,10 +112,10 @@ En tmux, panel de arriba: `scripts/run-hd60s-obs.sh` (init `analysis/init-p2-aud
 
 1. `HD60S_NO_MPV=1 ./scripts/hd60s live` (o `./scripts/hd60s obs`).
 2. Fuentes:
-   - vídeo: **fuente de medios (FFmpeg)**, no el plugin V4L2. Entrada `/dev/video42`, formato `video4linux2`, opciones `video_size=1920x1080 framerate=60 input_format=yuyv422`.
-   - audio: PipeWire-Pulse `hd60s_capture` (48 kHz estéreo). También vale ALSA `hw:10,1`.
+   - vídeo V4L2: dispositivo **ElgatoHD60S** (`/dev/video42`), 1920×1080, 60 fps, YUYV.
+   - audio: PipeWire-Pulse `hd60s_capture` (48 kHz estéreo).
 
-OBS 30.0.x en Linux se cierra con `free(): invalid pointer` si usas «Dispositivo de captura de video (V4L2)» sobre v4l2loopback. El crash está en `linux-v4l2.so` al listar propiedades, no en `iso_capture`.
+`sudo make install` y `systemctl --user enable --now hd60s` dejan el loopback con `exclusive_caps=1` (OBS lo ve como cámara nativa) y arrancan la captura al enchufar el USB.
 
 ### Audio
 
@@ -127,7 +129,7 @@ PipeWire nativo: `HD60S_AUDIO_PW=1`. En ese modo no se publica la fuente ALSA.
 
 - 1080p60 YUYV sin comprimir (~2 Gbps). `iso_capture` y OBS usan CPU de verdad; no es un fallo del driver.
 - Solo 1080p60. No hay 720p ni 30 fps.
-- OBS 30 + plugin V4L2 nativo + v4l2loopback: crash `free(): invalid pointer`. Usar fuente de medios (FFmpeg).
+- El loopback tiene que ir con `exclusive_caps=1`. Con 0, OBS 30 puede abortar en `linux-v4l2.so`.
 - Wayland + NVIDIA: mpv con `--vo=gpu-next` puede fallar; `live` fuerza `--vo=wlshm`.
 - No hay hotplug por libusb. El supervisor hace polling hasta que el USB vuelve a enumerar.
 - Implementación no oficial, sin relación con Elgato Systems GmbH. Uso bajo tu responsabilidad.

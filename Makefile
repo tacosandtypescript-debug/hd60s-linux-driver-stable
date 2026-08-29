@@ -8,6 +8,9 @@ SYSTEMD_USER_UNITDIR ?= $(PREFIX)/share/systemd/user
 SYSTEMD_USER_UNIT_TEMPLATE := packaging/hd60s.service.in
 WIREPLUMBER_CONFDIR ?= /etc/wireplumber/main.lua.d
 WIREPLUMBER_RULE := packaging/wireplumber/51-hd60s-alsa.lua
+WIREPLUMBER_V4L2_RULE := packaging/wireplumber/51-hd60s-v4l2.lua
+MODPROBEDIR ?= /etc/modprobe.d
+MODULESLOADDIR ?= /etc/modules-load.d
 LIBUSB_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
 LIBUSB_LIBS := $(shell pkg-config --libs libusb-1.0)
 ALSA_LIBS := -lasound
@@ -40,11 +43,13 @@ install-symlink:
 
 install: all
 	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)"
+	install -d "$(DESTDIR)$(MODPROBEDIR)" "$(DESTDIR)$(MODULESLOADDIR)" "$(DESTDIR)$(UDEVRULEDIR)"
 	install -m 0755 iso_capture scripts/hd60s scripts/hd60s-lib.sh scripts/run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
 	install -m 0644 analysis/*.tsv "$(DESTDIR)$(LIBEXECDIR)/analysis/"
-	install -m 0644 "$(WIREPLUMBER_RULE)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/"
+	install -m 0644 "$(WIREPLUMBER_RULE)" "$(WIREPLUMBER_V4L2_RULE)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/"
+	install -m 0644 packaging/modprobe.d/*.conf "$(DESTDIR)$(MODPROBEDIR)/"
+	install -m 0644 packaging/modules-load.d/hd60s.conf "$(DESTDIR)$(MODULESLOADDIR)/"
 	@sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' "$(SYSTEMD_USER_UNIT_TEMPLATE)" > "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s.service"
-	install -d "$(DESTDIR)$(UDEVRULEDIR)"
 	install -m 0644 $(UDEVRULE) "$(DESTDIR)$(UDEVRULEDIR)/$(notdir $(UDEVRULE))"
 	ln -sfn "$(LIBEXECDIR)/hd60s" "$(DESTDIR)$(PREFIX)/bin/hd60s"
 	@if test -z "$(DESTDIR)" && command -v udevadm >/dev/null 2>&1; then \
@@ -56,6 +61,9 @@ uninstall:
 	rm -f "$(DESTDIR)$(UDEVRULEDIR)/$(notdir $(UDEVRULE))"
 	rm -f "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s.service"
 	rm -f "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/$(notdir $(WIREPLUMBER_RULE))"
+	rm -f "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/$(notdir $(WIREPLUMBER_V4L2_RULE))"
+	rm -f "$(DESTDIR)$(MODPROBEDIR)/hd60s-v4l2loopback.conf" "$(DESTDIR)$(MODPROBEDIR)/hd60s-snd-aloop.conf"
+	rm -f "$(DESTDIR)$(MODULESLOADDIR)/hd60s.conf"
 	rm -rf "$(DESTDIR)$(LIBEXECDIR)"
 
 spi_dump: tools/spi_dump.c

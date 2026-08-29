@@ -6,12 +6,19 @@ Wants=pipewire.service
 [Service]
 Type=simple
 ExecStart=@LIBEXECDIR@/run-hd60s-obs.sh
+WorkingDirectory=@LIBEXECDIR@
 Restart=always
 RestartSec=2s
 KillMode=mixed
 TimeoutStopSec=10s
-Environment=HD60S_CADENCE_DIAG=1
-Environment=HD60S_AUDIO_PW=0
+Environment=HD60S_CADENCE_DIAG=0
+Environment=HD60S_VERBOSE=0
+Environment=HD60S_AUDIO_PW=1
+Environment=HD60S_PACE_OUTPUT=1
+Environment=HD60S_AUDIO=1
+Environment=HD60S_AUDIO_V2=1
+Environment=HD60S_POST_ISO_AUDIO94=1
+Environment=HD60S_IT6802_RECOVER=1
 
 [Install]
 WantedBy=default.target
