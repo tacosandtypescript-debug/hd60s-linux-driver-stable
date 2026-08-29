@@ -1,10 +1,11 @@
 [Unit]
 Description=Elgato HD60 S capture supervisor
-After=pipewire.service wireplumber.service
-Wants=pipewire.service
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service pipewire-pulse.service
 
 [Service]
 Type=simple
+ExecStartPre=@LIBEXECDIR@/hd60s-audio-bridge.sh
 ExecStart=@LIBEXECDIR@/run-hd60s-obs.sh
 WorkingDirectory=@LIBEXECDIR@
 Restart=always

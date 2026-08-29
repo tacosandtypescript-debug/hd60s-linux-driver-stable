@@ -45,7 +45,7 @@ install-symlink:
 install: all
 	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)"
 	install -d "$(DESTDIR)$(MODPROBEDIR)" "$(DESTDIR)$(MODULESLOADDIR)" "$(DESTDIR)$(UDEVRULEDIR)" "$(DESTDIR)$(TMPFILESDIR)"
-	install -m 0755 iso_capture scripts/hd60s scripts/hd60s-lib.sh scripts/run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
+	install -m 0755 iso_capture scripts/hd60s scripts/hd60s-lib.sh scripts/run-hd60s-obs.sh scripts/hd60s-audio-bridge.sh "$(DESTDIR)$(LIBEXECDIR)/"
 	install -m 0755 scripts/hd60s-install.sh scripts/hd60s-uninstall.sh "$(DESTDIR)$(LIBEXECDIR)/"
 	install -m 0644 analysis/*.tsv "$(DESTDIR)$(LIBEXECDIR)/analysis/"
 	install -m 0644 "$(WIREPLUMBER_RULE)" "$(WIREPLUMBER_V4L2_RULE)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/"

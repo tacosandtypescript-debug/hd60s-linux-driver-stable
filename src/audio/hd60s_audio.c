@@ -632,21 +632,45 @@ static int audio_pw_open(void) {
     }
     pw_thread_loop_lock(g_pw_loop);
 
-    struct pw_properties* props = pw_properties_new(
-        PW_KEY_MEDIA_TYPE, "Audio",
-        PW_KEY_MEDIA_CLASS, "Audio/Source",
-        PW_KEY_MEDIA_CATEGORY, "Capture",
-        PW_KEY_MEDIA_ROLE, "Game",
-        PW_KEY_MEDIA_NAME, "hd60s_capture",
-        PW_KEY_NODE_NAME, "hd60s_capture",
-        PW_KEY_NODE_DESCRIPTION, "Elgato HD60 S Audio Capture",
-        PW_KEY_NODE_LATENCY, "128/48000",   // 128 samples @ 48kHz = 2.6ms
-        PW_KEY_NODE_ALWAYS_PROCESS, "true",
-        NULL);
+    /* Reproduce hacia un sink permanente (hd60s_out). OBS captura el
+     * monitor remapeado a hd60s_capture, que no desaparece si iso_capture
+     * se reinicia. HD60S_PW_SINK=source vuelve al nodo nativo. */
+    const char *pw_sink = getenv("HD60S_PW_SINK");
+    if (!pw_sink || !pw_sink[0])
+        pw_sink = "hd60s_out";
+    int as_source = (strcmp(pw_sink, "source") == 0 || strcmp(pw_sink, "-") == 0);
+
+    struct pw_properties* props;
+    if (as_source) {
+        props = pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CLASS, "Audio/Source",
+            PW_KEY_MEDIA_CATEGORY, "Capture",
+            PW_KEY_MEDIA_ROLE, "Game",
+            PW_KEY_MEDIA_NAME, "hd60s_capture",
+            PW_KEY_NODE_NAME, "hd60s_capture",
+            PW_KEY_NODE_DESCRIPTION, "Elgato HD60 S Audio Capture",
+            PW_KEY_NODE_LATENCY, "128/48000",
+            PW_KEY_NODE_ALWAYS_PROCESS, "true",
+            NULL);
+    } else {
+        props = pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Playback",
+            PW_KEY_MEDIA_ROLE, "Game",
+            PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
+            PW_KEY_MEDIA_NAME, "hd60s_play",
+            PW_KEY_NODE_NAME, "hd60s_play",
+            PW_KEY_NODE_DESCRIPTION, "Elgato HD60 S playback",
+            PW_KEY_TARGET_OBJECT, pw_sink,
+            PW_KEY_NODE_LATENCY, "256/48000",
+            PW_KEY_NODE_ALWAYS_PROCESS, "true",
+            NULL);
+    }
 
     g_pw_stream = pw_stream_new_simple(
         pw_thread_loop_get_loop(g_pw_loop),
-        "hd60s_capture",
+        as_source ? "hd60s_capture" : "hd60s_play",
         props,
         &g_pw_events,
         NULL);
@@ -709,7 +733,11 @@ static int audio_pw_open(void) {
         return -1;
     }
     g_pw_started = 1;
-    fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE stereo)\n");
+    if (as_source)
+        fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE stereo)\n");
+    else
+        fprintf(stderr, "[audio-pw] playback → %s (48kHz S16_LE stereo); OBS lee hd60s_capture\n",
+                pw_sink);
     audio_src_init();
     return 0;
 }

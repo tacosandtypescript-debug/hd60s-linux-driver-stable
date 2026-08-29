@@ -24,9 +24,29 @@ usb_device_present() {
 device_state=unknown
 child_pid=0
 
+link_hd60s_play() {
+  command -v pw-link >/dev/null 2>&1 || return 0
+  sink=${HD60S_PW_SINK:-hd60s_out}
+  # Reintenta un poco: el stream nativo tarda en aparecer.
+  n=0
+  while [ "$n" -lt 20 ]; do
+    if pw-link "hd60s_play:output_FL" "$sink:playback_FL" 2>/dev/null; then
+      pw-link "hd60s_play:output_FR" "$sink:playback_FR" 2>/dev/null || true
+      echo "[hd60s] audio enlazado hd60s_play → $sink"
+      return 0
+    fi
+    n=$((n + 1))
+    sleep 0.25
+  done
+  return 0
+}
+
 ensure_hd60s_audio_source() {
-  # snd-aloop cross-connects playback device 0 to capture device 1.
-  # iso_capture writes to hw:10,0, so OBS must consume hw:10,1.
+  # Puente permanente PipeWire: sink hd60s_out + fuente hd60s_capture.
+  # OBS no pierde el dispositivo cuando iso_capture se reinicia.
+  if [ -x "$SCRIPT_DIR/hd60s-audio-bridge.sh" ]; then
+    sh "$SCRIPT_DIR/hd60s-audio-bridge.sh" || true
+  fi
   case "${HD60S_AUDIO_PW:-0}" in
     0|n|N) ;;
     *) return 0 ;;
@@ -108,6 +128,7 @@ while :; do
     HD60S_VERBOSE=0 \
     ./iso_capture 0 2 1 &
   child_pid=$!
+  link_hd60s_play &
   wait "$child_pid"
   rc=$?
   child_pid=0
