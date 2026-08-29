@@ -205,13 +205,12 @@ case "$CMD" in
     chk "/dev/v4l/by-id existe"  "[ -d /dev/v4l/by-id ]"                    "sudo systemd-tmpfiles --create /etc/tmpfiles.d/hd60s.conf"
     avs "symlink OBS by-id"      "[ -e /dev/v4l/by-id/elgato-hd60s-index0 ]" "sudo udevadm trigger --subsystem-match=video4linux"
     avs "HD60 S conectado (USB 0fd9:005e)" "usb_device_present"                    "enchufa el HD60 S a USB 3.0 y dale alimentación"
-    avs "snd-aloop cargado"     "lsmod | grep -q snd_aloop"                 "sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1"
     avs "grupo video"            "id -nG | tr ' ' '\\n' | grep -qx video"    "sudo usermod -aG video $USER  (luego cierra sesión)"
     avs "comando hd60s en PATH"  "command -v hd60s"                          "./install.sh deja hd60s en /usr/local/bin"
     avs "servicio hd60s activo"  "systemctl --user is-active --quiet hd60s"  "systemctl --user enable --now hd60s"
+    avs "sink hd60s_out"         "pactl list short sinks 2>/dev/null | grep -q hd60s_out" "systemctl --user restart hd60s"
+    avs "fuente hd60s_capture"   "pactl list short sources 2>/dev/null | grep -q hd60s_capture" "systemctl --user restart hd60s"
     avs "obs"                      "command -v obs"                            "./install.sh --extras   o   sudo apt install -y obs-studio"
-    avs "tmux"                     "command -v tmux"                           "./install.sh --extras"
-    avs "mpv"                      "command -v mpv"                            "./install.sh --extras"
     echo
     echo "resultado: OK=$ok  avisos=$warn  fallos=$ng"
     if [ "$ng" != 0 ]; then

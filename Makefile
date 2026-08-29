@@ -18,9 +18,10 @@ ALSA_LIBS := -lasound
 PIPEWIRE_CFLAGS := $(shell pkg-config --cflags libpipewire-0.3)
 PIPEWIRE_LIBS := $(shell pkg-config --libs libpipewire-0.3)
 
-BINS = iso_capture audio_extract offline_parser spi_dump probe_iso
+TOOLS = audio_extract offline_parser spi_dump probe_iso
 
-all: $(BINS)
+all: iso_capture
+tools: $(TOOLS)
 
 ISO_SRC := src/iso_capture.c src/util/hd60s_util.c src/v4l2/hd60s_v4l2.c src/audio/hd60s_audio.c src/replay/hd60s_replay.c src/pace/hd60s_pace.c src/parser/hd60s_parser.c src/usb/hd60s_usb.c src/pt/hd60s_passthrough.c src/unmute/hd60s_unmute.c
 ISO_INC := -Isrc -Isrc/util -Isrc/v4l2 -Isrc/audio -Isrc/replay -Isrc/pace -Isrc/parser -Isrc/usb -Isrc/pt -Isrc/unmute
@@ -35,14 +36,11 @@ offline_parser: tools/offline_parser.c
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:
-	rm -f $(BINS)
+	rm -f iso_capture $(TOOLS)
 
-install-symlink:
-	ln -sf $(CURDIR)/scripts/hd60s /usr/local/bin/hd60s
+.PHONY: all tools clean install uninstall
 
-.PHONY: all clean install install-symlink uninstall
-
-install: all
+install: iso_capture
 	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)"
 	install -d "$(DESTDIR)$(MODPROBEDIR)" "$(DESTDIR)$(MODULESLOADDIR)" "$(DESTDIR)$(UDEVRULEDIR)" "$(DESTDIR)$(TMPFILESDIR)"
 	install -m 0755 iso_capture scripts/hd60s scripts/hd60s-lib.sh scripts/hd60s-capture.sh scripts/hd60s-audio-bridge.sh "$(DESTDIR)$(LIBEXECDIR)/"
