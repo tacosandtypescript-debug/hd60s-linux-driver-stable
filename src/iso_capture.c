@@ -614,8 +614,14 @@ int main(int argc, char** argv) {
             const char* env_int = getenv("HD60S_RECOVER_MS");
             rec_interval = (env_int && atoi(env_int) > 0) ? atoi(env_int) / 1000.0 : 0.100;
         }
-        // también dispara en t=0 (primera vez last_it6802_rec == 0.0; mata el silencio inicial)
-        if (do_rec && (last_it6802_rec == 0.0 || (el - last_it6802_rec) >= rec_interval)) {
+        /* Solo re-unmute si no llegan SEP (audio muerto). Pulsar 0x7D cada
+         * 100 ms con audio vivo corta el sonido. */
+        static unsigned long long last_audio_pk = 0;
+        unsigned long long audio_pk = hd60s_audio_packets();
+        int audio_stalled = (audio_pk == last_audio_pk);
+        last_audio_pk = audio_pk;
+        if (do_rec && audio_stalled &&
+            (last_it6802_rec == 0.0 || (el - last_it6802_rec) >= rec_interval)) {
             #define IT6802W(reg, val) do { \
                 unsigned char _w[3] = {0x94, (reg), (val)}; \
                 libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _w, 3, 100); \

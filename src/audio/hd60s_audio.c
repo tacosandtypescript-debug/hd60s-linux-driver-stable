@@ -142,7 +142,9 @@ static void audio_track_cadence_and_recalibrate(int is_active) {
             g_upsample_ratio = target_rate / effective_sample_rate;
             if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
             if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
-            if (fabs(g_upsample_ratio - 1.0) < 0.02)
+            /* Solo identidad si el error es < ~24 muestras/s. Un snap a 1.0
+             * con 47870 Hz reales vacía el anillo PipeWire y el audio se corta. */
+            if (fabs(g_upsample_ratio - 1.0) < 0.0005)
                 g_upsample_ratio = 1.0;
             g_pll_base_ratio = g_upsample_ratio;
             g_pll_last_update = now;
@@ -214,7 +216,7 @@ static void decode_sep_mono(const uint8_t* payload, int16_t mono[2]) {
 }
 
 static int audio_ratio_is_unity(void) {
-    return fabs(g_upsample_ratio - 1.0) < 0.01;
+    return fabs(g_upsample_ratio - 1.0) < 0.0005;
 }
 
 static void audio_src_init(void) {
@@ -490,7 +492,7 @@ static int g_pw_started = 0;
 // recortado a 4096 samples @ 96kHz = 43ms; si está lleno, tira lo viejo (prioriza lo nuevo).
 #define PW_CHANNELS 2
 #define PW_RING_SIZE 16384
-#define PW_TARGET_FILL 512  // frames @ 48 kHz ≈ 10.7 ms
+#define PW_TARGET_FILL 2048  /* ~43 ms @ 48 kHz: absorbe jitter USB */
 // 2026-07-18 lock-free SPSC ring: el producer solo toca head, el consumer solo tail.
 // sin pthread_mutex se elimina la priority inversion (el hilo RT esperando el mutex del producer).
 // ordering release/acquire garantiza que los samples escritos se ven cross-thread.
@@ -571,16 +573,11 @@ static void pw_on_process(void* userdata) {
     }
     g_audio_samples_out += n;
 
-    int32_t decay_l = g_pw_last_l;
-    int32_t decay_r = g_pw_last_r;
+    /* No decaer a silencio: un hueco corto se oye como corte seco. */
     for (uint32_t i = n; i < want; i++) {
-        decay_l = decay_l * 245 / 256;
-        decay_r = decay_r * 245 / 256;
-        dst[i * 2] = (int16_t)decay_l;
-        dst[i * 2 + 1] = (int16_t)decay_r;
+        dst[i * 2] = g_pw_last_l;
+        dst[i * 2 + 1] = g_pw_last_r;
     }
-    g_pw_last_l = (int16_t)decay_l;
-    g_pw_last_r = (int16_t)decay_r;
 
     atomic_store_explicit(&g_pw_ring_tail, (tail + n * PW_CHANNELS) & (PW_RING_SIZE - 1),
                           memory_order_release);
@@ -823,6 +820,10 @@ void hd60s_audio_feed_sep(const uint8_t *payload12) {
 
 void hd60s_audio_close(void) {
     audio_close();
+}
+
+unsigned long long hd60s_audio_packets(void) {
+    return atomic_load_explicit(&g_audio_packets, memory_order_relaxed);
 }
 
 void hd60s_audio_dump_stats(FILE *fp) {
