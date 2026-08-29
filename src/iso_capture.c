@@ -62,16 +62,20 @@
 // TODO: activar passthrough (HDMI loop-through) de forma permanente y, a la vez,
 // capturar. Aún no resuelto; hoy pt-only solo lo mantiene un rato.
 int main(int argc, char** argv) {
-    hd60s_diag_set(getenv("HD60S_CADENCE_DIAG") ? 1 : 0);
+    hd60s_diag_set(hd60s_env_on("HD60S_CADENCE_DIAG"));
     const char *pace_env = getenv("HD60S_PACE_OUTPUT");
     hd60s_pace_configure(pace_env && pace_env[0] && pace_env[0] != '0' &&
                     pace_env[0] != 'n' && pace_env[0] != 'N');
     if (g_diag) fprintf(stderr, "[cadence] diagnostics enabled (no capture parameters changed)\n");
     if (g_pace_output) fprintf(stderr, "[cadence] V4L2 output pacing enabled at 60 Hz\n");
-    // stderr sin buffer (con prioridad RT SCHED_FIFO el buffer por bloques
-    // retrasa los logs; esto lo evita)
-    setvbuf(stderr, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IONBF, 0);
+    // Logs de diagnóstico: sin buffer. En vivo, línea a línea para no saturar.
+    if (g_diag || hd60s_env_on("HD60S_VERBOSE")) {
+        setvbuf(stderr, NULL, _IONBF, 0);
+        setvbuf(stdout, NULL, _IONBF, 0);
+    } else {
+        setvbuf(stderr, NULL, _IOLBF, 0);
+        setvbuf(stdout, NULL, _IOLBF, 0);
+    }
     hd60s_parser_trace_init();
     install_signal_handlers();
     int read_sec = argc > 1 ? atoi(argv[1]) : 6;

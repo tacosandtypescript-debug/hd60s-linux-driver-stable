@@ -132,9 +132,11 @@ void hd60s_pace_output_if_due(void) {
     uint64_t write_start_ns = now;
     ssize_t w = hd60s_v4l2_write_frame(frame, FRAME_BYTES);
     uint64_t write_done_ns = now_mono_ns();
-    fprintf(stderr, "[v4l-write] seq=%llu mode=paced bytes=%zd expected=%zu %s\n",
-            ++g_v4l_write_seq, w, (size_t)FRAME_BYTES,
-            w == FRAME_BYTES ? "OK" : "ANOMALY");
+    ++g_v4l_write_seq;
+    if (g_diag)
+        fprintf(stderr, "[v4l-write] seq=%llu mode=paced bytes=%zd expected=%zu %s\n",
+                g_v4l_write_seq, w, (size_t)FRAME_BYTES,
+                w == FRAME_BYTES ? "OK" : "ANOMALY");
     if (g_diag) {
         uint64_t dur = write_done_ns - write_start_ns;
         g_diag_write_dur_n++;

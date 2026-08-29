@@ -166,8 +166,8 @@ static void LIBUSB_CALL iso_cb(struct libusb_transfer* xfr) {
     } else {
         s->inflight--;
     }
-    if ((++callback_count % 100) == 0)
-        fprintf(stderr, "[iso-debug] callbacks=%lu ok=%ld empty=%ld err=%ld bytes=%lld frames=%llu\\n",
+    if (g_diag && (++callback_count % 100) == 0)
+        fprintf(stderr, "[iso-debug] callbacks=%lu ok=%ld empty=%ld err=%ld bytes=%lld frames=%llu\n",
                 callback_count, s->pkt_ok, s->pkt_empty, s->pkt_err, s->total_bytes, g_frames_out);
 }
 

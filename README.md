@@ -125,6 +125,7 @@ PipeWire nativo: `HD60S_AUDIO_PW=1`. En ese modo no se publica la fuente ALSA.
 
 ## Limitaciones
 
+- 1080p60 YUYV sin comprimir (~2 Gbps). `iso_capture` y OBS usan CPU de verdad; no es un fallo del driver.
 - Solo 1080p60. No hay 720p ni 30 fps.
 - OBS 30 + plugin V4L2 nativo + v4l2loopback: crash `free(): invalid pointer`. Usar fuente de medios (FFmpeg).
 - Wayland + NVIDIA: mpv con `--vo=gpu-next` puede fallar; `live` fuerza `--vo=wlshm`.

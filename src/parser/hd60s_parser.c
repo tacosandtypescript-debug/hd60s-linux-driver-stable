@@ -341,9 +341,11 @@ static void emit_frame(void) {
         uint64_t write_start_ns = now_mono_ns();
         ssize_t w = hd60s_v4l2_write_frame(g_framebuf, FRAME_BYTES);
         uint64_t write_done_ns = now_mono_ns();
-        fprintf(stderr, "[v4l-write] seq=%llu mode=direct bytes=%zd expected=%zu %s\n",
-                ++g_v4l_write_seq, w, (size_t)FRAME_BYTES,
-                w == FRAME_BYTES ? "OK" : "ANOMALY");
+        ++g_v4l_write_seq;
+        if (g_diag)
+            fprintf(stderr, "[v4l-write] seq=%llu mode=direct bytes=%zd expected=%zu %s\n",
+                    g_v4l_write_seq, w, (size_t)FRAME_BYTES,
+                    w == FRAME_BYTES ? "OK" : "ANOMALY");
         if (g_diag) {
             uint64_t dur = write_done_ns - write_start_ns;
             g_diag_write_dur_n++;
@@ -380,7 +382,7 @@ static void emit_frame(void) {
     // bastante pronto para pillar stall, y el journal se ensucia 1/5. Equilibrio.
     // HD60S_VERBOSE=1 vuelve a cada segundo (60 frames), el verbose de antes.
     static int verbose_checked = 0, verbose = 0;
-    if (!verbose_checked) { verbose = getenv("HD60S_VERBOSE") ? 1 : 0; verbose_checked = 1; }
+    if (!verbose_checked) { verbose = hd60s_env_on("HD60S_VERBOSE"); verbose_checked = 1; }
     unsigned long long interval = verbose ? 60 : 300;
     if ((g_frames_out % interval) == 0) fprintf(stderr, "[emit] %llu frames\n", g_frames_out);
     hd60s_diag_report_if_due();
@@ -617,9 +619,10 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
                 int frame_blks = g_blk_run;
                 int structurally_valid = frame_blks == EXPECTED_FRAME_BLK;
                 if (structurally_valid) {
-                    fprintf(stderr, "[frame] emit #%llu lines=%d BLK=%d %s\n",
-                            g_frames_out + 1, frame_lines, frame_blks,
-                            frame_blks == EXPECTED_FRAME_BLK ? "OK" : "ANOMALY");
+                    if (g_diag)
+                        fprintf(stderr, "[frame] emit #%llu lines=%d BLK=%d %s\n",
+                                g_frames_out + 1, frame_lines, frame_blks,
+                                frame_blks == EXPECTED_FRAME_BLK ? "OK" : "ANOMALY");
                     if (g_diag) g_diag_complete++;
                     emit_frame();
                     g_recovery_pending = 0;
