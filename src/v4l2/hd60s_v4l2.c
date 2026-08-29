@@ -79,10 +79,14 @@ int hd60s_v4l2_open(const char* devpath) {
     sp.parm.output.timeperframe.denominator = 60;
     if (ioctl(fd, VIDIOC_S_PARM, &sp) < 0) fprintf(stderr, "[v4l2] S_PARM fps60 失敗(続行)\n");
 
-    // v4l2loopback's write() interface owns the OUTPUT queue.  Calling
-    // VIDIOC_STREAMON here can block waiting for a queue state that is
-    // established by the consumer (OBS), so leave the queue in write mode.
-    // A complete frame is submitted by each write(FRAME_BYTES) below.
+    // OBS usa mmap/CAPTURE: con exclusive_caps=1 hace falta STREAMON en OUTPUT
+    // para que el consumidor reciba frames. El fd es O_NONBLOCK.
+    {
+        enum v4l2_buf_type btype = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        if (ioctl(fd, VIDIOC_STREAMON, &btype) < 0)
+            fprintf(stderr, "[v4l2] STREAMON: %s (se sigue con write())\n",
+                    strerror(errno));
+    }
     fprintf(stderr, "[v4l2] %s opened (YUYV 1920x1080 @60fps, S_FMT/write mode)\n", devpath);
     g_v4l_fd = fd;
     return fd;

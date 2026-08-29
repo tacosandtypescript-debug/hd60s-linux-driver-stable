@@ -1,3 +1,6 @@
 # Acceso USB sin root + arranque del servicio de usuario al enchufar.
 SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="005e", TAG+="uaccess"
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="005e", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="hd60s.service"
+
+# Enlaces estables para el plugin V4L2 de OBS 30 (scandir /dev/v4l/by-id).
+KERNEL=="video42", SUBSYSTEM=="video4linux", GROUP="video", MODE="0660", SYMLINK+="v4l/by-id/elgato-hd60s-index0", SYMLINK+="v4l/by-path/platform-v4l2loopback-042-video-index0"
