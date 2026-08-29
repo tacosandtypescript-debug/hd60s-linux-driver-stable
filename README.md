@@ -108,11 +108,12 @@ En tmux, panel de arriba: `scripts/run-hd60s-obs.sh` (init `analysis/init-p2-aud
 
 ### OBS
 
-1. `./scripts/hd60s live` (o `HD60S_NO_MPV=1 ./scripts/hd60s live` si no quieres mpv).
-2. Alternativa: `./scripts/hd60s obs`.
-3. Fuentes:
-   - vídeo V4L2: `/dev/video42`, 1920×1080, 60 fps, YUYV
-   - audio: fuente PipeWire-Pulse `hd60s_capture` (ruta por defecto). También vale ALSA `hw:10,1` (hd60s Loopback), que es lo que imprime `hd60s obs`.
+1. `HD60S_NO_MPV=1 ./scripts/hd60s live` (o `./scripts/hd60s obs`).
+2. Fuentes:
+   - vídeo: **fuente de medios (FFmpeg)**, no el plugin V4L2. Entrada `/dev/video42`, formato `video4linux2`, opciones `video_size=1920x1080 framerate=60 input_format=yuyv422`.
+   - audio: PipeWire-Pulse `hd60s_capture` (48 kHz estéreo). También vale ALSA `hw:10,1`.
+
+OBS 30.0.x en Linux se cierra con `free(): invalid pointer` si usas «Dispositivo de captura de video (V4L2)» sobre v4l2loopback. El crash está en `linux-v4l2.so` al listar propiedades, no en `iso_capture`.
 
 ### Audio
 
@@ -125,6 +126,7 @@ PipeWire nativo: `HD60S_AUDIO_PW=1`. En ese modo no se publica la fuente ALSA.
 ## Limitaciones
 
 - Solo 1080p60. No hay 720p ni 30 fps.
+- OBS 30 + plugin V4L2 nativo + v4l2loopback: crash `free(): invalid pointer`. Usar fuente de medios (FFmpeg).
 - Wayland + NVIDIA: mpv con `--vo=gpu-next` puede fallar; `live` fuerza `--vo=wlshm`.
 - No hay hotplug por libusb. El supervisor hace polling hasta que el USB vuelve a enumerar.
 - Implementación no oficial, sin relación con Elgato Systems GmbH. Uso bajo tu responsabilidad.
