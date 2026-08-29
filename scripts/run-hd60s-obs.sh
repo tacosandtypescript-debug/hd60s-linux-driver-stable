@@ -57,7 +57,7 @@ ensure_hd60s_audio_source() {
   module_id=$(pactl load-module module-alsa-source \
     "device=$audio_capture_dev" \
     "source_name=$audio_source_name" \
-    format=s16le rate=96000 channels=1 \
+    format=s16le rate=48000 channels=1 \
     source_properties=device.description=Elgato-HD60S-Audio 2>/dev/null || true)
   if [ -n "$module_id" ]; then
     echo "[hd60s] fuente de audio $audio_source_name publicada desde $audio_capture_dev"

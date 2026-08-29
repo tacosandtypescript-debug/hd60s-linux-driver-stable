@@ -35,8 +35,11 @@ static _Atomic unsigned long long g_audio_bytes = 0;
 static _Atomic unsigned long long g_audio_samples_in = 0;
 static _Atomic unsigned long long g_audio_samples_out = 0;
 static _Atomic unsigned long long g_audio_pw_underflow = 0;
-#define AUDIO_BATCH_FRAMES 960  // ~10ms (96kHz mono OBS bridge)
+#define AUDIO_TARGET_RATE 48000
+#define AUDIO_BATCH_FRAMES 480  // 10 ms @ 48 kHz mono
 static int16_t g_audio_buf[AUDIO_BATCH_FRAMES];  // mono
+static SRC_STATE *g_src = NULL;
+static int g_src_ok = 0;
 static int g_audio_buf_pos = 0;
 
 // ALSA playback must not run in the libusb callback.  snd_pcm_writei() can
@@ -69,7 +72,7 @@ typedef struct {
 
 static AudioCadenceState g_audio_cadence = {0};
 static int g_sep_count = 0;
-// ratio de interpolación hacia el bridge 96kHz (0=antes del cálculo fijo)
+// ratio hacia el puente 48 kHz (0 = aún no medido)
 static double g_upsample_ratio = 0.0;
 static double g_pll_base_ratio = 0.0;
 static double g_pll_last_update = 0.0;
@@ -93,7 +96,7 @@ static void audio_track_cadence_and_recalibrate(int is_active) {
             // Do not start measurement window during initial silence/settling
             if (!is_active || g_audio_cadence.active_sep_count < 100) {
                 if (g_upsample_ratio <= 0.0) {
-                    g_upsample_ratio = g_use_pw ? 1.0 : 2.0;
+                    g_upsample_ratio = 1.0;
                     g_pll_base_ratio = g_upsample_ratio;
                 }
                 return;
@@ -103,7 +106,7 @@ static void audio_track_cadence_and_recalibrate(int is_active) {
             g_audio_cadence.sep_count = 0;
             g_audio_cadence.active_sep_count = 0;
             if (g_upsample_ratio <= 0.0) {
-                g_upsample_ratio = g_use_pw ? 1.0 : 2.0;
+                g_upsample_ratio = 1.0;
                 g_pll_base_ratio = g_upsample_ratio;
             }
             return;
@@ -124,22 +127,23 @@ static void audio_track_cadence_and_recalibrate(int is_active) {
                 return;
             }
 
-            double effective_sample_rate = 48000.0;
+            double effective_sample_rate = audio_rate;
             if (audio_rate >= 40000.0 && audio_rate <= 60000.0) {
-                effective_sample_rate = 48000.0;
+                effective_sample_rate = audio_rate;
             } else if (audio_rate >= 88000.0 && audio_rate <= 105000.0) {
-                effective_sample_rate = 96000.0;
+                effective_sample_rate = audio_rate;
             } else if (audio_rate >= 176000.0 && audio_rate <= 200000.0) {
-                effective_sample_rate = 192000.0;
+                effective_sample_rate = audio_rate;
             } else {
-                // Default fallback for standard HDMI 48kHz PCM
                 effective_sample_rate = 48000.0;
             }
 
-            double target_rate = g_use_pw ? 48000.0 : 96000.0;
+            double target_rate = (double)AUDIO_TARGET_RATE;
             g_upsample_ratio = target_rate / effective_sample_rate;
             if (g_upsample_ratio < 0.125) g_upsample_ratio = 0.125;
             if (g_upsample_ratio > 8.0) g_upsample_ratio = 8.0;
+            if (fabs(g_upsample_ratio - 1.0) < 0.02)
+                g_upsample_ratio = 1.0;
             g_pll_base_ratio = g_upsample_ratio;
             g_pll_last_update = now;
             g_audio_cadence.measured_sep_rate = sep_rate;
@@ -151,7 +155,7 @@ static void audio_track_cadence_and_recalibrate(int is_active) {
 
             fprintf(stderr, "[audio%s] measured: %.1f SEP/s (%.1f audio frames/s) → %.0f Hz nominal → ratio %.3fx to %.0fkHz %s\n",
                     g_use_pw ? "-pw" : "", sep_rate, audio_rate, effective_sample_rate,
-                    g_upsample_ratio, target_rate / 1000.0, g_use_pw ? "stream" : "mono bridge");
+                    g_upsample_ratio, target_rate / 1000.0, g_use_pw ? "stream" : "alsa bridge");
         }
     } else {
         // 2. Continuous Monitoring & Automatic Recalibration
@@ -171,7 +175,7 @@ static void audio_track_cadence_and_recalibrate(int is_active) {
                 } else if (rolling_audio_rate >= 176000.0 && rolling_audio_rate <= 200000.0) {
                     nominal_rate = 192000.0;
                 }
-                double target_rate = g_use_pw ? 48000.0 : 96000.0;
+                double target_rate = (double)AUDIO_TARGET_RATE;
                 double expected_ratio = target_rate / nominal_rate;
                 if (fabs(g_upsample_ratio - expected_ratio) > 0.02) {
                     fprintf(stderr, "[audio%s-recalibrate] ratio adjusted from %.4f to expected %.4f (measured %.1f SEP/s, nominal %.0f Hz)\n",
@@ -195,13 +199,99 @@ static int16_t decode_sep_s16(const uint8_t* p) {
     return (int16_t)raw;
 }
 
+static void decode_sep_stereo(const uint8_t *payload, int16_t lr[4]) {
+    lr[0] = decode_sep_s16(payload);
+    lr[1] = decode_sep_s16(payload + 2);
+    lr[2] = decode_sep_s16(payload + 4);
+    lr[3] = decode_sep_s16(payload + 6);
+}
+
 static void decode_sep_mono(const uint8_t* payload, int16_t mono[2]) {
-    int32_t l0 = decode_sep_s16(payload);
-    int32_t r0 = decode_sep_s16(payload + 2);
-    int32_t l1 = decode_sep_s16(payload + 4);
-    int32_t r1 = decode_sep_s16(payload + 6);
-    mono[0] = (int16_t)((l0 + r0) / 2);
-    mono[1] = (int16_t)((l1 + r1) / 2);
+    int16_t lr[4];
+    decode_sep_stereo(payload, lr);
+    mono[0] = (int16_t)(((int32_t)lr[0] + lr[1]) / 2);
+    mono[1] = (int16_t)(((int32_t)lr[2] + lr[3]) / 2);
+}
+
+static int audio_ratio_is_unity(void) {
+    return fabs(g_upsample_ratio - 1.0) < 0.01;
+}
+
+static void audio_src_init(void) {
+    if (g_src_ok) return;
+    int src_err = 0;
+    g_src = src_new(SRC_SINC_MEDIUM_QUALITY, 2, &src_err);
+    if (!g_src) {
+        fprintf(stderr, "[audio] src_new failed: %s; using linear fallback\n",
+                src_strerror(src_err));
+        g_src_ok = 0;
+        return;
+    }
+    g_src_ok = 1;
+    fprintf(stderr, "[audio] libsamplerate SINC_MEDIUM_QUALITY enabled\n");
+}
+
+static void audio_src_close(void) {
+    if (g_src) {
+        src_delete(g_src);
+        g_src = NULL;
+    }
+    g_src_ok = 0;
+}
+
+// 2 frames estéreo HDMI → interleaved S16. A ratio 1.0 no se filtra (el SINC ensucia).
+static int audio_resample_sep_stereo(const int16_t lr[4], int16_t *out, int max_samples) {
+    if (max_samples < 4) return 0;
+    if (audio_ratio_is_unity()) {
+        memcpy(out, lr, 4 * sizeof(int16_t));
+        return 4;
+    }
+    if (g_src_ok) {
+        float input[4] = {
+            (float)lr[0] / 32768.0f, (float)lr[1] / 32768.0f,
+            (float)lr[2] / 32768.0f, (float)lr[3] / 32768.0f,
+        };
+        float output[64];
+        int cap_frames = (int)(sizeof(output) / sizeof(output[0]) / 2);
+        if (cap_frames > max_samples / 2) cap_frames = max_samples / 2;
+        SRC_DATA data = {
+            .data_in = input,
+            .input_frames = 2,
+            .data_out = output,
+            .output_frames = cap_frames,
+            .src_ratio = g_upsample_ratio,
+            .end_of_input = 0,
+        };
+        if (src_process(g_src, &data) == 0) {
+            int n = (int)data.output_frames_gen * 2;
+            if (n > max_samples) n = max_samples & ~1;
+            for (int i = 0; i < n; i++) {
+                float v = output[i] * 32768.0f;
+                if (v > 32767.0f) v = 32767.0f;
+                if (v < -32768.0f) v = -32768.0f;
+                out[i] = (int16_t)v;
+            }
+            return n;
+        }
+    }
+    memcpy(out, lr, 4 * sizeof(int16_t));
+    return 4;
+}
+
+static int audio_resample_sep(const int16_t mono[2], int16_t *out, int max_out) {
+    if (max_out <= 0) return 0;
+    if (audio_ratio_is_unity()) {
+        int n = max_out < 2 ? max_out : 2;
+        memcpy(out, mono, (size_t)n * sizeof(int16_t));
+        return n;
+    }
+    int16_t lr[4] = { mono[0], mono[0], mono[1], mono[1] };
+    int16_t stereo[32];
+    int ns = audio_resample_sep_stereo(lr, stereo, (int)(sizeof(stereo) / sizeof(stereo[0])));
+    int n_out = 0;
+    for (int i = 0; i + 1 < ns && n_out < max_out; i += 2)
+        out[n_out++] = (int16_t)(((int32_t)stereo[i] + stereo[i + 1]) / 2);
+    return n_out;
 }
 
 // forward declaration de la versión PipeWire (definición más abajo)
@@ -232,15 +322,16 @@ static void audio_open(const char* pcm_name) {
         SND_PCM_FORMAT_S16_LE,
         SND_PCM_ACCESS_RW_INTERLEAVED,
         1,          // mono
-        96000,      // OBS-facing snd-aloop bridge rate
+        AUDIO_TARGET_RATE,
         1,          // soft resample
-        200000);    // 200ms latency (dejar holgura)
+        80000);     // 80 ms
     if (err < 0) {
         fprintf(stderr, "[audio] snd_pcm_set_params failed: %s\n", snd_strerror(err));
         snd_pcm_close(g_pcm); g_pcm = NULL;
         return;
     }
-    fprintf(stderr, "[audio] ALSA %s opened (96kHz S16_LE mono bridge; SEP stereo downmix), 初 SEP 到着から 2 秒で実 rate 測定...\n", pcm_name);
+    audio_src_init();
+    fprintf(stderr, "[audio] ALSA %s opened (48kHz S16_LE mono; SEP stereo downmix)\n", pcm_name);
     audio_writer_start();
 }
 
@@ -351,7 +442,6 @@ static void audio_flush(void) {
     g_audio_buf_pos = 0;
 }
 
-// downmix L/R del SEP a mono y sale al bridge 96kHz con interpolación lineal de huecos.
 static void audio_feed_sep(const uint8_t* payload) {
     g_audio_packets++;
     g_audio_bytes += 8;
@@ -361,12 +451,11 @@ static void audio_feed_sep(const uint8_t* payload) {
     int is_active = (abs(mono[0]) > 32 || abs(mono[1]) > 32);
 
     static int g_sep_diag_count = 0;
-    if (g_sep_diag_count < 10 || (is_active && g_sep_diag_count < 50)) {
-        fprintf(stderr, "[sep-raw #%d] raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x -> mono0=%d mono1=%d active=%d\n",
-                g_sep_diag_count,
-                payload[0], payload[1], payload[2], payload[3],
-                payload[4], payload[5], payload[6], payload[7],
-                mono[0], mono[1], is_active);
+    if (g_sep_diag_count < 10 || (is_active && g_sep_diag_count < 20)) {
+        int16_t lr[4];
+        decode_sep_stereo(payload, lr);
+        fprintf(stderr, "[sep-raw #%d] L0=%d R0=%d L1=%d R1=%d active=%d\n",
+                g_sep_diag_count, lr[0], lr[1], lr[2], lr[3], is_active);
         g_sep_diag_count++;
     }
 
@@ -376,22 +465,11 @@ static void audio_feed_sep(const uint8_t* payload) {
 
     if (!g_pcm || g_upsample_ratio <= 0) return;
 
-    for (int sample_index = 0; sample_index < 2; sample_index++) {
-        int16_t cur = mono[sample_index];
-        // expande cada sample de entrada a upsample_ratio samples de salida
-        // linear interpolation: prev (g_last_sample) → cur
-        double count = g_upsample_ratio + g_frac_pos;
-        int n = (int)count;
-        g_frac_pos = count - n;
-        for (int i = 1; i <= n; i++) {
-            double t = (double)i / (double)(n > 0 ? n : 1);
-            double v = g_last_sample + (cur - g_last_sample) * t;
-            if (v > 32767.0) v = 32767.0;
-            if (v < -32768.0) v = -32768.0;
-            if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
-            g_audio_buf[g_audio_buf_pos++] = (int16_t)v;
-        }
-        g_last_sample = cur;
+    int16_t batch[32];
+    int n = audio_resample_sep(mono, batch, (int)(sizeof(batch) / sizeof(batch[0])));
+    for (int i = 0; i < n; i++) {
+        if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
+        g_audio_buf[g_audio_buf_pos++] = batch[i];
     }
     if (g_audio_buf_pos >= AUDIO_BATCH_FRAMES) audio_flush();
 }
@@ -410,9 +488,9 @@ static int g_pw_started = 0;
 // Consumer: callback process de pipewire (otro hilo).
 // 🔥 test de kusq: 683ms es demasiado; se acumula audio viejo → latencia.
 // recortado a 4096 samples @ 96kHz = 43ms; si está lleno, tira lo viejo (prioriza lo nuevo).
+#define PW_CHANNELS 2
 #define PW_RING_SIZE 16384
-// para que el hilo PW no deje «sin leer», nivel objetivo = 1 quantum (128 samples ~1.3ms).
-#define PW_TARGET_FILL 1024
+#define PW_TARGET_FILL 512  // frames @ 48 kHz ≈ 10.7 ms
 // 2026-07-18 lock-free SPSC ring: el producer solo toca head, el consumer solo tail.
 // sin pthread_mutex se elimina la priority inversion (el hilo RT esperando el mutex del producer).
 // ordering release/acquire garantiza que los samples escritos se ven cross-thread.
@@ -431,8 +509,8 @@ static _Atomic uint64_t g_pw_output_errors = 0;
 static _Atomic uint32_t g_pw_fill_min = UINT32_MAX;
 static _Atomic uint32_t g_pw_fill_max = 0;
 
-// estado para el callback process de PW
-static int16_t g_pw_last_sample = 0;  // continuidad en underflow
+static int16_t g_pw_last_l = 0;
+static int16_t g_pw_last_r = 0;
 
 // callback process de pw_stream: lo llama el hilo RT de PipeWire. Dequeue del ring
 // y escribe en el buffer PW.
@@ -455,17 +533,16 @@ static void pw_on_process(void* userdata) {
     }
 
     int16_t* dst = (int16_t*)buf->datas[0].data;
-    uint32_t max_frames = buf->datas[0].maxsize / sizeof(int16_t);
+    uint32_t max_frames = buf->datas[0].maxsize / (PW_CHANNELS * sizeof(int16_t));
     uint32_t want = b->requested;
-    // requested==0 = «que lo decida PW». Si se consume hasta max_frames el ring queda vacío →
-    // 40ms de silencio en la siguiente llamada, así que se limita a TARGET_FILL (~1 quantum)
     if (want == 0) want = PW_TARGET_FILL;
     if (want > max_frames) want = max_frames;
 
-    // acquire: garantiza que se ven los samples que escribió el producer
     uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_acquire);
     uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
-    uint32_t avail = (head - tail) & (PW_RING_SIZE - 1);
+    uint32_t avail_s = (head - tail) & (PW_RING_SIZE - 1);
+    avail_s &= ~(uint32_t)(PW_CHANNELS - 1);
+    uint32_t avail = avail_s / PW_CHANNELS;
     uint32_t old_min = atomic_load_explicit(&g_pw_fill_min, memory_order_relaxed);
     while (avail < old_min && !atomic_compare_exchange_weak_explicit(
         &g_pw_fill_min, &old_min, avail, memory_order_relaxed, memory_order_relaxed)) {}
@@ -473,42 +550,44 @@ static void pw_on_process(void* userdata) {
     while (avail > old_max && !atomic_compare_exchange_weak_explicit(
         &g_pw_fill_max, &old_max, avail, memory_order_relaxed, memory_order_relaxed)) {}
 
-    // 2026-07-18 soft-drop: tirar mucho de golpe produce un click audible, así que si se pasa
-    // de TARGET*3 (~8ms) solo tira 128 samples (1.3ms, 1 quantum). Dispara más a menudo, pero
-    // el salto es más chico y el click se siente << que un drop duro.
     if (avail > PW_TARGET_FILL * 3) {
-        uint32_t drop = 128;
-        tail = (tail + drop) & (PW_RING_SIZE - 1);
-        avail = (head - tail) & (PW_RING_SIZE - 1);
+        uint32_t drop = 64;
+        tail = (tail + drop * PW_CHANNELS) & (PW_RING_SIZE - 1);
+        avail_s = (head - tail) & (PW_RING_SIZE - 1);
+        avail_s &= ~(uint32_t)(PW_CHANNELS - 1);
+        avail = avail_s / PW_CHANNELS;
         atomic_fetch_add_explicit(&g_pw_drops_old, drop, memory_order_relaxed);
     }
 
     uint32_t n = (want < avail) ? want : avail;
     if (n < want) g_audio_pw_underflow++;
     for (uint32_t i = 0; i < n; i++) {
-        dst[i] = g_pw_ring[(tail + i) & (PW_RING_SIZE - 1)];
+        dst[i * 2]     = g_pw_ring[(tail + i * 2) & (PW_RING_SIZE - 1)];
+        dst[i * 2 + 1] = g_pw_ring[(tail + i * 2 + 1) & (PW_RING_SIZE - 1)];
     }
-    if (n > 0) g_pw_last_sample = dst[n-1];
+    if (n > 0) {
+        g_pw_last_l = dst[(n - 1) * 2];
+        g_pw_last_r = dst[(n - 1) * 2 + 1];
+    }
     g_audio_samples_out += n;
 
-    // 🔥 relleno de underflow: no 0; atenúa last_sample rápido (continuidad, evita click)
-    int32_t decay = g_pw_last_sample;
+    int32_t decay_l = g_pw_last_l;
+    int32_t decay_r = g_pw_last_r;
     for (uint32_t i = n; i < want; i++) {
-        // decay exponencial: ×3/4 cada 25 samples (~1ms hasta silence)
-        decay = decay * 245 / 256;  // 0.957x per sample
-        dst[i] = (int16_t)decay;
+        decay_l = decay_l * 245 / 256;
+        decay_r = decay_r * 245 / 256;
+        dst[i * 2] = (int16_t)decay_l;
+        dst[i * 2 + 1] = (int16_t)decay_r;
     }
-    g_pw_last_sample = decay;
+    g_pw_last_l = (int16_t)decay_l;
+    g_pw_last_r = (int16_t)decay_r;
 
-    // release: en el siguiente pop_process, si se ve el update de tail antes de leer samples
-    // no hay efecto (solo este hilo escribe tail, así que es simple, pero influye en el
-    // fill del producer, por eso release explícito)
-    atomic_store_explicit(&g_pw_ring_tail, (tail + n) & (PW_RING_SIZE - 1),
+    atomic_store_explicit(&g_pw_ring_tail, (tail + n * PW_CHANNELS) & (PW_RING_SIZE - 1),
                           memory_order_release);
 
     buf->datas[0].chunk->offset = 0;
-    buf->datas[0].chunk->stride = sizeof(int16_t);
-    buf->datas[0].chunk->size = want * sizeof(int16_t);
+    buf->datas[0].chunk->stride = (int32_t)(PW_CHANNELS * sizeof(int16_t));
+    buf->datas[0].chunk->size = want * PW_CHANNELS * sizeof(int16_t);
     atomic_fetch_add_explicit(&g_pw_output_writes, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_pw_output_frames, want, memory_order_relaxed);
     pw_stream_queue_buffer(g_pw_stream, b);
@@ -518,11 +597,6 @@ static const struct pw_stream_events g_pw_events = {
     PW_VERSION_STREAM_EVENTS,
     .process = pw_on_process,
 };
-
-// 2026-07-19 se mete libsamplerate: contra el coloreado de agudos del linear interp (Opus 4.8 A1).
-// SRC_SINC_MEDIUM_QUALITY = ~-100 dB THD en fase y amplitud; <1% CPU estimado en i7-12700.
-static SRC_STATE* g_src = NULL;
-static int g_src_ok = 0;
 
 // escribe samples al ring en batch (desde el hilo iso)
 // 🔥 2026-07-18 lock-free SPSC + batch: se quita el mutex per-sample de antes.
@@ -598,8 +672,9 @@ static int audio_pw_open(void) {
     struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     struct spa_audio_info_raw info = SPA_AUDIO_INFO_RAW_INIT(
         .format = SPA_AUDIO_FORMAT_S16_LE,
-        .channels = 1,
-        .rate = 48000
+        .channels = 2,
+        .rate = 48000,
+        .position = { SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR }
     );
     const struct spa_pod* params[1];
     params[0] = spa_format_audio_raw_build(&pod_builder, SPA_PARAM_EnumFormat, &info);
@@ -637,19 +712,8 @@ static int audio_pw_open(void) {
         return -1;
     }
     g_pw_started = 1;
-    fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE mono)\n");
-
-    // 2026-07-19 init de libsamplerate (SINC MEDIUM QUALITY): mucho menos coloreado
-    // de fase/amplitud que linear interp. src_ratio se setea tras medir el rate SEP.
-    int src_err = 0;
-    g_src = src_new(SRC_SINC_MEDIUM_QUALITY, 1, &src_err);
-    if (!g_src) {
-        fprintf(stderr, "[audio-pw] src_new failed: %s → linear fallback\n", src_strerror(src_err));
-        g_src_ok = 0;
-    } else {
-        g_src_ok = 1;
-        fprintf(stderr, "[audio-pw] libsamplerate SINC_MEDIUM_QUALITY 有効\n");
-    }
+    fprintf(stderr, "[audio-pw] native source hd60s_capture started (48kHz S16_LE stereo)\n");
+    audio_src_init();
     return 0;
 }
 
@@ -667,7 +731,7 @@ static void audio_pw_close(void) {
         pw_thread_loop_destroy(g_pw_loop);
         g_pw_loop = NULL;
     }
-    if (g_src) { src_delete(g_src); g_src = NULL; g_src_ok = 0; }
+    audio_src_close();
     if (g_pw_initialized) {
         pw_deinit();
         g_pw_initialized = 0;
@@ -676,9 +740,9 @@ static void audio_pw_close(void) {
 
 // versión PipeWire de audio_feed_sep: push al ring de los samples upsampleados
 static void audio_feed_sep_pw(const uint8_t* payload) {
-    int16_t mono[2];
-    decode_sep_mono(payload, mono);
-    int is_active = (abs(mono[0]) > 32 || abs(mono[1]) > 32);
+    int16_t lr[4];
+    decode_sep_stereo(payload, lr);
+    int is_active = (abs(lr[0]) > 32 || abs(lr[1]) > 32 || abs(lr[2]) > 32 || abs(lr[3]) > 32);
 
     audio_track_cadence_and_recalibrate(is_active);
     if (!g_pw_stream || g_upsample_ratio <= 0) return;
@@ -700,8 +764,8 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
             g_pll_last_update = now;
             uint32_t head = atomic_load_explicit(&g_pw_ring_head, memory_order_relaxed);
             uint32_t tail = atomic_load_explicit(&g_pw_ring_tail, memory_order_relaxed);
-            int32_t fill = (int32_t)((head - tail) & (PW_RING_SIZE - 1));
-            int32_t err = fill - (int32_t)PW_TARGET_FILL;  // +=demasiado lleno, -=falta
+            int32_t fill = (int32_t)(((head - tail) & (PW_RING_SIZE - 1)) / PW_CHANNELS);
+            int32_t err = fill - (int32_t)PW_TARGET_FILL;
             g_pll_integral += (double)err * dt;
             // clamp anti-runaway del integrador
             if (g_pll_integral > 100000.0) g_pll_integral = 100000.0;
@@ -728,56 +792,9 @@ static void audio_feed_sep_pw(const uint8_t* payload) {
         }
     }
 
-    // 2026-07-19 ruta libsamplerate (interp SINC). Si no se puede, fallback al linear interp viejo.
-    if (g_src_ok) {
-        // int16 → float [-1,1)
-        float input[2] = {
-            (float)mono[0] / 32768.0f,
-            (float)mono[1] / 32768.0f,
-        };
-        float output[32];
-        SRC_DATA data = {
-            .data_in = input,
-            .input_frames = 2,
-            .data_out = output,
-            .output_frames = (long)(sizeof(output)/sizeof(output[0])),
-            .src_ratio = g_upsample_ratio,
-            .end_of_input = 0,
-        };
-        int r = src_process(g_src, &data);
-        if (r == 0) {
-            int16_t batch[32];
-            int bi = 0;
-            for (long i = 0; i < data.output_frames_gen && bi < 32; i++) {
-                float v = output[i] * 32768.0f;
-                if (v > 32767.0f) v = 32767.0f;
-                if (v < -32768.0f) v = -32768.0f;
-                batch[bi++] = (int16_t)v;
-            }
-            pw_ring_push_batch(batch, bi);
-            return;
-        }
-        // si src_process falla, cae al fallback (raro)
-    }
-
-    // Fallback: linear interp viejo (solo si falla el init de libsamplerate)
     int16_t batch[32];
-    int bi = 0;
-    for (int k = 0; k < 2; k++) {
-        int16_t cur = mono[k];
-        double count = g_upsample_ratio + g_frac_pos;
-        int n = (int)count;
-        g_frac_pos = count - n;
-        for (int i = 1; i <= n && bi < (int)(sizeof(batch)/sizeof(batch[0])); i++) {
-            double t = (double)i / (double)(n > 0 ? n : 1);
-            double v = g_last_sample + (cur - g_last_sample) * t;
-            if (v > 32767.0) v = 32767.0;
-            if (v < -32768.0) v = -32768.0;
-            batch[bi++] = (int16_t)v;
-        }
-        g_last_sample = cur;
-    }
-    pw_ring_push_batch(batch, bi);
+    int n = audio_resample_sep_stereo(lr, batch, (int)(sizeof(batch) / sizeof(batch[0])));
+    pw_ring_push_batch(batch, n);
 }
 
 
@@ -792,6 +809,7 @@ static void audio_close(void) {
     snd_pcm_drain(g_pcm);
     snd_pcm_close(g_pcm);
     g_pcm = NULL;
+    audio_src_close();
 }
 
 

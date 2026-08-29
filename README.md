@@ -15,7 +15,7 @@ Dispositivo soportado: **VID `0fd9` / PID `005e`**. No es el HD60 S+ ni el HD60 
 Un `./scripts/hd60s live` deja listo:
 
 - Vídeo **1080p60 YUYV** en `/dev/video42` (v4l2loopback), usable desde OBS, mpv o ffmpeg.
-- Audio **96 kHz mono** por loopback ALSA (`hw:10,0` → `hw:10,1`), publicado como fuente PipeWire-Pulse `hd60s_capture`.
+- Audio **48 kHz estéreo** (PCM HDMI nativo) por PipeWire nativo `hd60s_capture`. Alternativa: loopback ALSA (`hw:10,0` → `hw:10,1`).
 - **Passthrough HDMI** (HDMI OUT del HD60 S → TV) a la vez que la captura USB.
 - Reintento automático si se desconecta el USB (`scripts/run-hd60s-obs.sh`).
 

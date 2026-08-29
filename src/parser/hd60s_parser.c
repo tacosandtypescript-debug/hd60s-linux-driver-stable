@@ -589,16 +589,19 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
         memcpy(g_linebuf, g_dyn_buf, copy);
         if (copy < LINE_BYTES && g_have_prev_line)
             memcpy(g_linebuf + copy, g_prev_line + copy, LINE_BYTES - copy);
-        // In the live HD60 S stream the SEP record is immediately followed
-        // by the EOL_ACT marker: [SEP 4B][audio payload 8B][EOL_ACT 4B].
-        // The line-marker scorer intentionally prefers EOL_ACT, so recover
-        // the audio payload from the 12 bytes immediately preceding that
-        // marker instead of letting the video parser skip it.
-        if (tag == MK_EOL_ACT && q >= 12) {
+        // SEP va pegado al marcador de línea: [SEP 4B][PCM 8B][EOL_ACT|EOL_BLK].
+        // El scorer suele elegir el EOL, así que el audio de blanking (BLK,
+        // ~4 % del tiempo) se perdía y PipeWire rellenaba huecos → audio sucio.
+        if ((tag == MK_EOL_ACT || tag == MK_EOL_BLK) && q >= 12) {
             uint32_t sep_tag;
             memcpy(&sep_tag, g_dyn_buf + q - 12, 4);
-            if (sep_tag == MK_SEP || sep_tag == MK_SEP_BULK)
+            if (sep_tag == MK_SEP || sep_tag == MK_SEP_BULK) {
                 hd60s_audio_feed_sep(g_dyn_buf + q - 8);
+            } else if (q >= 16) {
+                memcpy(&sep_tag, g_dyn_buf + q - 16, 4);
+                if (sep_tag == MK_SEP || sep_tag == MK_SEP_BULK)
+                    hd60s_audio_feed_sep(g_dyn_buf + q - 12);
+            }
         }
         if (tag == MK_EOL_ACT || tag == MK_SEP || tag == MK_SEP_BULK) {
             if (g_diag) g_diag_act++;
