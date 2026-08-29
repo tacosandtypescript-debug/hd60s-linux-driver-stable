@@ -184,45 +184,68 @@ case "$CMD" in
 
   doctor)
     echo "== hd60s doctor =="
-    ok=0; ng=0
+    ok=0; warn=0; ng=0
     chk() {
         if eval "$2" >/dev/null 2>&1; then
-            printf "  [OK] %s\n" "$1"; ok=$((ok+1))
+            printf "  [OK]    %s\n" "$1"; ok=$((ok+1))
         else
-            printf "  [NG] %s\n     → %s\n" "$1" "$3"; ng=$((ng+1))
+            printf "  [FALLO] %s\n          → %s\n" "$1" "$3"; ng=$((ng+1))
         fi
     }
-    chk "iso_capture compilado"   "[ -x ./iso_capture ]"                     "cd $(pwd) && make"
-    chk "HD60 S conectado (USB 0fd9:005e)" "usb_device_present"                    "revisa el cable USB y la alimentación"
-    chk "v4l2loopback cargado"  "lsmod | grep -q v4l2loopback"              "sudo modprobe v4l2loopback video_nr=42 card_label=HD60S exclusive_caps=0"
+    avs() {
+        if eval "$2" >/dev/null 2>&1; then
+            printf "  [OK]    %s\n" "$1"; ok=$((ok+1))
+        else
+            printf "  [AVISO] %s\n          → %s\n" "$1" "$3"; warn=$((warn+1))
+        fi
+    }
+    chk "iso_capture compilado"   "[ -x ./iso_capture ]"                     "clona el repo y ejecuta ./install.sh  (o make)"
+    chk "v4l2loopback cargado"  "lsmod | grep -q v4l2loopback"              "sudo modprobe v4l2loopback video_nr=42 card_label=ElgatoHD60S exclusive_caps=1"
     chk "$VDEV existe"               "[ -e $VDEV ]"                              "carga v4l2loopback con video_nr=42"
-    chk "snd-aloop cargado"     "lsmod | grep -q snd_aloop"                 "sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1"
-    chk "comando v4l2loopback-ctl" "command -v v4l2loopback-ctl"              "sudo apt install -y v4l2loopback-utils"
-    chk "comando vlc"             "command -v vlc"                            "sudo apt install -y vlc"
-    chk "comando mpv"             "command -v mpv"                            "sudo apt install -y mpv"
-    chk "ffmpeg/ffplay"            "command -v ffplay"                         "sudo apt install -y ffmpeg"
-    chk "tmux"                     "command -v tmux"                           "sudo apt install -y tmux"
-    chk "obs"                      "command -v obs"                            "sudo apt install -y obs-studio"
+    chk "/dev/v4l/by-id existe"  "[ -d /dev/v4l/by-id ]"                    "sudo systemd-tmpfiles --create /etc/tmpfiles.d/hd60s.conf"
+    avs "symlink OBS by-id"      "[ -e /dev/v4l/by-id/elgato-hd60s-index0 ]" "sudo udevadm trigger --subsystem-match=video4linux"
+    avs "HD60 S conectado (USB 0fd9:005e)" "usb_device_present"                    "enchufa el HD60 S a USB 3.0 y dale alimentación"
+    avs "snd-aloop cargado"     "lsmod | grep -q snd_aloop"                 "sudo modprobe snd-aloop enable=1 index=10 id=hd60s pcm_substreams=1"
+    avs "grupo video"            "id -nG | tr ' ' '\\n' | grep -qx video"    "sudo usermod -aG video $USER  (luego cierra sesión)"
+    avs "comando hd60s en PATH"  "command -v hd60s"                          "./install.sh deja hd60s en /usr/local/bin"
+    avs "servicio hd60s activo"  "systemctl --user is-active --quiet hd60s"  "systemctl --user enable --now hd60s"
+    avs "obs"                      "command -v obs"                            "./install.sh --extras   o   sudo apt install -y obs-studio"
+    avs "tmux"                     "command -v tmux"                           "./install.sh --extras"
+    avs "mpv"                      "command -v mpv"                            "./install.sh --extras"
     echo
-    echo "resultado: OK=$ok / NG=$ng"
-    if [ "$ng" = 0 ]; then
-        echo "todo OK. Prueba 'hd60s live'"
-    else
-        echo "con 'hd60s install-deps' se instalan los que falten"
+    echo "resultado: OK=$ok  avisos=$warn  fallos=$ng"
+    if [ "$ng" != 0 ]; then
+        echo "con './install.sh' se instala lo que falta"
         exit 1
     fi
+    if [ "$warn" != 0 ]; then
+        echo "el driver está instalado; los avisos no bloquean OBS si el USB está enchufado."
+        exit 0
+    fi
+    echo "todo OK. En OBS: V4L2 → ElgatoHD60S  y  audio → hd60s_capture"
+    ;;
+
+  install)
+    INSTALLER="$SCRIPT_DIR/hd60s-install.sh"
+    [ -f "$INSTALLER" ] || die "no encuentro hd60s-install.sh. Clona el repo y ejecuta ./install.sh"
+    if [ ! -f "$ROOT/Makefile" ]; then
+        die "para instalar o actualizar hace falta el checkout. git clone … && ./install.sh"
+    fi
+    shift
+    exec bash "$INSTALLER" "$@"
+    ;;
+
+  uninstall)
+    UNINSTALLER="$SCRIPT_DIR/hd60s-uninstall.sh"
+    [ -f "$UNINSTALLER" ] || die "no encuentro hd60s-uninstall.sh"
+    exec bash "$UNINSTALLER"
     ;;
 
   install-deps)
-    say "instalando paquetes apt..."
-    need_sudo
-    PKGS=(build-essential pkg-config libusb-1.0-0-dev libasound2-dev
-          libpipewire-0.3-dev libsamplerate0-dev
-          v4l2loopback-dkms v4l2loopback-utils linux-headers-$(uname -r)
-          ffmpeg vlc mpv guvcview tmux obs-studio)
-    sudo apt update
-    sudo apt install -y "${PKGS[@]}"
-    say "listo. Comprueba con 'hd60s doctor'"
+    INSTALLER="$SCRIPT_DIR/hd60s-install.sh"
+    [ -f "$INSTALLER" ] || die "no encuentro hd60s-install.sh. Clona el repo y ejecuta ./install.sh"
+    say "instalando paquetes del sistema (incluye extras: OBS, mpv, tmux)..."
+    exec bash "$INSTALLER" --deps-only --extras
     ;;
 
   help|--help|-h|"")
@@ -251,8 +274,10 @@ Uso: hd60s <command> [argumentos]
 ── Mantenimiento ─────────────────────────────
   stop           para todos los iso_capture en marcha
   busy           procesos que tienen abierto $VDEV
-  doctor         diagnóstico (paquetes, módulos, dispositivo)
-  install-deps   instala los paquetes apt necesarios
+  doctor         diagnóstico (driver, módulos, USB, OBS)
+  install        instalador completo (desde el checkout: ./install.sh)
+  uninstall      quita udev, el servicio y /usr/local
+  install-deps   paquetes del sistema + extras (OBS, mpv, tmux)
   help           esta ayuda
 
 Dispositivos: vídeo=$VDEV / audio=$ADEV

@@ -46,6 +46,7 @@ install: all
 	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)"
 	install -d "$(DESTDIR)$(MODPROBEDIR)" "$(DESTDIR)$(MODULESLOADDIR)" "$(DESTDIR)$(UDEVRULEDIR)" "$(DESTDIR)$(TMPFILESDIR)"
 	install -m 0755 iso_capture scripts/hd60s scripts/hd60s-lib.sh scripts/run-hd60s-obs.sh "$(DESTDIR)$(LIBEXECDIR)/"
+	install -m 0755 scripts/hd60s-install.sh scripts/hd60s-uninstall.sh "$(DESTDIR)$(LIBEXECDIR)/"
 	install -m 0644 analysis/*.tsv "$(DESTDIR)$(LIBEXECDIR)/analysis/"
 	install -m 0644 "$(WIREPLUMBER_RULE)" "$(WIREPLUMBER_V4L2_RULE)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/"
 	install -m 0644 packaging/modprobe.d/*.conf "$(DESTDIR)$(MODPROBEDIR)/"
@@ -54,8 +55,13 @@ install: all
 	@sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' "$(SYSTEMD_USER_UNIT_TEMPLATE)" > "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s.service"
 	install -m 0644 $(UDEVRULE) "$(DESTDIR)$(UDEVRULEDIR)/$(notdir $(UDEVRULE))"
 	ln -sfn "$(LIBEXECDIR)/hd60s" "$(DESTDIR)$(PREFIX)/bin/hd60s"
+	@if test -z "$(DESTDIR)" && command -v systemd-tmpfiles >/dev/null 2>&1; then \
+		systemd-tmpfiles --create "$(TMPFILESDIR)/hd60s.conf" || true; \
+	fi
 	@if test -z "$(DESTDIR)" && command -v udevadm >/dev/null 2>&1; then \
-		udevadm control --reload-rules; udevadm trigger --subsystem-match=usb; \
+		udevadm control --reload-rules; \
+		udevadm trigger --subsystem-match=usb; \
+		udevadm trigger --subsystem-match=video4linux; \
 	fi
 
 uninstall:
