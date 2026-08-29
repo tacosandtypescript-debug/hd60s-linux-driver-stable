@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -94,7 +95,22 @@ int hd60s_v4l2_open(const char* devpath) {
 
 ssize_t hd60s_v4l2_write_frame(const uint8_t *frame, size_t n) {
     if (g_v4l_fd < 0) return -1;
-    return write(g_v4l_fd, frame, n);
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(g_v4l_fd, frame + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = g_v4l_fd, .events = POLLOUT };
+                if (poll(&pfd, 1, 20) <= 0) break;
+                continue;
+            }
+            return off ? (ssize_t)off : -1;
+        }
+        if (w == 0) break;
+        off += (size_t)w;
+    }
+    return (ssize_t)off;
 }
 
 void hd60s_v4l2_close(void) {

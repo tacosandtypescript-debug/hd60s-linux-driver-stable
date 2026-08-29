@@ -319,6 +319,54 @@ static void parser_reset(const char* why) {
     g_resyncs++;
 }
 
+static void emit_frame(void);
+
+static void pad_frame_black(int from_line) {
+    if (from_line < 0) from_line = 0;
+    if (from_line >= FRAME_H) return;
+    uint8_t *dst = g_framebuf + (size_t)from_line * LINE_BYTES;
+    size_t nbytes = (size_t)(FRAME_H - from_line) * LINE_BYTES;
+    /* YUYV negro de estudio: Y=16 U=128 V=128 */
+    for (size_t i = 0; i + 3 < nbytes; i += 4) {
+        dst[i] = 16;
+        dst[i + 1] = 128;
+        dst[i + 2] = 16;
+        dst[i + 3] = 128;
+    }
+}
+
+/* Cierra el frame activo. El blanking vertical (BLK) es el corte de verdad:
+ * si seguimos hasta 1080 ACT después de un VBLANK, copiamos el inicio del
+ * frame siguiente abajo — el vídeo se ve partido. */
+static void finish_active_frame(int from_vblank) {
+    int frame_lines = g_fline;
+    if (frame_lines <= 0)
+        return;
+    if (frame_lines < (FRAME_H * 3) / 4) {
+        if (g_diag)
+            fprintf(stderr, "[frame-drop] short ACT=%d via=%s\n",
+                    frame_lines, from_vblank ? "vblank" : "count");
+        if (g_diag) g_diag_discarded++;
+        g_fline = 0;
+        g_diag_frame_start_ns = 0;
+        if (!from_vblank) g_blk_run = 0;
+        return;
+    }
+    if (frame_lines < FRAME_H)
+        pad_frame_black(frame_lines);
+    if (g_diag)
+        fprintf(stderr, "[frame] emit #%llu ACT=%d pad=%d BLK=%d via=%s\n",
+                g_frames_out + 1, frame_lines,
+                FRAME_H - frame_lines, g_blk_run,
+                from_vblank ? "vblank" : "count");
+    if (g_diag) g_diag_complete++;
+    emit_frame();
+    g_recovery_pending = 0;
+    g_fline = 0;
+    g_blk_run = 0;
+    g_diag_frame_start_ns = 0;
+}
+
 static void emit_frame(void) {
     uint64_t emit_start_ns = now_mono_ns();
     if (g_diag && g_diag_frame_start_ns) {
@@ -614,36 +662,13 @@ static void dynamic_video_feed(const uint8_t *data, size_t len) {
             if (g_fline < FRAME_H)
                 memcpy(g_framebuf + (size_t)g_fline * LINE_BYTES, g_linebuf, LINE_BYTES);
             g_fline++;
-            if (g_fline >= FRAME_H) {
-                int frame_lines = g_fline;
-                int frame_blks = g_blk_run;
-                int structurally_valid = frame_blks == EXPECTED_FRAME_BLK;
-                if (structurally_valid) {
-                    if (g_diag)
-                        fprintf(stderr, "[frame] emit #%llu lines=%d BLK=%d %s\n",
-                                g_frames_out + 1, frame_lines, frame_blks,
-                                frame_blks == EXPECTED_FRAME_BLK ? "OK" : "ANOMALY");
-                    if (g_diag) g_diag_complete++;
-                    emit_frame();
-                    g_recovery_pending = 0;
-                } else {
-                    fprintf(stderr,
-                            "[frame-drop] complete lines=%d BLK=%d expected=%d reason=structural\n",
-                            frame_lines, frame_blks, EXPECTED_FRAME_BLK);
-                    if (g_diag) g_diag_discarded++;
-                    // A wrong BLK count means the vertical phase is not
-                    // trustworthy even when no packet error was reported.
-                    // Require the next complete 45-BLK group before output.
-                    g_recovery_pending = 1;
-                }
-                g_fline = 0;
-                g_blk_run = 0;
-                g_diag_frame_start_ns = 0;
-            }
+            if (g_fline >= FRAME_H)
+                finish_active_frame(0);
         } else if (tag == MK_EOL_BLK) {
-            // BLK is retained as a structural diagnostic.  It is not the
-            // frame delimiter: the 005e stream normally has about 29 BLK
-            // markers around each group of 1080 video-line events.
+            /* Primer BLK tras vídeo = fin de frame. Seguir contando ACT
+             * después de VBLANK pega arriba del siguiente frame abajo. */
+            if (g_fline > 0)
+                finish_active_frame(1);
             g_blk_run++;
             if (g_diag) g_diag_blk++;
         }
