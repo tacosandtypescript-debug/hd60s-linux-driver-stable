@@ -57,6 +57,9 @@ ensure_hd60s_device() {
 set_caps() {
     # iso_capture hace VIDIOC_S_FMT; esto solo adelanta el formato si el ctl lo acepta.
     v4l2loopback-ctl set-caps "video/x-raw,format=YUY2,width=1920,height=1080,framerate=60/1" "$VDEV" >/dev/null 2>&1 || true
+    # exclusive_caps: OBS lee G_PARM del lado CAPTURE, que por defecto es 30 fps.
+    # Sin esto linux-v4l2.so abre ElgatoHD60S a 30 aunque iso_capture escriba 60.
+    v4l2-ctl -d "$VDEV" --set-parm=60 >/dev/null 2>&1 || true
 }
 
 kill_capture() {

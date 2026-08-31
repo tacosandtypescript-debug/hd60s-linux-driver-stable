@@ -130,6 +130,17 @@ while :; do
     ./iso_capture 0 2 1 &
   child_pid=$!
   link_hd60s_play &
+  # Anunciar 60 fps en el lado CAPTURE para que OBS no negocie 30.
+  (
+    i=0
+    while [ "$i" -lt 20 ]; do
+      if v4l2-ctl -d /dev/video42 --set-parm=60 >/dev/null 2>&1; then
+        break
+      fi
+      i=$((i + 1))
+      sleep 0.5
+    done
+  ) &
   wait "$child_pid"
   rc=$?
   child_pid=0
