@@ -234,6 +234,12 @@ case "$CMD" in
     exec bash "$INSTALLER" "$@"
     ;;
 
+  open-obs)
+    SETUP="$SCRIPT_DIR/hd60s-obs-setup.sh"
+    [ -f "$SETUP" ] || die "no encuentro hd60s-obs-setup.sh"
+    exec bash "$SETUP"
+    ;;
+
   uninstall)
     UNINSTALLER="$SCRIPT_DIR/hd60s-uninstall.sh"
     [ -f "$UNINSTALLER" ] || die "no encuentro hd60s-uninstall.sh"
@@ -255,6 +261,7 @@ Uso diario (tras ./install.sh):
   enchufa USB 3.0 y abre OBS → V4L2 ElgatoHD60S + audio hd60s_capture
 
   doctor         diagnóstico (módulos, USB, servicio)
+  open-obs       perfil 1080p60 + fuentes HD60 S y abre OBS
   stop           para el servicio o iso_capture
   help           esta ayuda
 

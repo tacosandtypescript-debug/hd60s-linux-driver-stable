@@ -10,22 +10,24 @@ Solo el modelo **VID `0fd9` / PID `005e`**. No vale para HD60 S+ ni HD60 X.
 
 *Captura actual en OBS: Fortnite por **Dispositivo de captura de video (V4L2)** y audio **Elgato HD60 S**, 60 fps.*
 
-## Instalación
+## Instalación (un comando)
 
-Hace falta el HD60 S, un puerto **USB 3.0** y **PipeWire**. Probado en Linux Mint / Ubuntu; también instala paquetes en Fedora y Arch.
+Hace falta el HD60 S, un puerto **USB 3.0** y **PipeWire**. Instala el driver, deja OBS en 1080p60 con las fuentes de la capturadora y abre OBS.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/tacosandtypescript-debug/hd60s-linux-driver-stable/main/get.sh)
+```
+
+Usa `bash <(curl …)` (no `curl | bash`) para que sudo pueda pedir la contraseña.
+
+Pide sudo. Instala dependencias, compila, configura udev / v4l2loopback / WirePlumber, activa el servicio `hd60s`, crea el perfil OBS **HD60S** y lo abre.
+
+Checkout a mano:
 
 ```bash
 git clone https://github.com/tacosandtypescript-debug/hd60s-linux-driver-stable.git
 cd hd60s-linux-driver-stable
-./install.sh
-```
-
-Pide sudo. Instala dependencias, compila, configura udev / v4l2loopback / WirePlumber y activa el servicio de usuario `hd60s`.
-
-Si también quieres OBS, mpv y tmux:
-
-```bash
-./install.sh --extras
+./install.sh --extras --open-obs
 ```
 
 Quitar:
@@ -48,6 +50,7 @@ La captura arranca al iniciar sesión y al enchufar el USB.
 
 ```text
 hd60s doctor     comprueba módulos, USB, /dev/video42 y el servicio
+hd60s open-obs   perfil 1080p60 + fuentes y abre OBS
 hd60s stop       para la captura
 hd60s help       resto de comandos
 ```

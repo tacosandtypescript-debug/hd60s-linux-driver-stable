@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Instala el driver userspace de la Elgato HD60 S (0fd9:005e).
-# Uso: ./install.sh [--extras] [--deps-only] [--no-service]
+# Uso: ./install.sh [--extras] [--deps-only] [--no-service] [--open-obs]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -14,6 +14,7 @@ PREFIX="${PREFIX:-/usr/local}"
 EXTRAS=0
 DEPS_ONLY=0
 NO_SERVICE=0
+OPEN_OBS=0
 
 say()  { echo "[hd60s] $*"; }
 err()  { echo "[hd60s ERR] $*" >&2; }
@@ -26,6 +27,7 @@ Instalador del driver Linux de la Elgato HD60 S.
 Uso: ./install.sh [opciones]
 
   --extras      instala también OBS, mpv, VLC, tmux y ffmpeg
+  --open-obs    configura OBS a 1080p60 (ElgatoHD60S + audio) y lo abre
   --deps-only   solo paquetes del sistema (no compila ni instala el driver)
   --no-service  no activa el servicio systemd de usuario
   -h, --help    esta ayuda
@@ -39,6 +41,7 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --extras) EXTRAS=1 ;;
+    --open-obs) OPEN_OBS=1; EXTRAS=1 ;;
     --deps-only) DEPS_ONLY=1 ;;
     --no-service) NO_SERVICE=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -332,6 +335,20 @@ say "instalando a $PREFIX (udev, v4l2loopback, systemd, WirePlumber)..."
 as_root make -C "$ROOT" PREFIX="$PREFIX" install
 ensure_modules
 enable_service
+
+setup_obs() {
+  [ "$OPEN_OBS" -eq 1 ] || return 0
+  local setup="$ROOT/scripts/hd60s-obs-setup.sh"
+  [ -x "$setup" ] || setup="$PREFIX/libexec/hd60s/hd60s-obs-setup.sh"
+  if [ ! -f "$setup" ]; then
+    say "aviso: no encuentro hd60s-obs-setup.sh"
+    return 0
+  fi
+  say "configurando OBS (1080p60) y abriéndolo..."
+  as_user bash "$setup" || say "aviso: no pude configurar OBS"
+}
+
+setup_obs
 print_done
 if [ -x "$ROOT/scripts/hd60s" ]; then
   as_user "$ROOT/scripts/hd60s" doctor || true
