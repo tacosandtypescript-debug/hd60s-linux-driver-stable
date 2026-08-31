@@ -64,6 +64,10 @@ hd60s help       resto de comandos
 
 Tras **reiniciar el PC**, el servicio `hd60s` arranca solo. OBS a veces se abre antes de que el USB termine el init (~20–40 s) y se queda en negro: el autostart **Elgato HD60 S (OBS)** espera a 1920×1080 @ 60 y vuelve a abrir OBS. También: `hd60s open-obs`.
 
+**Cerrar y abrir OBS:** el loopback se queda en 1080p60 (`keep_format`) y, si no hay capturadora, un hold escribe negro para que OBS no abra `/dev/video42` como OUTPUT. Al reabrir, V4L2 debe seguir siendo **ElgatoHD60S** 1920×1080 @ 60.
+
+**Apagar/prender o desconectar USB:** el supervisor espera el `0fd9:005e` y relanza `iso_capture` (unos 20–40 s de init). Enchufa otra vez en USB 3.0. Si OBS se queda negro: `hd60s open-obs`.
+
 Si el instalador te acaba de meter en el grupo `video`, cierra sesión y vuelve a entrar.
 
 ## Qué deja instalado
