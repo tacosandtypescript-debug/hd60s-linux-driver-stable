@@ -62,6 +62,8 @@ hd60s stop       para la captura
 hd60s help       resto de comandos
 ```
 
+Tras **reiniciar el PC**, el servicio `hd60s` arranca solo. OBS a veces se abre antes de que el USB termine el init (~20–40 s) y se queda en negro: el autostart **Elgato HD60 S (OBS)** espera a 1920×1080 @ 60 y vuelve a abrir OBS. También: `hd60s open-obs`.
+
 Si el instalador te acaba de meter en el grupo `video`, cierra sesión y vuelve a entrar.
 
 ## Qué deja instalado

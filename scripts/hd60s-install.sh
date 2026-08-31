@@ -277,12 +277,15 @@ enable_service() {
   else
     as_user systemctl --user enable hd60s
   fi
+  as_user systemctl --user enable hd60s-obs 2>/dev/null || \
+    as_user systemctl --user enable "$PREFIX/share/systemd/user/hd60s-obs.service" 2>/dev/null || true
   if as_user systemctl --user is-active --quiet hd60s 2>/dev/null; then
     say "servicio hd60s ya estaba en marcha (no lo reinicio)"
   else
     as_user systemctl --user start hd60s
     say "servicio de usuario hd60s arrancado"
   fi
+  as_user systemctl --user start hd60s-obs 2>/dev/null || true
   if [ "${NEED_WP_RESTART:-0}" -eq 1 ]; then
     say "reiniciando WirePlumber para que no se quede con /dev/video42"
     as_user systemctl --user try-restart wireplumber.service 2>/dev/null || true

@@ -1,0 +1,14 @@
+[Unit]
+Description=OBS con Elgato HD60 S (espera 1080p60 y abre)
+After=graphical-session.target hd60s.service
+Wants=hd60s.service
+
+[Service]
+Type=oneshot
+ExecStart=@LIBEXECDIR@/hd60s-obs-setup.sh
+RemainAfterExit=yes
+TimeoutStartSec=180
+Environment=HD60S_WAIT_SEC=120
+
+[Install]
+WantedBy=default.target

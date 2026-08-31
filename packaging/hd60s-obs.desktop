@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Elgato HD60 S (OBS)
+Comment=Espera a que la capturadora dé 1080p60 y abre OBS
+Exec=/usr/local/libexec/hd60s/hd60s-obs-setup.sh
+Icon=com.obsproject.Studio
+Terminal=false
+Categories=AudioVideo;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=8
+StartupNotify=false

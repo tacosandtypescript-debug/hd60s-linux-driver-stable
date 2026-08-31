@@ -3,11 +3,13 @@
 set -euo pipefail
 
 LAUNCH=1
+WAIT=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-launch) LAUNCH=0 ;;
+    --no-wait) WAIT=0 ;;
     -h|--help)
-      echo "Uso: hd60s-obs-setup.sh [--no-launch]"
+      echo "Uso: hd60s-obs-setup.sh [--no-launch] [--no-wait]"
       exit 0
       ;;
     *) echo "[hd60s ERR] opción desconocida: $1" >&2; exit 1 ;;
@@ -16,6 +18,18 @@ while [ $# -gt 0 ]; do
 done
 
 say() { echo "[hd60s] $*"; }
+
+# Un solo arranque a la vez (systemd + autostart del escritorio).
+exec 9>"/tmp/hd60s-obs-setup.lock"
+if ! flock -n 9; then
+  say "otro hd60s-obs-setup ya está en marcha"
+  exit 0
+fi
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "$WAIT" -eq 1 ] && [ -x "$SCRIPT_DIR/hd60s-wait-ready.sh" ]; then
+  "$SCRIPT_DIR/hd60s-wait-ready.sh" || say "aviso: abro OBS aunque el loopback aún no marque 1080p60"
+fi
 
 OBS_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio"
 SCENE_DIR="$OBS_HOME/basic/scenes"

@@ -44,7 +44,7 @@ as_user() {
 
 say "parando el servicio de usuario..."
 if [ -S "/run/user/$REAL_UID/bus" ]; then
-  as_user systemctl --user disable --now hd60s 2>/dev/null || true
+  as_user systemctl --user disable --now hd60s hd60s-obs 2>/dev/null || true
   as_user systemctl --user daemon-reload 2>/dev/null || true
 fi
 
