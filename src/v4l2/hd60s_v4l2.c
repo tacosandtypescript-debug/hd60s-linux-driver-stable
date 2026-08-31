@@ -80,6 +80,20 @@ int hd60s_v4l2_open(const char* devpath) {
     sp.parm.output.timeperframe.denominator = 60;
     if (ioctl(fd, VIDIOC_S_PARM, &sp) < 0) fprintf(stderr, "[v4l2] S_PARM fps60 falló (sigo)\n");
 
+    /* keep_format + sustain: al cerrar OBS el loopback no vuelve a 640x480
+     * OUTPUT-only (exclusive_caps), que hace fallar el plugin V4L2 al reabrir. */
+    {
+        struct v4l2_control c;
+        memset(&c, 0, sizeof(c));
+        c.id = 0x0098f900; /* keep_format */
+        c.value = 1;
+        if (ioctl(fd, VIDIOC_S_CTRL, &c) < 0)
+            fprintf(stderr, "[v4l2] keep_format=1: %s (sigo)\n", strerror(errno));
+        c.id = 0x0098f901; /* sustain_framerate */
+        c.value = 1;
+        ioctl(fd, VIDIOC_S_CTRL, &c);
+    }
+
     // OBS usa mmap/CAPTURE: con exclusive_caps=1 hace falta STREAMON en OUTPUT
     // para que el consumidor reciba frames. El fd es O_NONBLOCK.
     {

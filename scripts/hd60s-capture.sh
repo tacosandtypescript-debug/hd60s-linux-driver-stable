@@ -24,6 +24,34 @@ usb_device_present() {
 
 device_state=unknown
 child_pid=0
+hold_pid=0
+
+start_hold() {
+  if [ "$hold_pid" -gt 0 ] 2>/dev/null && kill -0 "$hold_pid" 2>/dev/null; then
+    return 0
+  fi
+  if pgrep -x iso_capture >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -x "$SCRIPT_DIR/hd60s-hold-loopback.sh" ]; then
+    sh "$SCRIPT_DIR/hd60s-hold-loopback.sh" &
+    hold_pid=$!
+    echo "[hd60s] sujetando /dev/video42 (negro 1080p60) para OBS"
+  elif [ -x "$DIR/hd60s-hold-loopback.sh" ]; then
+    sh "$DIR/hd60s-hold-loopback.sh" &
+    hold_pid=$!
+    echo "[hd60s] sujetando /dev/video42 (negro 1080p60) para OBS"
+  fi
+}
+
+stop_hold() {
+  if [ "$hold_pid" -gt 0 ] 2>/dev/null; then
+    kill -TERM "$hold_pid" 2>/dev/null || true
+    wait "$hold_pid" 2>/dev/null || true
+    hold_pid=0
+  fi
+  pkill -f 'ffmpeg.*video42' 2>/dev/null || true
+}
 
 link_hd60s_play() {
   command -v pw-link >/dev/null 2>&1 || return 0
@@ -93,6 +121,7 @@ stop_supervisor() {
     kill -TERM "$child_pid" 2>/dev/null || true
     wait "$child_pid" 2>/dev/null || true
   fi
+  stop_hold
   exit 0
 }
 
@@ -104,6 +133,7 @@ while :; do
       echo "[hd60s] HD60 S no enumerada; esperando reconexión USB"
       device_state=absent
     fi
+    start_hold
     sleep 2
     continue
   fi
@@ -113,6 +143,8 @@ while :; do
   fi
   echo "[hd60s] iniciando captura; se reintentará automáticamente tras una desconexión"
   ensure_hd60s_audio_source
+  stop_hold
+  sleep 0.2
   set +e
   # snd-aloop is a persistent OBS-facing source across iso_capture restarts.
   env \
