@@ -1,6 +1,8 @@
 # ---------- helpers ----------
 # Binario instalado por "sudo make install" (root:root 0755). Ruta fija: los comandos con sudo nunca ejecutan ./iso_capture del directorio actual.
 HD60S_ISO_BIN=/usr/local/libexec/hd60s/iso_capture
+# Salidas de captura (creada por install.sh, propiedad del usuario).
+HD60S_CAPTURE_DIR=/usr/local/libexec/hd60s/captures
 say()  { echo "[hd60s] $*"; }
 err()  { echo "[hd60s ERR] $*" >&2; }
 die()  { err "$*"; exit 1; }

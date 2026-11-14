@@ -227,7 +227,7 @@ static void cleanup_iso_transfers(libusb_device_handle* h,
 void hd60s_usb_open_dump(void) {
     Hd60sUsbSession *s = usb_session_get();
     if (!s) return;
-    s->outf = fopen("captures/stream-iso.bin", "wb");
+    s->outf = fopen(HD60S_CAPTURE_DIR "/stream-iso.bin", "wb");
     if (!s->outf) fprintf(stderr, "生ストリーム出力ファイル開けず(続行)\n");
 }
 

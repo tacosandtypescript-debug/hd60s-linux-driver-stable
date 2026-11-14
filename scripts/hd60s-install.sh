@@ -336,6 +336,8 @@ say "compilando iso_capture..."
 as_user make -C "$ROOT" -j"$(nproc 2>/dev/null || echo 1)" all
 say "instalando a $PREFIX (udev, v4l2loopback, systemd, WirePlumber)..."
 as_root make -C "$ROOT" PREFIX="$PREFIX" install
+# Capturas: el servicio (usuario) escribe aquí; el resto de libexec queda root-owned.
+as_root install -d -m 0755 -o "$REAL_USER" -g "$REAL_USER" "$PREFIX/libexec/hd60s/captures" "$PREFIX/libexec/hd60s/captures/proof"
 ensure_modules
 enable_service
 

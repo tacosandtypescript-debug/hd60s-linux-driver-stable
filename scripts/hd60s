@@ -120,9 +120,9 @@ case "$CMD" in
     say "prueba de audio ${SEC}s..."
     sudo "$HD60S_ISO_BIN" "$SEC" 2 5
     say "extrayendo SEP de stream-iso.bin..."
-    ./audio_extract captures/stream-iso.bin captures/sep.raw
-    ffmpeg -f s16le -ar 48000 -ac 2 -i captures/sep.raw -y captures/sep.wav 2>&1 | tail -3
-    say "listo captures/sep.wav. Comprueba con 'aplay captures/sep.wav'"
+    ./audio_extract "$HD60S_CAPTURE_DIR/stream-iso.bin" "$HD60S_CAPTURE_DIR/sep.raw"
+    ffmpeg -f s16le -ar 48000 -ac 2 -i "$HD60S_CAPTURE_DIR/sep.raw" -y "$HD60S_CAPTURE_DIR/sep.wav" 2>&1 | tail -3
+    say "listo $HD60S_CAPTURE_DIR/sep.wav. Comprueba con 'aplay $HD60S_CAPTURE_DIR/sep.wav'"
     ;;
 
   pt)

@@ -2,7 +2,7 @@
 // node-usb no soporta iso, así que está en C. Misma ruta iso que Windows: chupa vídeo (YUYV crudo) de EP0x83.
 //
 // build: gcc -O2 -Isrc src/iso_capture.c src/hd60s_util.c src/hd60s_v4l2.c src/hd60s_audio.c src/hd60s_replay.c src/hd60s_pace.c src/hd60s_parser.c src/hd60s_usb.c -o iso_capture $(pkg-config --libs --cflags libusb-1.0)
-// run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (el vídeo va a captures/stream-iso.bin)
+// run  : sudo ./iso_capture [readSec=6] [alt=2] > /dev/null  (el vídeo va a HD60S_CAPTURE_DIR/stream-iso.bin)
 //
 // ======================================================================
 // TODO (trabajo pendiente):
@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
     // log de observación de diffs: el 5º arg es etiqueta; todos los IN van a captures/reads-<label>.tsv
     const char* label = argc > 4 ? argv[4] : NULL;
     if (label) {
-        char lp[256]; snprintf(lp, sizeof(lp), "captures/reads-%s.tsv", label);
+        char lp[256]; snprintf(lp, sizeof(lp), HD60S_CAPTURE_DIR "/reads-%s.tsv", label);
         g_rdlog = fopen(lp, "w");
         if (g_rdlog) { fprintf(g_rdlog, "idx\twValue\tsetupOUT\tresponse\n"); fprintf(stderr, "[main] 読みログ: %s\n", lp); }
     }
@@ -568,7 +568,7 @@ int main(int argc, char** argv) {
         int ka_loop = (env_ka && env_ka[0] && env_ka[0] != '0');
         if (ka_loop && g_nka < 0) {
             // primera vez: TSV load (querría otra función, pero load_burst pisa g_burst → inline)
-            FILE* fka = fopen("analysis/keepalive-cycle-v2.tsv", "r");
+            FILE* fka = fopen(HD60S_LIBEXEC_DIR "/analysis/keepalive-cycle-v2.tsv", "r");
             if (!fka) { fprintf(stderr, "[ka] keepalive-cycle-v2.tsv 開けず、KA無効化\n"); g_nka = 0; ka_loop = 0; }
             else {
                 char line[8192]; int first = 1; g_nka = 0;

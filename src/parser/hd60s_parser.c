@@ -424,7 +424,7 @@ static void emit_frame(void) {
     if (hd60s_env_present("HD60S_DEBUG_DUMP") &&
         (g_frames_out == 1 || g_frames_out == 60 || g_frames_out == 300 || g_frames_out == 600)) {
         char path[256];
-        snprintf(path, sizeof(path), "captures/proof/live_frame_%llu.yuv", g_frames_out);
+        snprintf(path, sizeof(path), HD60S_CAPTURE_DIR "/proof/live_frame_%llu.yuv", g_frames_out);
         FILE* fp = fopen(path, "wb");
         if (fp) { fwrite(g_framebuf, 1, FRAME_BYTES, fp); fclose(fp);
                   fprintf(stderr, "[dump] %s\n", path); }

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <signal.h>
 
+/* Rutas absolutas instaladas por make install; el servicio corre con WorkingDirectory en LIBEXEC. */
+#define HD60S_LIBEXEC_DIR "/usr/local/libexec/hd60s"
+#define HD60S_CAPTURE_DIR HD60S_LIBEXEC_DIR "/captures"
+
 double now_s(void);
 uint64_t now_mono_ns(void);
 double now_monotonic_s(void);
