@@ -106,6 +106,8 @@ hd60s open-obs
 
 `live` / `obs` / `start` son de laboratorio y pueden chocar con el servicio. Para el día a día basta `get.sh` o `hd60s open-obs`.
 
+Algunos comandos de laboratorio (`hd60s` con `sudo -E`) pasan al proceso root las variables `HD60S_*` de tu entorno. Úsalos solo en tu equipo y no los metas en scripts con privilegios.
+
 ## Limitaciones
 
 - 1080p60 YUYV sin comprimir (~2 Gbps): `iso_capture` y OBS usan CPU de verdad.
