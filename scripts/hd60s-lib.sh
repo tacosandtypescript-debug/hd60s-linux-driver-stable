@@ -1,4 +1,6 @@
 # ---------- helpers ----------
+# Binario instalado por "sudo make install" (root:root 0755). Ruta fija: los comandos con sudo nunca ejecutan ./iso_capture del directorio actual.
+HD60S_ISO_BIN=/usr/local/libexec/hd60s/iso_capture
 say()  { echo "[hd60s] $*"; }
 err()  { echo "[hd60s ERR] $*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -17,7 +19,8 @@ need_sudo() {
 }
 
 ensure_iso_capture() {
-    [ -x ./iso_capture ] || die "./iso_capture no está compilado. Ejecuta 'make'"
+    [ -x "$HD60S_ISO_BIN" ] || die "$HD60S_ISO_BIN no está instalado. Ejecuta 'make && sudo make install'"
+    [ "$(stat -c %u "$HD60S_ISO_BIN")" = 0 ] || die "$HD60S_ISO_BIN debe ser de root. Reinstala con 'sudo make install'"
 }
 
 ensure_snd_aloop() {

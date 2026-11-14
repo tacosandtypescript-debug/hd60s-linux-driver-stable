@@ -10,6 +10,8 @@ elif [ -x "$SCRIPT_DIR/../iso_capture" ]; then
 else
   DIR="$SCRIPT_DIR"
 fi
+# Ruta fija instalada por make install (ver hd60s-lib.sh).
+HD60S_ISO_BIN=/usr/local/libexec/hd60s/iso_capture
 cd "$DIR"
 
 # HD60 S 0fd9:005e → libusb → v4l2loopback (/dev/video42).
@@ -159,7 +161,7 @@ while :; do
     HD60S_CADENCE_DIAG="${HD60S_CADENCE_DIAG:-0}" \
     HD60S_PACE_OUTPUT=1 \
     HD60S_VERBOSE=0 \
-    ./iso_capture 0 2 1 &
+    "$HD60S_ISO_BIN" 0 2 1 &
   child_pid=$!
   link_hd60s_play &
   # Anunciar 60 fps en el lado CAPTURE para que OBS no negocie 30.
