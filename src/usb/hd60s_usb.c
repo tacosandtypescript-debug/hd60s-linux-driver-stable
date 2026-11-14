@@ -284,18 +284,18 @@ int hd60s_usb_start_iso(libusb_device_handle *h, int pkt_size, int n_pkts) {
             if (s->inflight > s->max_inflight) s->max_inflight = s->inflight;
         } else {
             s->submit_fail++;
-            fprintf(stderr, "submit%d failed rc=%d (%s)\\n", i, submit_rc, libusb_error_name(submit_rc));
+            fprintf(stderr, "submit%d failed rc=%d (%s)\n", i, submit_rc, libusb_error_name(submit_rc));
         }
     }
     fprintf(stderr, "[main] iso転送 %d 本投入\n", s->inflight);
 
-    fprintf(stderr, "[iso] submit summary ok=%lu fail=%lu max_inflight=%d current=%d\\n",
+    fprintf(stderr, "[iso] submit summary ok=%lu fail=%lu max_inflight=%d current=%d\n",
             s->submit_ok, s->submit_fail, s->max_inflight, s->inflight);
     if (s->inflight == 0 || s->usb_session_fatal) {
         s->usb_session_fatal = 1;
         if (!s->usb_session_error) s->usb_session_error = LIBUSB_ERROR_OTHER;
         s->keep_running = 0;
-        fprintf(stderr, "[iso] no active transfers or allocation failure; ending USB session before capture\\n");
+        fprintf(stderr, "[iso] no active transfers or allocation failure; ending USB session before capture\n");
         return -1;
     }
     return 0;
@@ -311,7 +311,7 @@ int hd60s_usb_handle_events(struct timeval *tv) {
             s->usb_session_error = event_rc;
             s->keep_running = 0;
         }
-        fprintf(stderr, "[iso] event handling failed rc=%d (%s)\\n",
+        fprintf(stderr, "[iso] event handling failed rc=%d (%s)\n",
                 event_rc, libusb_error_name(event_rc));
     }
     return event_rc;
