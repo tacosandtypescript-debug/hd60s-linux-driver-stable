@@ -70,9 +70,13 @@ kill_capture() {
         systemctl --user stop hd60s || true
         return
     fi
-    sudo pkill -TERM -x iso_capture 2>/dev/null || true
-    sleep 1
-    sudo pkill -9 -x iso_capture 2>/dev/null || true
+    # Huérfano lanzado fuera del servicio: solo el binario instalado, por ruta completa (nunca por nombre).
+    local pat="^$HD60S_ISO_BIN( |\$)"
+    if pgrep -f -- "$pat" >/dev/null 2>&1; then
+        sudo pkill -TERM -f -- "$pat" 2>/dev/null || true
+        sleep 1
+        sudo pkill -9 -f -- "$pat" 2>/dev/null || true
+    fi
 }
 
 # preparación de runtime de una vez

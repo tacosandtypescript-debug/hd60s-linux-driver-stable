@@ -48,9 +48,9 @@ if [ -S "/run/user/$REAL_UID/bus" ]; then
   as_user systemctl --user daemon-reload 2>/dev/null || true
 fi
 
-as_root pkill -TERM -x iso_capture 2>/dev/null || true
+as_root pkill -TERM -f -- "^$PREFIX/libexec/hd60s/iso_capture( |\$)" 2>/dev/null || true
 sleep 1
-as_root pkill -9 -x iso_capture 2>/dev/null || true
+as_root pkill -9 -f -- "^$PREFIX/libexec/hd60s/iso_capture( |\$)" 2>/dev/null || true
 
 if [ -n "$ROOT" ] && [ -f "$ROOT/Makefile" ]; then
   say "sudo make uninstall (prefijo $PREFIX)..."
