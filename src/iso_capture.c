@@ -44,6 +44,13 @@
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
+
+/* Errores de control USB no comprobados antes; se cuentan como bfail en las estadísticas. */
+static unsigned long g_ctl_errors = 0;
+#define CTL_CHECK(expr) do { int _ctl_rc = (expr); \
+    if (_ctl_rc < 0) { g_ctl_errors++; \
+        fprintf(stderr, "[ctl] %s:%d rc=%d (%s)\n", __FILE__, __LINE__, _ctl_rc, libusb_error_name(_ctl_rc)); } \
+} while (0)
 #include "hd60s_util.h"
 #include "hd60s_v4l2.h"
 #include "hd60s_audio.h"
@@ -257,8 +264,8 @@ int main(int argc, char** argv) {
             unsigned char o[3], in[1]; int v[2];
             for (int p = 0; p < 2; p++) {
                 o[0]=0x9d; o[1]=0x01; o[2]= p ? regs[k].lo : regs[k].hi;
-                libusb_control_transfer(h, 0x40, 192, 0x5066, 0, o, 3, 500);
-                in[0]=0; libusb_control_transfer(h, 0xc0, 192, 0x5066, 0, in, 1, 500);
+                CTL_CHECK(libusb_control_transfer(h, 0x40, 192, 0x5066, 0, o, 3, 500));
+                in[0]=0; CTL_CHECK(libusb_control_transfer(h, 0xc0, 192, 0x5066, 0, in, 1, 500));
                 v[p]=in[0];
             }
             fprintf(stderr, "[res] %s = %d (0x%02x%02x)\n", regs[k].name, (v[0]<<8)|v[1], v[0], v[1]);
@@ -287,16 +294,16 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[pt-pre-iso] enable trio 1st fire (pre-alt=2)...\n");
         // (0) aa 12 34 90 05 00
         unsigned char t0[6] = {0xaa, 0x12, 0x34, 0x90, 0x05, 0x00};
-        libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, t0, 6, 1000);
+        CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, t0, 6, 1000));
         // (1) aa 12 34 90 03 00
         unsigned char t1[6] = {0xaa, 0x12, 0x34, 0x90, 0x03, 0x00};
-        libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, t1, 6, 1000);
+        CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, t1, 6, 1000));
         // (2) d4 00 04 03 (CPLD routing enable)
         unsigned char t2[4] = {0xd4, 0x00, 0x04, 0x03};
-        libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, t2, 4, 1000);
+        CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, t2, 4, 1000));
         // (3) 5098 data=[0x20, 0x05] LE (también visto en Windows)
         unsigned char t3[2] = {0x20, 0x05};
-        libusb_control_transfer(h, 0x40, 0xC0, 0x5098, 0, t3, 2, 1000);
+        CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5098, 0, t3, 2, 1000));
         usleep(50000);  // 50ms sleep before alt=2 (Windows-observed)
     }
 
@@ -429,7 +436,7 @@ int main(int argc, char** argv) {
         for (int r = 0; r < 16; r++) {
             unsigned char setup[3] = {0x9b, 0x01, (unsigned char)r};
             unsigned char resp[1] = {0};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, setup, 3, 500);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, setup, 3, 500));
             int rr = libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, resp, 1, 500);
             regs[r] = (rr > 0) ? resp[0] : 0xff;
             usleep(1000);
@@ -513,7 +520,7 @@ int main(int argc, char** argv) {
         for (int r = 0; r < 16; r++) {
             unsigned char setup[3] = {0x9b, 0x01, (unsigned char)r};
             unsigned char resp[1] = {0};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, setup, 3, 500);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, setup, 3, 500));
             int rr = libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, resp, 1, 500);
             regs[r] = (rr > 0) ? resp[0] : 0xff;
             usleep(1000);
@@ -599,6 +606,7 @@ int main(int argc, char** argv) {
                 if (c->is_out) r = libusb_control_transfer(h, c->brt, c->br, c->wv, c->wi, c->data, c->dlen, 100);
                 else r = libusb_control_transfer(h, c->brt, c->br, c->wv, c->wi, inbuf, c->wl, 100);
                 if (r >= 0) ka_ok++;
+                else g_ctl_errors++;
             }
             last_ka_fire = el;
             ka_fires++;
@@ -628,7 +636,7 @@ int main(int argc, char** argv) {
             (last_it6802_rec == 0.0 || (el - last_it6802_rec) >= rec_interval)) {
             #define IT6802W(reg, val) do { \
                 unsigned char _w[3] = {0x94, (reg), (val)}; \
-                libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _w, 3, 100); \
+                CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _w, 3, 100)); \
             } while (0)
             // 1) Maintain verified bank 0x94 audio config (0x0e=0x8b, 0x0f=0x8b, 0x10=0x05, 0x11=0x05)
             IT6802W(0x0e, 0x8b);
@@ -666,19 +674,19 @@ int main(int argc, char** argv) {
             // dispara enable trio + keepalive pair cada vez
             // aa 12 34 90 05 00
             unsigned char w0a[6] = {0xaa, 0x12, 0x34, 0x90, 0x05, 0x00};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w0a, 6, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w0a, 6, 100));
             // aa 12 34 90 03 00
             unsigned char w0b[6] = {0xaa, 0x12, 0x34, 0x90, 0x03, 0x00};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w0b, 6, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w0b, 6, 100));
             // d4 00 04 03 (CPLD routing)
             unsigned char w0c[4] = {0xd4, 0x00, 0x04, 0x03};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w0c, 4, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w0c, 4, 100));
             // d4 00 2a 6e
             unsigned char w1[4] = {0xd4, 0x00, 0x2a, 0x6e};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w1, 4, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w1, 4, 100));
             // d4 00 01 02
             unsigned char w2[4] = {0xd4, 0x00, 0x01, 0x02};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w2, 4, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w2, 4, 100));
             last_pt_ka = el;
             pt_ka_fires++;
             if (pt_ka_fires <= 3) fprintf(stderr, "[pt-keepalive] fire #%d at t=%.0fms (full trio+keepalive)\n", pt_ka_fires, el*1000);
@@ -698,8 +706,8 @@ int main(int argc, char** argv) {
                 0x11, 0x82, 0xff, 0x00, 0x12, 0x82, 0xff, 0x00, 0x11, 0x82, 0xff, 0x00,
                 0x12, 0x82, 0xff, 0x00, 0x0e, 0x40, 0xd0, 0x9a, 0x0e, 0x40, 0x80, 0x9a
             };
-            libusb_control_transfer(h, 0x40, 0xC6, 0x0000, 0x0100, NULL, 0, 100);
-            libusb_control_transfer(h, 0x40, 0xC6, 0x0032, 0x0101, (unsigned char*)arm_payload, 60, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC6, 0x0000, 0x0100, NULL, 0, 100));
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC6, 0x0032, 0x0101, (unsigned char*)arm_payload, 60, 100));
             last_batch_fire = el;
             batch_fires++;
             if (batch_fires <= 3) fprintf(stderr, "[batch] fired #%d at t=%.0fms\n", batch_fires, el*1000);
@@ -718,7 +726,7 @@ int main(int argc, char** argv) {
             static int first_time = 1;
             if (first_time) {
                 unsigned char bank[3] = {0x94, 0x0f, 0x02};
-                libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, bank, 3, 30);
+                CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, bank, 3, 30));
                 first_time = 0;
             }
             unsigned char vals[6] = {0};
@@ -731,8 +739,8 @@ int main(int argc, char** argv) {
                 {0x95, 0x01, 0xa9},  // (unknown but returned 0x11 in probe)
             };
             for (int i = 0; i < 6; i++) {
-                libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, (unsigned char*)reads[i], 3, 30);
-                libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, &vals[i], 1, 30);
+                CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, (unsigned char*)reads[i], 3, 30));
+                CTL_CHECK(libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, &vals[i], 1, 30));
             }
             if (pll_mon_fires < 60) {
                 fprintf(stderr, "[audio] t=%6.0fms AA=0x%02x(AUD_ON=%d HBR=%d LAYOUT=%d CH=%d) AE=0x%02x(Fs=%d) AD=0x%02x AC=0x%02x AB=0x%02x A9=0x%02x\n",
@@ -754,9 +762,9 @@ int main(int argc, char** argv) {
         int arm_loop = (env_arm_loop && env_arm_loop[0] && env_arm_loop[0] != '0');
         if (arm_loop && (el - last_arm_loop) >= 0.030) {
             unsigned char arm_a[4] = {0xd4, 0x00, 0x04, 0x03};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, arm_a, 4, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, arm_a, 4, 100));
             unsigned char arm_b[2] = {0x20, 0x05};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5098, 0, arm_b, 2, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5098, 0, arm_b, 2, 100));
             last_arm_loop = el;
             arm_loop_fires++;
         }
@@ -771,19 +779,19 @@ int main(int argc, char** argv) {
         if (unmute_retry && (el - last_unmute_fire) >= 0.050) {
             // Bank2 select (audio bank)
             unsigned char sel[3] = {0x94, 0x0f, 0x02};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, sel, 3, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, sel, 3, 100));
             // Force clear HWMuteCtrl (reg 0x7D bit4 = HWMuteClr trigger)
             unsigned char w1[3] = {0x94, 0x7d, 0x10};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w1, 3, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w1, 3, 100));
             // Clear Force_AVMute (reg 0x74)
             unsigned char w2[3] = {0x94, 0x74, 0x00};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w2, 3, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w2, 3, 100));
             // Clear P0/P1_AVMUTE (reg 0xA8)
             unsigned char w3[3] = {0x94, 0xa8, 0x00};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w3, 3, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w3, 3, 100));
             // Force I2S output on (reg 0x7E bit4)
             unsigned char w4[3] = {0x94, 0x7e, 0x10};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w4, 3, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w4, 3, 100));
             last_unmute_fire = el;
             unmute_fires++;
             if (unmute_fires <= 3) fprintf(stderr, "[unmute-retry] fired #%d\n", unmute_fires);
@@ -797,9 +805,9 @@ int main(int argc, char** argv) {
         int min_loop = (env_min_loop && env_min_loop[0] && env_min_loop[0] != '0');
         if (min_loop && bi >= g_nburst && (el - last_min_fire) >= 0.10) {
             unsigned char sel[2] = {0x00, 0x02};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, sel, 2, 50);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, sel, 2, 50));
             unsigned char wr[2] = {0x20, 0x00};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, wr, 2, 50);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, wr, 2, 50));
             last_min_fire = el;
             min_fires++;
         }
@@ -809,14 +817,14 @@ int main(int argc, char** argv) {
         // detalle en analysis/keepalive-cycle.tsv
         if (pt_loop && bi >= g_nburst && (el - last_pt_fire) >= 0.12) {
             // IT66121 writes: 9a0f00, 9ac101, 9ac603 (start of cycle)
-            unsigned char w1[3] = {0x9a, 0x0f, 0x00}; libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w1, 3, 100);
-            unsigned char w2[3] = {0x9a, 0xc1, 0x01}; libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w2, 3, 100);
-            unsigned char w3[3] = {0x9a, 0xc6, 0x03}; libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w3, 3, 100);
+            unsigned char w1[3] = {0x9a, 0x0f, 0x00}; CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w1, 3, 100));
+            unsigned char w2[3] = {0x9a, 0xc1, 0x01}; CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w2, 3, 100));
+            unsigned char w3[3] = {0x9a, 0xc6, 0x03}; CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, w3, 3, 100));
             // IT66121 read setup for 9b/reg 0x0e (SYS_STATUS)
             unsigned char rs1[3] = {0x9b, 0x01, 0x0e};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, rs1, 3, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, rs1, 3, 100));
             unsigned char rb[1];
-            libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, rb, 1, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, rb, 1, 100));
             // MCU seq (0x509c series)
             unsigned short ka_seq[] = {
                 0x0000, 0x0000, 0xb3ff, 0x0002, 0x27ff, 0x0002,
@@ -824,16 +832,16 @@ int main(int argc, char** argv) {
             };
             for (int k = 0; k < (int)(sizeof(ka_seq)/sizeof(ka_seq[0])); k++) {
                 unsigned char d[2] = { ka_seq[k] & 0xff, (ka_seq[k] >> 8) & 0xff };
-                libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, d, 2, 100);
+                CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x509c, 0, d, 2, 100));
                 usleep(500);
             }
             // IT6802E reads: 0x11, 0x12 (interleaved with 0x509c 0x0002 - simplified)
             unsigned char rs2[3] = {0x9d, 0x01, 0x11};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, rs2, 3, 100);
-            libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, rb, 1, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, rs2, 3, 100));
+            CTL_CHECK(libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, rb, 1, 100));
             unsigned char rs3[3] = {0x9d, 0x01, 0x12};
-            libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, rs3, 3, 100);
-            libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, rb, 1, 100);
+            CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, rs3, 3, 100));
+            CTL_CHECK(libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, rb, 1, 100));
             last_pt_fire = el;
             pt_fires++;
     }
@@ -866,7 +874,7 @@ int main(int argc, char** argv) {
     // reg 0x0E es SYS_STATUS. En docs ITE, bit4=VID_STABLE
     #define IT66121_READ(reg) ({ \
         unsigned char _setup[3] = {0x9b, 0x01, (unsigned char)(reg)}; \
-        libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _setup, 3, 1000); \
+        CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _setup, 3, 1000)); \
         unsigned char _resp[8]; \
         int _rr = libusb_control_transfer(h, 0xC0, 0xC0, 0x5066, 0, _resp, 1, 1000); \
         (_rr > 0) ? _resp[0] : 0xff; \
@@ -912,7 +920,7 @@ int main(int argc, char** argv) {
     //   0x0F bit4 clear (TX clock)
     #define IT66121_WRITE(reg, val) do { \
         unsigned char _w[3] = {0x9a, (reg), (val)}; \
-        libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _w, 3, 1000); \
+        CTL_CHECK(libusb_control_transfer(h, 0x40, 0xC0, 0x5066, 0, _w, 3, 1000)); \
     } while (0)
 
     fprintf(stderr, "[fire-afe] IT66121 output enable sequence...\n");
@@ -937,6 +945,7 @@ capture_cleanup:
     hd60s_v4l2_close();
     hd60s_audio_close();
     fprintf(stderr, "\n=== HD60S Linux driver stats ===\n");
+    fprintf(stderr, "[ctl] errores de control no comprobados (contados): %lu\n", g_ctl_errors);
     fprintf(stderr, "iso pkts:  ok=%ld empty=%ld err=%ld (empty=%.2f%%)\n",
             hd60s_usb_pkt_ok(), hd60s_usb_pkt_empty(), hd60s_usb_pkt_err(),
             (hd60s_usb_pkt_ok() + hd60s_usb_pkt_empty()) ? 100.0 * hd60s_usb_pkt_empty() / (hd60s_usb_pkt_ok() + hd60s_usb_pkt_empty()) : 0.0);
