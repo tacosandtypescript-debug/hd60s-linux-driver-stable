@@ -12,6 +12,8 @@ void request_stop(int signal_number);
 void install_signal_handlers(void);
 int hd60s_env_present(const char *name);
 int hd60s_env_on(const char *name);
+/* Crea un directorio nuevo y privado (0700) bajo /run/hd60s. Devuelve 0 o -1. */
+int hd60s_private_tmpdir(char *out, unsigned long out_n);
 
 extern volatile sig_atomic_t g_stop_requested;
 

@@ -317,7 +317,11 @@ int main(int argc, char** argv) {
     if (alt == 4) {
         unsigned char bulk_buf[1024 * 32];
         int nonempty = 0;
-        FILE *bulk_dump = fopen("/tmp/hd60s-bulk-stream.bin", "wb");
+        FILE *bulk_dump = NULL;
+        char bulk_dir[PATH_MAX], bulk_path[PATH_MAX];
+        if (hd60s_private_tmpdir(bulk_dir, sizeof(bulk_dir)) == 0 &&
+            snprintf(bulk_path, sizeof(bulk_path), "%s/bulk-stream.bin", bulk_dir) > 0)
+            bulk_dump = fopen(bulk_path, "wb");
         hd60s_v4l2_open("/dev/video42");
         int bulk_count = 200;
         const char *bulk_env = getenv("HD60S_BULK_COUNT");

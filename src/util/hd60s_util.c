@@ -5,8 +5,19 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <unistd.h>
 
 volatile sig_atomic_t g_stop_requested = 0;
+
+int hd60s_private_tmpdir(char *out, unsigned long out_n) {
+    if (!out || out_n < 32) return -1;
+    if (mkdir("/run/hd60s", 0700) < 0 && errno != EEXIST) return -1;
+    int n = snprintf(out, out_n, "/run/hd60s/run.XXXXXX");
+    if (n < 0 || (unsigned long)n >= out_n) return -1;
+    return mkdtemp(out) ? 0 : -1;
+}
 
 double now_s(void) {
     struct timeval tv; gettimeofday(&tv, NULL);

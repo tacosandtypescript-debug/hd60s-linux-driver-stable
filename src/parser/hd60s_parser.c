@@ -95,7 +95,7 @@ static unsigned int g_trace_ring_next = 0;
 static ParserTracePacket* g_trace_packets = NULL;
 static FILE* g_trace_log = NULL;
 static FILE* g_trace_post_raw = NULL;
-static char g_trace_base[PATH_MAX] = "/tmp/hd60s-parser-first-loss";
+static char g_trace_base[PATH_MAX] = "";
 
 static unsigned long long g_trace_scan_count = 0;
 static size_t g_trace_last_scan_n = 0;
@@ -138,7 +138,18 @@ static void parser_trace_init(void) {
         return;
     }
     const char* base = getenv("HD60S_PARSER_TRACE_FILE");
-    if (base && *base) snprintf(g_trace_base, sizeof(g_trace_base), "%s", base);
+    if (base && *base) {
+        snprintf(g_trace_base, sizeof(g_trace_base), "%s", base);
+    } else {
+        char dir[PATH_MAX];
+        if (hd60s_private_tmpdir(dir, sizeof(dir)) < 0) {
+            fprintf(stderr, "[parser-trace] no se pudo crear directorio privado: %s; tracing disabled\n", strerror(errno));
+            free(g_trace_packets);
+            g_trace_packets = NULL;
+            return;
+        }
+        snprintf(g_trace_base, sizeof(g_trace_base), "%s/parser-first-loss", dir);
+    }
     char path[PATH_MAX];
     trace_path(path, sizeof(path), ".log");
     g_trace_log = fopen(path, "w");
