@@ -35,7 +35,7 @@ case "$CMD" in
         -e "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" -e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
     # panel 1 (arriba): iso_capture — corre sin límite hasta Ctrl+C (argv[1]=0 ≈ 100 años)
     # el audio sale por snd-aloop hw:10,0 → hw:10,1 hacia hd60s_capture
-    tmux send-keys -t hd60s "cd $HERE && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 \"$SCRIPT_DIR\"/hd60s-capture.sh" Enter
+    tmux send-keys -t hd60s "cd $(printf %q "$HERE") && HD60S_INIT_TSV=analysis/init-p2-audio-fast.tsv HD60S_BURST_TSV=analysis/poststream-no9a.tsv HD60S_AUDIO_PW=0 $(printf %q "$SCRIPT_DIR")/hd60s-capture.sh" Enter
     # panel 2 (abajo): vista previa mpv — arranca a los 13s (HD60S_NO_MPV=1 lo desactiva)
     # si usas OBS, mpv no hace falta; sin preview: HD60S_NO_MPV=1
     if [ -z "${HD60S_NO_MPV:-}" ]; then
@@ -60,7 +60,7 @@ case "$CMD" in
     kill_capture
     HERE="$PWD"
     tmux new-session -d -s hd60s -x 200 -y 50
-    tmux send-keys -t hd60s "cd $HERE && \"$SCRIPT_DIR\"/hd60s-capture.sh" Enter
+    tmux send-keys -t hd60s "cd $(printf %q "$HERE") && $(printf %q "$SCRIPT_DIR")/hd60s-capture.sh" Enter
     say "iso_capture arrancado (tmux 'hd60s'). Esperando lock de vídeo 12s..."
     sleep 12
     say "arrancando OBS..."
