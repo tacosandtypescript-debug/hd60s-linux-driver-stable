@@ -254,13 +254,27 @@ ensure_modules() {
 }
 
 maybe_restart_wireplumber() {
-  local dst="/etc/wireplumber/main.lua.d/51-hd60s-v4l2.lua"
-  local src="$ROOT/packaging/wireplumber/51-hd60s-v4l2.lua"
-  [ -f "$src" ] || return 0
-  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+  # Las reglas de WirePlumber solo se aplican al reiniciarlo. Se mira cualquiera
+  # de las dos (vídeo y audio), con o sin --no-service.
+  local f src dst
+  for f in 51-hd60s-v4l2.lua 51-hd60s-alsa.lua; do
+    src="$ROOT/packaging/wireplumber/$f"
+    dst="/etc/wireplumber/main.lua.d/$f"
+    [ -f "$src" ] || continue
+    if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
+      NEED_WP_RESTART=1
+    fi
+  done
+}
+
+restart_wireplumber_if_needed() {
+  [ "${NEED_WP_RESTART:-0}" -eq 1 ] || return 0
+  if [ ! -S "/run/user/$REAL_UID/bus" ]; then
+    say "aviso: reinicia WirePlumber al entrar en sesión: systemctl --user restart wireplumber"
     return 0
   fi
-  NEED_WP_RESTART=1
+  say "reiniciando WirePlumber para aplicar las reglas de vídeo y audio"
+  as_user systemctl --user try-restart wireplumber.service 2>/dev/null || true
 }
 
 enable_service() {
@@ -286,10 +300,6 @@ enable_service() {
     say "servicio de usuario hd60s arrancado"
   fi
   as_user systemctl --user start hd60s-obs 2>/dev/null || true
-  if [ "${NEED_WP_RESTART:-0}" -eq 1 ]; then
-    say "reiniciando WirePlumber para que no se quede con /dev/video42"
-    as_user systemctl --user try-restart wireplumber.service 2>/dev/null || true
-  fi
 }
 
 print_done() {
@@ -340,6 +350,7 @@ as_root make -C "$ROOT" PREFIX="$PREFIX" install
 as_root install -d -m 0755 -o "$REAL_USER" -g "$REAL_USER" "$PREFIX/libexec/hd60s/captures" "$PREFIX/libexec/hd60s/captures/proof"
 ensure_modules
 enable_service
+restart_wireplumber_if_needed
 
 setup_obs() {
   [ "$OPEN_OBS" -eq 1 ] || return 0
