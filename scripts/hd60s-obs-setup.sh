@@ -88,7 +88,8 @@ python3 - "$COLLECTION" <<'PY'
 import json, sys, uuid
 
 path = sys.argv[1]
-pack = lambda a, b: (a << 16) | (b & 0xffff)
+# OBS 30 (linux-v4l2) empaqueta resolución y framerate como (a << 32) | b.
+pack = lambda a, b: (a << 32) | (b & 0xffffffff)
 v_uuid = str(uuid.uuid4())
 a_uuid = str(uuid.uuid4())
 scene_uuid = str(uuid.uuid4())
@@ -109,6 +110,8 @@ v4l2 = {
         "framerate": pack(1, 60),
         "buffering": False,
         "auto_reset": True,
+        # El HD60 S entrega YUV en rango limitado (negro = 16): 1 = Parcial.
+        "color_range": 1,
     },
     "mixers": 0, "sync": 0, "flags": 0, "volume": 1.0, "balance": 0.5,
     "enabled": True, "muted": False, "push-to-mute": False, "push-to-mute-delay": 0,
