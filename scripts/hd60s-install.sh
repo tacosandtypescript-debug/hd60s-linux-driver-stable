@@ -273,8 +273,14 @@ restart_wireplumber_if_needed() {
     say "aviso: reinicia WirePlumber al entrar en sesión: systemctl --user restart wireplumber"
     return 0
   fi
-  say "reiniciando WirePlumber para aplicar las reglas de vídeo y audio"
-  as_user systemctl --user try-restart wireplumber.service 2>/dev/null || true
+  # Reiniciar solo WirePlumber con los nodos de hd60s ya creados lo deja con
+  # "pending linkable(s) not activated" y sin enlazar audio. Se reinicia la pila
+  # entera y después hd60s, que vuelve a crear hd60s_out/hd60s_capture.
+  say "reiniciando PipeWire y WirePlumber para aplicar las reglas de vídeo y audio"
+  as_user systemctl --user try-restart pipewire.service pipewire-pulse.service wireplumber.service 2>/dev/null || true
+  if as_user systemctl --user is-active --quiet hd60s 2>/dev/null; then
+    as_user systemctl --user restart hd60s 2>/dev/null || true
+  fi
 }
 
 enable_service() {
