@@ -47,6 +47,8 @@
 
 /* Errores de control USB no comprobados antes; se cuentan como bfail en las estadísticas. */
 static unsigned long g_ctl_errors = 0;
+/* 1 si se salió por falta de vídeo (sin señal HDMI); el proceso devuelve 3. */
+static int g_nosignal_exit = 0;
 #define CTL_CHECK(expr) do { int _ctl_rc = (expr); \
     if (_ctl_rc < 0) { g_ctl_errors++; \
         fprintf(stderr, "[ctl] %s:%d rc=%d (%s)\n", __FILE__, __LINE__, _ctl_rc, libusb_error_name(_ctl_rc)); } \
@@ -545,6 +547,16 @@ int main(int argc, char** argv) {
     int pt_loop = (env_pt && env_pt[0] && env_pt[0] != '0' && env_pt[0] != 'n' && env_pt[0] != 'N');
     double last_pt_fire = 0.0;
     int pt_fires = 0;
+    // Sin señal HDMI al arrancar (o si se pierde después) solo llegan paquetes vacíos
+    // y el proceso no vuelve a bloquear por sí mismo. Con HD60S_NOSIGNAL_EXIT_SEC>0 sale
+    // tras ese tiempo sin datos de vídeo para que el supervisor lo relance y reintente.
+    double nosig_limit = 0.0;
+    {
+        const char* env_nosig = getenv("HD60S_NOSIGNAL_EXIT_SEC");
+        if (env_nosig && *env_nosig) nosig_limit = atof(env_nosig);
+    }
+    long nosig_last_ok = hd60s_usb_pkt_ok();
+    double nosig_last_t = now_s();
     while (!g_stop_requested && hd60s_usb_keep_running() && now_s() - start < read_sec && hd60s_usb_inflight() > 0) {
         double el = now_s() - start;
         while (bi < g_nburst && (g_burst[bi].t - burst_t0) <= el) {
@@ -847,6 +859,19 @@ int main(int argc, char** argv) {
     }
     hd60s_usb_handle_events(&tv);
         hd60s_pace_output_if_due();
+        if (nosig_limit > 0) {
+            long ok_now = hd60s_usb_pkt_ok();
+            double t_now = now_s();
+            if (ok_now != nosig_last_ok) {
+                nosig_last_ok = ok_now;
+                nosig_last_t = t_now;
+            } else if (t_now - nosig_last_t >= nosig_limit) {
+                fprintf(stderr, "[main] sin datos de vídeo durante %.0f s (¿sin señal HDMI?); "
+                        "salgo para que el supervisor reintente\n", nosig_limit);
+                g_nosignal_exit = 1;
+                break;
+            }
+        }
     }
     if (g_stop_requested) {
         hd60s_usb_request_stop();
@@ -856,7 +881,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[iso] USB session ended: status=%d (%s)\n",
                 hd60s_usb_error(),
                 hd60s_usb_error() < 0 ? libusb_error_name(hd60s_usb_error()) : "transfer status");
-    if (hd60s_usb_fatal())
+    if (hd60s_usb_fatal() || g_nosignal_exit)
         goto capture_cleanup;
     if (pt_loop) fprintf(stderr, "[pt-loop] 継続発火 %d 回\n", pt_fires);
     fprintf(stderr, "[burst] 発行 %d/%d (ok=%d fail=%d)\n", bi, g_nburst, bok, bfail);
@@ -958,5 +983,6 @@ capture_cleanup:
     libusb_release_interface(h, 0);
     libusb_close(h);
     libusb_exit(NULL);
-    return hd60s_usb_fatal() ? 2 : 0;
+    if (hd60s_usb_fatal()) return 2;
+    return g_nosignal_exit ? 3 : 0;
 }
