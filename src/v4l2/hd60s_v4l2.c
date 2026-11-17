@@ -29,6 +29,16 @@ int hd60s_v4l2_open(const char* devpath) {
     // de v4l2loopback no se inicializa y el consumer deja de mostrar frames (síntomas: VLC "Timestamp conversion
     // failed", ffplay fd=0, hang de mpv, etc.). Hay que hacer VIDIOC_S_FMT + STREAMON explícitos para
     // "arrancar oficialmente" el stream OUTPUT.
+    // keep_format=1 (fijado abajo) se queda guardado en el driver entre sesiones. Si está
+    // activo al negociar, v4l2loopback conserva el formato anterior (640x480 BGR4) y rechaza
+    // el S_FMT. Se desactiva antes de negociar; se vuelve a activar tras la negociación.
+    {
+        struct v4l2_control c0; memset(&c0, 0, sizeof(c0));
+        c0.id = 0x0098f900; /* keep_format */
+        c0.value = 0;
+        if (ioctl(fd, VIDIOC_S_CTRL, &c0) < 0)
+            fprintf(stderr, "[v4l2] keep_format=0 previo: %s (sigo)\n", strerror(errno));
+    }
     struct v4l2_format vf; memset(&vf, 0, sizeof(vf));
     vf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     vf.fmt.pix.width = 1920;
