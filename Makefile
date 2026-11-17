@@ -26,8 +26,13 @@ tools: $(TOOLS)
 ISO_SRC := src/iso_capture.c src/util/hd60s_util.c src/v4l2/hd60s_v4l2.c src/audio/hd60s_audio.c src/replay/hd60s_replay.c src/pace/hd60s_pace.c src/parser/hd60s_parser.c src/usb/hd60s_usb.c src/pt/hd60s_passthrough.c src/unmute/hd60s_unmute.c
 ISO_INC := -Isrc -Isrc/util -Isrc/v4l2 -Isrc/audio -Isrc/replay -Isrc/pace -Isrc/parser -Isrc/usb -Isrc/pt -Isrc/unmute
 
-iso_capture: $(ISO_SRC)
-	$(CC) $(CFLAGS) $(ISO_INC) $(LIBUSB_CFLAGS) $(PIPEWIRE_CFLAGS) $(ISO_SRC) -o $@ $(LIBUSB_LIBS) $(ALSA_LIBS) $(PIPEWIRE_LIBS) -lpthread -lsamplerate
+# iso_capture lleva LIBEXECDIR compilado; se recompila si cambia (p. ej. otro PREFIX).
+LIBEXEC_STAMP := .hd60s-libexecdir
+$(LIBEXEC_STAMP): FORCE
+	@echo '$(LIBEXECDIR)' | cmp -s - $@ || echo '$(LIBEXECDIR)' > $@
+
+iso_capture: $(ISO_SRC) $(LIBEXEC_STAMP)
+	$(CC) $(CFLAGS) -DHD60S_LIBEXEC_DIR='"$(LIBEXECDIR)"' $(ISO_INC) $(LIBUSB_CFLAGS) $(PIPEWIRE_CFLAGS) $(ISO_SRC) -o $@ $(LIBUSB_LIBS) $(ALSA_LIBS) $(PIPEWIRE_LIBS) -lpthread -lsamplerate
 
 audio_extract: tools/audio_extract.c
 	$(CC) $(CFLAGS) $< -o $@
@@ -36,15 +41,16 @@ offline_parser: tools/offline_parser.c
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:
-	rm -f iso_capture $(TOOLS)
+	rm -f iso_capture $(TOOLS) $(LIBEXEC_STAMP)
 
-.PHONY: all tools clean install uninstall
+.PHONY: all tools clean install uninstall FORCE
 
 install: iso_capture
 	install -d "$(DESTDIR)$(LIBEXECDIR)/analysis" "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)"
 	install -d "$(DESTDIR)$(MODPROBEDIR)" "$(DESTDIR)$(MODULESLOADDIR)" "$(DESTDIR)$(UDEVRULEDIR)" "$(DESTDIR)$(TMPFILESDIR)"
 	install -m 0755 iso_capture scripts/hd60s scripts/hd60s-lib.sh scripts/hd60s-capture.sh scripts/hd60s-audio-bridge.sh scripts/hd60s-obs-setup.sh scripts/hd60s-wait-ready.sh scripts/hd60s-hold-loopback.sh "$(DESTDIR)$(LIBEXECDIR)/"
 	install -m 0755 scripts/hd60s-uninstall.sh "$(DESTDIR)$(LIBEXECDIR)/"
+	sed -i -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' "$(DESTDIR)$(LIBEXECDIR)/hd60s-lib.sh" "$(DESTDIR)$(LIBEXECDIR)/hd60s-capture.sh"
 	install -m 0644 analysis/*.tsv "$(DESTDIR)$(LIBEXECDIR)/analysis/"
 	install -m 0644 "$(WIREPLUMBER_RULE)" "$(WIREPLUMBER_V4L2_RULE)" "$(DESTDIR)$(WIREPLUMBER_CONFDIR)/"
 	install -m 0644 packaging/modprobe.d/*.conf "$(DESTDIR)$(MODPROBEDIR)/"
@@ -53,7 +59,8 @@ install: iso_capture
 	@sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' "$(SYSTEMD_USER_UNIT_TEMPLATE)" > "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s.service"
 	@sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' packaging/hd60s-obs.service.in > "$(DESTDIR)$(SYSTEMD_USER_UNITDIR)/hd60s-obs.service"
 	install -d "$(DESTDIR)/etc/xdg/autostart"
-	install -m 0644 packaging/hd60s-obs.desktop "$(DESTDIR)/etc/xdg/autostart/hd60s-obs.desktop"
+	sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' packaging/hd60s-obs.desktop > "$(DESTDIR)/etc/xdg/autostart/hd60s-obs.desktop"
+	chmod 0644 "$(DESTDIR)/etc/xdg/autostart/hd60s-obs.desktop"
 	install -m 0644 $(UDEVRULE) "$(DESTDIR)$(UDEVRULEDIR)/$(notdir $(UDEVRULE))"
 	ln -sfn "$(LIBEXECDIR)/hd60s" "$(DESTDIR)$(PREFIX)/bin/hd60s"
 	ln -sfn hd60s-capture.sh "$(DESTDIR)$(LIBEXECDIR)/run-hd60s-obs.sh"

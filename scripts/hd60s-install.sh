@@ -343,7 +343,7 @@ pkg-config --exists libpipewire-0.3 || die "falta libpipewire-0.3 (dev)"
 
 maybe_restart_wireplumber
 say "compilando iso_capture..."
-as_user make -C "$ROOT" -j"$(nproc 2>/dev/null || echo 1)" all
+as_user make -C "$ROOT" -j"$(nproc 2>/dev/null || echo 1)" PREFIX="$PREFIX" all
 say "instalando a $PREFIX (udev, v4l2loopback, systemd, WirePlumber)..."
 as_root make -C "$ROOT" PREFIX="$PREFIX" install
 # Capturas: el servicio (usuario) escribe aquí; el resto de libexec queda root-owned.

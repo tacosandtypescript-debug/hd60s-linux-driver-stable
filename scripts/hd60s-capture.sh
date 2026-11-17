@@ -10,8 +10,11 @@ elif [ -x "$SCRIPT_DIR/../iso_capture" ]; then
 else
   DIR="$SCRIPT_DIR"
 fi
-# Ruta fija instalada por make install (ver hd60s-lib.sh).
-HD60S_ISO_BIN=/usr/local/libexec/hd60s/iso_capture
+# Ruta instalada por make install (ver hd60s-lib.sh).
+HD60S_LIBEXEC_DIR=@LIBEXECDIR@
+# Sin instalar (ejecutado desde el repo) el marcador queda sin sustituir.
+case "$HD60S_LIBEXEC_DIR" in @*) HD60S_LIBEXEC_DIR=/usr/local/libexec/hd60s ;; esac
+HD60S_ISO_BIN=$HD60S_LIBEXEC_DIR/iso_capture
 cd "$DIR"
 
 # HD60 S 0fd9:005e → libusb → v4l2loopback (/dev/video42).
