@@ -168,15 +168,18 @@ while :; do
     "$HD60S_ISO_BIN" 0 2 1 &
   child_pid=$!
   link_hd60s_play &
-  # Anunciar 60 fps en el lado CAPTURE para que OBS no negocie 30.
+  # Anunciar 60 fps en el lado CAPTURE para que OBS no negocie otro valor.
+  # iso_capture abre el loopback ~15 s después de arrancar (init USB) y al
+  # negociar el formato el driver vuelve a su fps por defecto (1000), así que
+  # se reafirma 60 fps durante el primer minuto en lugar de una sola vez.
   (
     i=0
-    while [ "$i" -lt 20 ]; do
-      if v4l2-ctl -d /dev/video42 --set-parm=60 >/dev/null 2>&1; then
-        break
+    while [ "$i" -lt 60 ] && kill -0 "$child_pid" 2>/dev/null; do
+      if ! v4l2-ctl -d /dev/video42 --get-parm 2>/dev/null | grep -q 'per second: 60\.'; then
+        v4l2-ctl -d /dev/video42 --set-parm=60 >/dev/null 2>&1 || true
       fi
       i=$((i + 1))
-      sleep 0.5
+      sleep 1
     done
   ) &
   wait "$child_pid"
