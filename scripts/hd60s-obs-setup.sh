@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Perfil y colección OBS HD60 S (1920x1080 @ 60) y, opcionalmente, abre OBS.
+# Solo crea la colección y el perfil si faltan: no pisa cambios del usuario
+# (fuentes añadidas, ocultas, etc.). --force los regenera, con copia de seguridad.
 set -euo pipefail
 
 LAUNCH=1
 WAIT=1
+FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-launch) LAUNCH=0 ;;
     --no-wait) WAIT=0 ;;
+    --force) FORCE=1 ;;
     -h|--help)
-      echo "Uso: hd60s-obs-setup.sh [--no-launch] [--no-wait]"
+      echo "Uso: hd60s-obs-setup.sh [--no-launch] [--no-wait] [--force]"
       exit 0
       ;;
     *) echo "[hd60s ERR] opción desconocida: $1" >&2; exit 1 ;;
@@ -37,13 +41,50 @@ PROFILE_DIR="$OBS_HOME/basic/profiles/HD60S"
 GLOBAL="$OBS_HOME/global.ini"
 VDEV="${VDEV:-/dev/video42}"
 
+COLLECTION="$SCENE_DIR/HD60S.json"
+PROFILE_INI="$PROFILE_DIR/basic.ini"
 mkdir -p "$SCENE_DIR" "$PROFILE_DIR"
+
+# ¿Hay que escribir algo? Colección: si falta o no tiene la fuente /dev/video42.
+need_scene=0
+if [ "$FORCE" -eq 1 ] || [ ! -s "$COLLECTION" ] || ! grep -q "$VDEV" "$COLLECTION" 2>/dev/null; then
+  need_scene=1
+fi
+need_profile=0
+if [ "$FORCE" -eq 1 ] || [ ! -s "$PROFILE_INI" ]; then
+  need_profile=1
+fi
+
+# OBS guarda su configuración al cerrarse: si sigue abierto, pisaría lo que se
+# escriba ahora. Se cierra con SIGTERM y se espera; nunca con SIGKILL.
+close_obs() {
+  pgrep -x obs >/dev/null 2>&1 || return 0
+  say "cerrando OBS para escribir la configuración HD60S..."
+  pkill -TERM -x obs 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    pgrep -x obs >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+if [ "$need_scene" -eq 1 ] || [ "$need_profile" -eq 1 ]; then
+  if ! close_obs; then
+    say "OBS no se cerró en 15 s; no toco su configuración. Ciérralo y vuelve a ejecutar."
+    exit 1
+  fi
+fi
 
 if command -v v4l2-ctl >/dev/null 2>&1 && [ -e "$VDEV" ]; then
   v4l2-ctl -d "$VDEV" --set-parm=60 >/dev/null 2>&1 || true
 fi
 
-python3 - "$SCENE_DIR/HD60S.json" <<'PY'
+if [ "$need_scene" -eq 1 ]; then
+if [ -f "$COLLECTION" ]; then
+  cp -p "$COLLECTION" "$COLLECTION.bak-$(date +%Y%m%d%H%M%S)"
+  say "copia de la colección anterior en $COLLECTION.bak-*"
+fi
+python3 - "$COLLECTION" <<'PY'
 import json, sys, uuid
 
 path = sys.argv[1]
@@ -165,8 +206,12 @@ with open(path, "w") as f:
     json.dump(data, f)
 print("wrote", path)
 PY
+else
+  say "colección HD60S ya existe; la dejo como está (usa --force para regenerarla)"
+fi
 
-cat > "$PROFILE_DIR/basic.ini" <<'INI'
+if [ "$need_profile" -eq 1 ]; then
+cat > "$PROFILE_INI" <<'INI'
 [General]
 Name=HD60S
 
@@ -185,6 +230,7 @@ ColorFormat=NV12
 ColorSpace=709
 ColorRange=Partial
 INI
+fi
 
 mkdir -p "$OBS_HOME"
 if [ ! -f "$GLOBAL" ]; then
@@ -198,53 +244,6 @@ ProfileDir=HD60S
 SceneCollection=HD60S
 SceneCollectionFile=HD60S
 INI
-else
-  python3 - "$GLOBAL" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-text = p.read_text()
-lines = text.splitlines()
-out = []
-seen_basic = False
-keys = {
-    "Profile": "HD60S",
-    "ProfileDir": "HD60S",
-    "SceneCollection": "HD60S",
-    "SceneCollectionFile": "HD60S",
-}
-in_basic = False
-replaced = set()
-for line in lines:
-    if line.strip() == "[Basic]":
-        in_basic = True
-        seen_basic = True
-        out.append(line)
-        continue
-    if line.startswith("[") and line.strip() != "[Basic]":
-        if in_basic:
-            for k, v in keys.items():
-                if k not in replaced:
-                    out.append(f"{k}={v}")
-                    replaced.add(k)
-        in_basic = False
-    if in_basic and "=" in line:
-        k = line.split("=", 1)[0]
-        if k in keys:
-            out.append(f"{k}={keys[k]}")
-            replaced.add(k)
-            continue
-    out.append(line)
-if in_basic:
-    for k, v in keys.items():
-        if k not in replaced:
-            out.append(f"{k}={v}")
-elif not seen_basic:
-    out.append("[Basic]")
-    for k, v in keys.items():
-        out.append(f"{k}={v}")
-p.write_text("\n".join(out) + "\n")
-PY
 fi
 
 say "OBS: colección HD60S, 1920x1080 @ 60 fps, V4L2 /dev/video42 + hd60s_capture"
@@ -263,13 +262,10 @@ if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
 fi
 
 if pgrep -x obs >/dev/null 2>&1; then
-  say "cerrando OBS para cargar el perfil HD60S..."
-  pkill -x obs || true
-  sleep 1
-  pkill -9 -x obs 2>/dev/null || true
-  sleep 0.5
+  say "OBS ya está abierto; no lo reinicio"
+  exit 0
 fi
 
 say "abriendo OBS..."
-nohup obs >/tmp/hd60s-obs.log 2>&1 &
+nohup obs --collection HD60S --profile HD60S >/tmp/hd60s-obs.log 2>&1 &
 disown || true
